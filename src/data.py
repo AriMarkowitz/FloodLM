@@ -554,15 +554,23 @@ class TemporalGraphStream(IterableDataset):
 class RecurrentFloodDataset(IterableDataset):
     """
     Dataset for recurrent model with static graph and dynamic time series.
-    
-    Returns:
+
+    Yields pre-formed batches of shape [B, ...] so that every batch contains
+    windows from a single event only (temporal fidelity guaranteed).
+
+    Shuffling behaviour:
+      - shuffle=True : event order is randomised each epoch; window order
+                       within each event is preserved (temporal order).
+      - shuffle=False: events and windows are both iterated in original order.
+
+    Returns batches as dicts with:
         - static_graph: HeteroData with static features only
-        - y_hist_1d: [H, N_1d, 1] historical water levels for 1D nodes
-        - y_hist_2d: [H, N_2d, 1] historical water levels for 2D nodes
-        - rain_hist_2d: [H, N_2d, R] historical rainfall for 2D nodes
-        - y_future_1d: [T, N_1d, 1] future water levels (labels) for 1D nodes
-        - y_future_2d: [T, N_2d, 1] future water levels (labels) for 2D nodes
-        - rain_future_2d: [T, N_2d, R] future rainfall for 2D nodes
+        - y_hist_1d:      [B, H, N_1d, 1]
+        - y_hist_2d:      [B, H, N_2d, 1]
+        - rain_hist_2d:   [B, H, N_2d, 1]
+        - y_future_1d:    [B, T, N_1d, 1]
+        - y_future_2d:    [B, T, N_2d, 1]
+        - rain_future_2d: [B, T, N_2d, 1]
     """
     def __init__(
         self,
@@ -575,6 +583,7 @@ class RecurrentFloodDataset(IterableDataset):
         norm_stats,
         history_len=10,
         forecast_len=1,
+        batch_size=1,
         shuffle=True,
         node_id_col: str = "node_idx",
     ):
@@ -594,6 +603,7 @@ class RecurrentFloodDataset(IterableDataset):
         self.norm_stats = norm_stats
         self.history_len = history_len
         self.forecast_len = forecast_len
+        self.batch_size = batch_size
         self.shuffle = shuffle
         self.node_id_col = node_id_col
         
@@ -611,184 +621,183 @@ class RecurrentFloodDataset(IterableDataset):
         self.n_nodes_1d = len(static_1d_norm)
         self.n_nodes_2d = len(static_2d_norm)
         
+    def _build_sample(self, n1, n2, tcol, t_start):
+        """Extract and validate a single window sample. Returns a dict or None if invalid."""
+        t_hist_end = t_start + self.history_len - 1
+        t_pred_end = t_hist_end + self.forecast_len
+
+        hist_1d = n1[(n1[tcol] >= t_start) & (n1[tcol] <= t_hist_end)]
+        hist_2d = n2[(n2[tcol] >= t_start) & (n2[tcol] <= t_hist_end)]
+        future_1d = n1[(n1[tcol] > t_hist_end) & (n1[tcol] <= t_pred_end)]
+        future_2d = n2[(n2[tcol] > t_hist_end) & (n2[tcol] <= t_pred_end)]
+
+        # Check windows are complete
+        if (len(hist_1d) != self.n_nodes_1d * self.history_len or
+                len(hist_2d) != self.n_nodes_2d * self.history_len or
+                len(future_1d) != self.n_nodes_1d * self.forecast_len or
+                len(future_2d) != self.n_nodes_2d * self.forecast_len):
+            return None
+
+        y_hist_1d = torch.tensor(
+            hist_1d['water_level'].values.reshape(self.history_len, self.n_nodes_1d, 1),
+            dtype=torch.float32)
+        y_hist_2d = torch.tensor(
+            hist_2d['water_level'].values.reshape(self.history_len, self.n_nodes_2d, 1),
+            dtype=torch.float32)
+        y_future_1d = torch.tensor(
+            future_1d['water_level'].values.reshape(self.forecast_len, self.n_nodes_1d, 1),
+            dtype=torch.float32)
+        y_future_2d = torch.tensor(
+            future_2d['water_level'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
+            dtype=torch.float32)
+        rain_hist_2d = torch.tensor(
+            hist_2d['rainfall'].values.reshape(self.history_len, self.n_nodes_2d, 1),
+            dtype=torch.float32)
+        rain_future_2d = torch.tensor(
+            future_2d['rainfall'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
+            dtype=torch.float32)
+
+        # Finite check
+        if not (torch.isfinite(y_hist_1d).all() and torch.isfinite(y_hist_2d).all() and
+                torch.isfinite(y_future_1d).all() and torch.isfinite(y_future_2d).all() and
+                torch.isfinite(rain_hist_2d).all() and torch.isfinite(rain_future_2d).all()):
+            return None
+
+        # ================================================================
+        # COMPREHENSIVE VALIDITY CHECKS (catch 90% of data leakage bugs)
+        # ================================================================
+
+        # (1) SHAPE & ALIGNMENT CHECKS
+        assert y_hist_1d.shape == (self.history_len, self.n_nodes_1d, 1), \
+            f"1D history shape mismatch: {y_hist_1d.shape} vs ({self.history_len}, {self.n_nodes_1d}, 1)"
+        assert y_hist_2d.shape == (self.history_len, self.n_nodes_2d, 1), \
+            f"2D history shape mismatch: {y_hist_2d.shape} vs ({self.history_len}, {self.n_nodes_2d}, 1)"
+        assert y_future_1d.shape == (self.forecast_len, self.n_nodes_1d, 1), \
+            f"1D future shape mismatch: {y_future_1d.shape} vs ({self.forecast_len}, {self.n_nodes_1d}, 1)"
+        assert y_future_2d.shape == (self.forecast_len, self.n_nodes_2d, 1), \
+            f"2D future shape mismatch: {y_future_2d.shape} vs ({self.forecast_len}, {self.n_nodes_2d}, 1)"
+        assert rain_hist_2d.shape[0] == self.history_len and rain_hist_2d.shape[1] == self.n_nodes_2d, \
+            f"Rain history shape mismatch: {rain_hist_2d.shape} vs ({self.history_len}, {self.n_nodes_2d}, *)"
+        assert rain_future_2d.shape[0] == self.forecast_len and rain_future_2d.shape[1] == self.n_nodes_2d, \
+            f"Rain future shape mismatch: {rain_future_2d.shape} vs ({self.forecast_len}, {self.n_nodes_2d}, *)"
+
+        # (2) TIME ALIGNMENT CHECK
+        t_hist_values = sorted(hist_2d[tcol].unique())
+        t_future_values = sorted(future_2d[tcol].unique())
+        assert len(t_hist_values) == self.history_len, \
+            f"History timestep count mismatch: {len(t_hist_values)} vs {self.history_len}"
+        assert len(t_future_values) == self.forecast_len, \
+            f"Future timestep count mismatch: {len(t_future_values)} vs {self.forecast_len}"
+        assert t_hist_values[-1] + 1 == t_future_values[0], \
+            f"Timestep gap: history ends at {t_hist_values[-1]}, future starts at {t_future_values[0]}"
+
+        # (3) EVENT BOUNDARY CHECK
+        hist_events_2d = hist_2d.get('event_id', None)
+        future_events_2d = future_2d.get('event_id', None)
+        if hist_events_2d is not None:
+            assert hist_events_2d.iloc[0] == future_events_2d.iloc[0], \
+                f"Event boundary crossed: history={hist_events_2d.iloc[0]}, future={future_events_2d.iloc[0]}"
+
+        # (4) NODE CONSISTENCY
+        hist_2d_nodes_per_t = hist_2d.groupby(tcol)[self.node_id_col].nunique().values
+        future_2d_nodes_per_t = future_2d.groupby(tcol)[self.node_id_col].nunique().values
+        assert (hist_2d_nodes_per_t == self.n_nodes_2d).all(), \
+            f"History missing nodes: {hist_2d_nodes_per_t}"
+        assert (future_2d_nodes_per_t == self.n_nodes_2d).all(), \
+            f"Future missing nodes: {future_2d_nodes_per_t}"
+
+        # (5) NO-LEAKAGE CHECK
+        assert t_hist_end < t_future_values[0], \
+            f"History/future overlap: history ends at {t_hist_end}, future starts at {t_future_values[0]}"
+
+        # (6) SANITY SLICE CHECK
+        last_hist_val = hist_2d[hist_2d[tcol] == t_hist_values[-1]]['water_level'].iloc[0]
+        assert abs(last_hist_val - y_hist_2d[-1, 0, 0].item()) < 1e-5, \
+            f"History value mismatch at last timestep: raw={last_hist_val}, extracted={y_hist_2d[-1, 0, 0].item()}"
+        first_fut_val = future_2d[future_2d[tcol] == t_future_values[0]]['water_level'].iloc[0]
+        assert abs(first_fut_val - y_future_2d[0, 0, 0].item()) < 1e-5, \
+            f"Future value mismatch at first timestep: raw={first_fut_val}, extracted={y_future_2d[0, 0, 0].item()}"
+
+        return {
+            'y_hist_1d': y_hist_1d,
+            'y_hist_2d': y_hist_2d,
+            'rain_hist_2d': rain_hist_2d,
+            'y_future_1d': y_future_1d,
+            'y_future_2d': y_future_2d,
+            'rain_future_2d': rain_future_2d,
+        }
+
     def __iter__(self):
+        """
+        Yield pre-formed batches of size self.batch_size.
+
+        Events are shuffled each epoch (when shuffle=True).
+        Windows within each event are iterated in temporal order — never shuffled.
+        Tail windows that don't fill a complete batch are dropped (drop_last semantics).
+        All windows in a batch are guaranteed to come from the same event.
+        """
         event_list = list(self.event_file_list)
         if self.shuffle:
             random.shuffle(event_list)
-            
+
         for item in event_list:
-            # Handle both old format (event_idx, event_dir) and new format (event_idx, event_dir, split_label)
             if len(item) == 3:
                 event_idx, event_dir, split_label = item
             else:
                 event_idx, event_dir = item
-            
+
             # Load event data
             n1 = pd.read_csv(event_dir + "/1d_nodes_dynamic_all.csv")
             n2 = pd.read_csv(event_dir + "/2d_nodes_dynamic_all.csv")
-            
+
             # Drop excluded columns
             exclude_1d = self.norm_stats.get("exclude_1d", [])
             exclude_2d = self.norm_stats.get("exclude_2d", [])
             n1 = n1.drop(columns=[c for c in exclude_1d if c in n1.columns])
             n2 = n2.drop(columns=[c for c in exclude_2d if c in n2.columns])
-            
+
             # Apply normalization
             normalizer_1d = self.norm_stats["normalizer_1d"]
             normalizer_2d = self.norm_stats["normalizer_2d"]
             n1 = normalizer_1d.transform_dynamic(n1, exclude_cols=None)
             n2 = normalizer_2d.transform_dynamic(n2, exclude_cols=None)
-            
+
             # Merge with static features
             n1 = pd.merge(n1, self.static_1d_norm, on=self.node_id_col, how="left")
             n2 = pd.merge(n2, self.static_2d_norm, on=self.node_id_col, how="left")
             n2 = preprocess_2d_nodes(n2)
-            
+
             # Add temporal features
             n1 = add_temporal_features(n1, has_rainfall=False)
             n2 = add_temporal_features(n2, has_rainfall=True)
-            
-            # Sort by timestep and node_idx
+
+            # Sort by timestep and node_idx (temporal order preserved)
             tcol = "timestep_raw" if "timestep_raw" in n1.columns else "timestep"
             n1 = n1.sort_values([tcol, self.node_id_col]).reset_index(drop=True)
             n2 = n2.sort_values([tcol, self.node_id_col]).reset_index(drop=True)
-            
-            # Get number of timesteps
-            max_timestep = int(n1[tcol].max())
+
             min_timestep = int(n1[tcol].min())
-            n_timesteps = max_timestep - min_timestep + 1
-            
-            # Create sliding windows
+            max_timestep = int(n1[tcol].max())
+
+            # Collect all valid windows for this event in temporal order
+            event_samples = []
             for t_start in range(min_timestep, max_timestep - self.history_len - self.forecast_len + 2):
-                t_hist_end = t_start + self.history_len - 1
-                t_pred_end = t_hist_end + self.forecast_len
-                
-                # Extract history window
-                hist_1d = n1[(n1[tcol] >= t_start) & (n1[tcol] <= t_hist_end)]
-                hist_2d = n2[(n2[tcol] >= t_start) & (n2[tcol] <= t_hist_end)]
-                
-                # Extract future window
-                future_1d = n1[(n1[tcol] > t_hist_end) & (n1[tcol] <= t_pred_end)]
-                future_2d = n2[(n2[tcol] > t_hist_end) & (n2[tcol] <= t_pred_end)]
-                
-                # Check if windows are complete
-                expected_hist_1d = self.n_nodes_1d * self.history_len
-                expected_hist_2d = self.n_nodes_2d * self.history_len
-                expected_future_1d = self.n_nodes_1d * self.forecast_len
-                expected_future_2d = self.n_nodes_2d * self.forecast_len
-                
-                if (len(hist_1d) != expected_hist_1d or len(hist_2d) != expected_hist_2d or
-                    len(future_1d) != expected_future_1d or len(future_2d) != expected_future_2d):
-                    continue
-                
-                # Extract water levels (normalized)
-                y_hist_1d = torch.tensor(
-                    hist_1d['water_level'].values.reshape(self.history_len, self.n_nodes_1d, 1),
-                    dtype=torch.float32
-                )
-                y_hist_2d = torch.tensor(
-                    hist_2d['water_level'].values.reshape(self.history_len, self.n_nodes_2d, 1),
-                    dtype=torch.float32
-                )
-                
-                y_future_1d = torch.tensor(
-                    future_1d['water_level'].values.reshape(self.forecast_len, self.n_nodes_1d, 1),
-                    dtype=torch.float32
-                )
-                y_future_2d = torch.tensor(
-                    future_2d['water_level'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
-                    dtype=torch.float32
-                )
-                
-                # Extract rainfall (only for 2D nodes)
-                rain_hist_2d = torch.tensor(
-                    hist_2d['rainfall'].values.reshape(self.history_len, self.n_nodes_2d, 1),
-                    dtype=torch.float32
-                )
-                rain_future_2d = torch.tensor(
-                    future_2d['rainfall'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
-                    dtype=torch.float32
-                )
-                
-                # Check for finite values
-                if not (torch.isfinite(y_hist_1d).all() and torch.isfinite(y_hist_2d).all() and
-                        torch.isfinite(y_future_1d).all() and torch.isfinite(y_future_2d).all() and
-                        torch.isfinite(rain_hist_2d).all() and torch.isfinite(rain_future_2d).all()):
-                    continue
-                
-                # ================================================================
-                # COMPREHENSIVE VALIDITY CHECKS (catch 90% of data leakage bugs)
-                # ================================================================
-                
-                # (1) SHAPE & ALIGNMENT CHECKS
-                assert y_hist_1d.shape == (self.history_len, self.n_nodes_1d, 1), \
-                    f"1D history shape mismatch: {y_hist_1d.shape} vs ({self.history_len}, {self.n_nodes_1d}, 1)"
-                assert y_hist_2d.shape == (self.history_len, self.n_nodes_2d, 1), \
-                    f"2D history shape mismatch: {y_hist_2d.shape} vs ({self.history_len}, {self.n_nodes_2d}, 1)"
-                assert y_future_1d.shape == (self.forecast_len, self.n_nodes_1d, 1), \
-                    f"1D future shape mismatch: {y_future_1d.shape} vs ({self.forecast_len}, {self.n_nodes_1d}, 1)"
-                assert y_future_2d.shape == (self.forecast_len, self.n_nodes_2d, 1), \
-                    f"2D future shape mismatch: {y_future_2d.shape} vs ({self.forecast_len}, {self.n_nodes_2d}, 1)"
-                assert rain_hist_2d.shape[0] == self.history_len and rain_hist_2d.shape[1] == self.n_nodes_2d, \
-                    f"Rain history shape mismatch: {rain_hist_2d.shape} vs ({self.history_len}, {self.n_nodes_2d}, *)"
-                assert rain_future_2d.shape[0] == self.forecast_len and rain_future_2d.shape[1] == self.n_nodes_2d, \
-                    f"Rain future shape mismatch: {rain_future_2d.shape} vs ({self.forecast_len}, {self.n_nodes_2d}, *)"
-                
-                # (2) TIME ALIGNMENT CHECK: last history timestep should immediately precede first future timestep
-                t_hist_values = sorted(hist_2d[tcol].unique())
-                t_future_values = sorted(future_2d[tcol].unique())
-                assert len(t_hist_values) == self.history_len, \
-                    f"History timestep count mismatch: {len(t_hist_values)} vs {self.history_len}"
-                assert len(t_future_values) == self.forecast_len, \
-                    f"Future timestep count mismatch: {len(t_future_values)} vs {self.forecast_len}"
-                assert t_hist_values[-1] + 1 == t_future_values[0], \
-                    f"Timestep gap detected: history ends at {t_hist_values[-1]}, future starts at {t_future_values[0]} (not contiguous!)"
-                
-                # (3) EVENT BOUNDARY CHECK: all data from same event
-                hist_events_1d = hist_1d.get('event_id', None)
-                hist_events_2d = hist_2d.get('event_id', None)
-                future_events_1d = future_1d.get('event_id', None)
-                future_events_2d = future_2d.get('event_id', None)
-                
-                if hist_events_2d is not None:
-                    event_id_hist = hist_events_2d.iloc[0]
-                    event_id_future = future_events_2d.iloc[0]
-                    assert event_id_hist == event_id_future, \
-                        f"Event boundary crossed: history from event {event_id_hist}, future from event {event_id_future}"
-                
-                # (4) NODE CONSISTENCY: same nodes in each timestep, ordered correctly
-                hist_2d_nodes_per_t = hist_2d.groupby(tcol)[self.node_id_col].nunique().values
-                future_2d_nodes_per_t = future_2d.groupby(tcol)[self.node_id_col].nunique().values
-                assert (hist_2d_nodes_per_t == self.n_nodes_2d).all(), \
-                    f"History has missing nodes at some timesteps: {hist_2d_nodes_per_t} (expected all {self.n_nodes_2d})"
-                assert (future_2d_nodes_per_t == self.n_nodes_2d).all(), \
-                    f"Future has missing nodes at some timesteps: {future_2d_nodes_per_t} (expected all {self.n_nodes_2d})"
-                
-                # (5) NO-LEAKAGE CHECK: verify history and future don't overlap
-                assert t_hist_end < t_future_values[0], \
-                    f"History/future overlap: history ends at {t_hist_end}, future starts at {t_future_values[0]}"
-                
-                # (6) "SANITY SLICE" CHECK: spot-check a few values (catches off-by-one errors)
-                # Compare first node's water level at last history timestep
-                last_hist_val_2d = hist_2d[hist_2d[tcol] == t_hist_values[-1]]['water_level'].iloc[0]
-                extracted_hist_val = y_hist_2d[-1, 0, 0].item()
-                assert abs(last_hist_val_2d - extracted_hist_val) < 1e-5, \
-                    f"History value mismatch at last timestep: raw={last_hist_val_2d}, extracted={extracted_hist_val}"
-                
-                # Compare first node's water level at first future timestep
-                first_future_val_2d = future_2d[future_2d[tcol] == t_future_values[0]]['water_level'].iloc[0]
-                extracted_future_val = y_future_2d[0, 0, 0].item()
-                assert abs(first_future_val_2d - extracted_future_val) < 1e-5, \
-                    f"Future value mismatch at first timestep: raw={first_future_val_2d}, extracted={extracted_future_val}"
-                
+                sample = self._build_sample(n1, n2, tcol, t_start)
+                if sample is not None:
+                    event_samples.append(sample)
+
+            # Yield complete batches — all from this event, in temporal order
+            # Tail remainder is dropped (drop_last semantics per event)
+            for i in range(0, len(event_samples) - self.batch_size + 1, self.batch_size):
+                batch_samples = event_samples[i: i + self.batch_size]
                 yield {
                     'static_graph': NonBatchableGraph(self.static_graph),
-                    'y_hist_1d': y_hist_1d,
-                    'y_hist_2d': y_hist_2d,
-                    'rain_hist_2d': rain_hist_2d,
-                    'y_future_1d': y_future_1d,
-                    'y_future_2d': y_future_2d,
-                    'rain_future_2d': rain_future_2d,
+                    'y_hist_1d':      torch.stack([s['y_hist_1d']      for s in batch_samples]),
+                    'y_hist_2d':      torch.stack([s['y_hist_2d']      for s in batch_samples]),
+                    'rain_hist_2d':   torch.stack([s['rain_hist_2d']   for s in batch_samples]),
+                    'y_future_1d':    torch.stack([s['y_future_1d']    for s in batch_samples]),
+                    'y_future_2d':    torch.stack([s['y_future_2d']    for s in batch_samples]),
+                    'rain_future_2d': torch.stack([s['rain_future_2d'] for s in batch_samples]),
                 }
 
 
@@ -1096,42 +1105,39 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
         norm_stats=norm_stats,
         history_len=history_len,
         forecast_len=forecast_len,
+        batch_size=batch_size,
         shuffle=shuffle,
         node_id_col=node_id_col,
     )
-    
-    # Custom collate function to handle dict outputs
+
+    # Collate function: dataset already yields pre-formed batches, so the
+    # DataLoader batch size is 1 — we just unwrap the outer list of length 1.
     def collate_fn(batch):
         if len(batch) == 0:
             return None
-        
-        # Get the static graph from first sample (same for all samples - shared)
-        static_graph = batch[0]['static_graph']
-        
-        # Unwrap if wrapped
+        item = batch[0]
+        static_graph = item['static_graph']
         if isinstance(static_graph, NonBatchableGraph):
             static_graph = static_graph.graph
-        
-        # Stack time series tensors
         return {
-            'static_graph': static_graph,
-            'y_hist_1d': torch.stack([b['y_hist_1d'] for b in batch]),
-            'y_hist_2d': torch.stack([b['y_hist_2d'] for b in batch]),
-            'rain_hist_2d': torch.stack([b['rain_hist_2d'] for b in batch]),
-            'y_future_1d': torch.stack([b['y_future_1d'] for b in batch]),
-            'y_future_2d': torch.stack([b['y_future_2d'] for b in batch]),
-            'rain_future_2d': torch.stack([b['rain_future_2d'] for b in batch]),
+            'static_graph':   static_graph,
+            'y_hist_1d':      item['y_hist_1d'],
+            'y_hist_2d':      item['y_hist_2d'],
+            'rain_hist_2d':   item['rain_hist_2d'],
+            'y_future_1d':    item['y_future_1d'],
+            'y_future_2d':    item['y_future_2d'],
+            'rain_future_2d': item['rain_future_2d'],
         }
-    
-    # Use torch DataLoader (not PyG) to avoid automatic batching of HeteroData
+
+    # Use torch DataLoader (not PyG) to avoid automatic batching of HeteroData.
+    # batch_size=1 because RecurrentFloodDataset already yields pre-formed batches.
     from torch.utils.data import DataLoader as TorchDataLoader
     return TorchDataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=1,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=False,
-        drop_last=True,
     )
 
 

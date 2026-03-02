@@ -31,8 +31,8 @@ from data_config import SELECTED_MODEL
 CONFIG = {
     'history_len': 10,
     'forecast_len': 1,
-    'batch_size': 12,
-    'epochs': 2,
+    'batch_size': 16,
+    'epochs': 10,
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
@@ -106,8 +106,12 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
     
     return checkpoint_path
 
-def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False):
-    """Evaluate model on a dataset with both normalized and denormalized losses."""
+def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None):
+    """Evaluate model on a dataset with both normalized and denormalized losses.
+    
+    Args:
+        max_batches: If set, only evaluate on the first N batches (useful for faster validation)
+    """
     model.eval()
     total_loss_norm = 0.0
     total_loss_denorm = 0.0
@@ -122,6 +126,10 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
+            # Stop early if max_batches is set
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+                
             if batch is None:
                 continue
 
@@ -243,21 +251,13 @@ def train():
         shuffle=True,
         split='train',
     )
-    
+
     val_dataloader = get_recurrent_dataloader(
         history_len=CONFIG['history_len'],
         forecast_len=CONFIG['forecast_len'],
         batch_size=CONFIG['batch_size'],
         shuffle=False,
         split='val',
-    )
-    
-    test_dataloader = get_recurrent_dataloader(
-        history_len=CONFIG['history_len'],
-        forecast_len=CONFIG['forecast_len'],
-        batch_size=CONFIG['batch_size'],
-        shuffle=False,
-        split='test',
     )
     
     # Get model config
@@ -293,12 +293,20 @@ def train():
     
     best_loss = float('inf')
     epoch_start_time = time.time()
-    
+    global_step = 0  # Single monotonic step counter for wandb
+
+    # Configuration for frequent monitoring
+    VAL_CHECK_INTERVAL = 50  # Every N training batches, do lightweight validation
+    VAL_SUBSET_BATCHES = 3   # Use only 3 batches for lightweight validation (very fast)
+
     for epoch in range(1, CONFIG['epochs'] + 1):
         model.train()
         epoch_loss = 0.0
         num_batches = 0
         batch_start_time = time.time()
+
+        # Epoch boundary marker — visible as a vertical annotation in wandb
+        wandb.log({'epoch': epoch}, step=global_step)
         
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
@@ -354,8 +362,9 @@ def train():
             
             epoch_loss += loss.item()
             num_batches += 1
-            
-            # Print progress
+            global_step += 1
+
+            # Print progress and log frequently
             if (batch_idx + 1) % 10 == 0:
                 avg_loss = epoch_loss / num_batches
                 elapsed = time.time() - batch_start_time
@@ -364,7 +373,22 @@ def train():
                       f"Loss: {loss.item():.6f} | "
                       f"Avg: {avg_loss:.6f} | "
                       f"{elapsed:.1f}s")
-                wandb.log({'batch_loss': loss.item()})
+                wandb.log({'loss/train_batch': loss.item(), 'loss/train_avg': avg_loss}, step=global_step)
+
+            # Lightweight validation every N batches (very cheap!)
+            if (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
+                val_loss_norm, val_loss_denorm = evaluate(
+                    model, val_dataloader, criterion, device, norm_stats,
+                    split_name=f"Val-Subset (Epoch {epoch}, Batch {batch_idx+1})",
+                    debug=False,
+                    max_batches=VAL_SUBSET_BATCHES
+                )
+                print(f"  → Quick Val Loss (Norm): {val_loss_norm:.9f}")
+                wandb.log({
+                    'loss/val_norm': val_loss_norm,
+                    'loss/val_denorm': val_loss_denorm,
+                }, step=global_step)
+                model.train()  # Switch back to training mode
         
         # End-of-epoch stats
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
@@ -372,16 +396,15 @@ def train():
         
         print(f"\n[INFO] Epoch {epoch}/{CONFIG['epochs']}: Training Loss={avg_epoch_loss:.6f} | Time: {epoch_time:.1f}s")
         
-        # Validation evaluation
-        print(f"\n[INFO] Running validation...")
-        val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=True)
-        print(f"[INFO] Comparison: Training Loss (Norm)={avg_epoch_loss:.9f}, Validation Loss (Norm)={val_loss_norm:.9f}")
+        # Full validation evaluation (now less frequent due to quick checks)
+        print(f"\n[INFO] Running full validation...")
+        val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=False)
 
         wandb.log({
-            'train_loss': avg_epoch_loss,
-            'val_loss_norm': val_loss_norm,
-            'val_loss_denorm': val_loss_denorm,
-        }, step=epoch)
+            'loss/train': avg_epoch_loss,
+            'loss/val_norm': val_loss_norm,
+            'loss/val_denorm': val_loss_denorm,
+        }, step=global_step)
         
         print()
         
@@ -401,17 +424,11 @@ def train():
         
         epoch_start_time = time.time()
     
-    # Final test evaluation
-    print("\n[INFO] Running final test set evaluation...")
-    test_loss_norm, test_loss_denorm = evaluate(model, test_dataloader, criterion, device, norm_stats, split_name="Test")
-    
     # Final summary
     print("\n" + "="*70)
     print("Training Complete")
     print("="*70)
     print(f"Best training loss (Normalized): {best_loss:.6f}")
-    print(f"Test Loss (Normalized): {test_loss_norm:.9f}")
-    print(f"Test Loss (Denormalized): {test_loss_denorm:.6f}")
     print(f"\nInterpretation: Denormalized loss is in original water level units (meters)")
     print(f"Checkpoints saved to: {CONFIG['save_dir']}")
     final_model_path = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')

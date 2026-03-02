@@ -38,7 +38,8 @@ DATA_FOLDER = "data"
 MAX_EVENTS = -1  # -1 means use all available events
 
 # Training configuration
-VALIDATION_SPLIT = 0.1  # 10% validation split
+VALIDATION_SPLIT = 0.2  # 20% validation split (randomly selected events)
+TEST_SPLIT = 0.0        # No held-out test set — maximise training data
 RANDOM_SEED = 42
 
 

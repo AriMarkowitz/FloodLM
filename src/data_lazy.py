@@ -279,10 +279,14 @@ def initialize_data():
     
     # CRITICAL: Split events BEFORE computing normalization to prevent data leakage
     from data_config import VALIDATION_SPLIT, RANDOM_SEED
+    try:
+        from data_config import TEST_SPLIT
+    except ImportError:
+        TEST_SPLIT = 0.0
     event_splits = _split_events(
         event_dirs,
         val_split=VALIDATION_SPLIT,
-        test_split=VALIDATION_SPLIT,  # Use same split for test
+        test_split=TEST_SPLIT,
         random_seed=RANDOM_SEED
     )
     
@@ -449,16 +453,12 @@ def initialize_data():
     train_event_file_list = [(event_idx, f, 'train') for event_idx, f in enumerate(train_events)]
     val_event_file_list = [(event_idx, f, 'val') for event_idx, f in enumerate(val_events)]
     test_event_file_list = [(event_idx, f, 'test') for event_idx, f in enumerate(test_events)]
-    
-    # Legacy: all events list (for backward compatibility)
-    event_file_list = train_event_file_list + val_event_file_list + test_event_file_list
-    
+
     # Cache and return
     _cache = {
-        'event_file_list': event_file_list,  # All events (legacy)
-        'train_event_file_list': train_event_file_list,  # Training events only
-        'val_event_file_list': val_event_file_list,      # Validation events only
-        'test_event_file_list': test_event_file_list,    # Test events only
+        'train_event_file_list': train_event_file_list,
+        'val_event_file_list': val_event_file_list,
+        'test_event_file_list': test_event_file_list,
         'event_splits': event_splits,  # Split metadata
         'edges1d': edges1d,
         'edges2d': edges2d,
