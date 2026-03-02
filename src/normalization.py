@@ -105,9 +105,9 @@ class FeatureNormalizer:
             vmax = vals_transformed.max()
             
             self.static_params[col] = {
-                'min': vmin,
-                'max': vmax,
-                'log': use_log,
+                'min': float(vmin),
+                'max': float(vmax),
+                'log': bool(use_log),
             }
             
             # Print normalization range
@@ -159,7 +159,7 @@ class FeatureNormalizer:
             self.dynamic_params[col] = {
                 'min': float(vmin),
                 'max': float(vmax),
-                'log': use_log,
+                'log': bool(use_log),
             }
             
             # Print normalization range

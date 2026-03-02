@@ -3,3 +3,4 @@ checkpoints/*
 __pycache__/*
 logs/*
 src/__pycache__/*
+wandb/*

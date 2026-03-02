@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 import numpy as np
+import wandb
 
 # Setup paths (works whether launched via train.py wrapper or directly)
 THIS_DIR = Path(__file__).resolve().parent
@@ -33,7 +34,7 @@ CONFIG = {
     'batch_size': 12,
     'epochs': 2,
     'lr': 1e-3,
-    'device': 'mps' if torch.backends.mps.is_available() else 'cpu',
+    'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
     'checkpoint_interval': 1,  # Save every N epochs
 }
@@ -69,7 +70,7 @@ def save_normalization_stats(norm_stats, save_dir, model_id=None):
     # Save as JSON
     stats_path = os.path.join(save_dir, f'{model_id}_normalization_stats.json')
     with open(stats_path, 'w') as f:
-        json.dump(stats_to_save, f, indent=2, default=str)
+        json.dump(stats_to_save, f, indent=2)
     
     # Also save as pickle for full FeatureNormalizer objects (optional, for reference)
     normalizer_path = os.path.join(save_dir, f'{model_id}_normalizers.pkl')
@@ -116,72 +117,84 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
     all_errors_norm = []
     all_errors_denorm = []
     
+    wl_col_1d = norm_stats['node1d_cols'].index('water_level')
+    wl_col_2d = norm_stats['node2d_cols'].index('water_level')
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             if batch is None:
                 continue
-            
+
             static_graph = batch['static_graph'].to(device)
+            y_hist_1d = batch['y_hist_1d'].to(device)
             y_hist_2d = batch['y_hist_2d'].to(device)
             rain_hist_2d = batch['rain_hist_2d'].to(device)
+            y_future_1d = batch['y_future_1d'].to(device)
             y_future_2d = batch['y_future_2d'].to(device)
             rain_future_2d = batch['rain_future_2d'].to(device)
-            
+
             batch_size = y_hist_2d.size(0)
             batch_loss_norm = 0.0
             batch_loss_denorm = 0.0
-            
+
             for i in range(batch_size):
-                y_hist_sample = y_hist_2d[i]
-                rain_hist_sample = rain_hist_2d[i]
-                y_future_sample = y_future_2d[i]
-                rain_future_sample = rain_future_2d[i]
-                
                 predictions = model.forward_unroll(
                     data=static_graph,
-                    y_hist_true=y_hist_sample,
-                    rain_hist=rain_hist_sample,
-                    rain_future=rain_future_sample,
+                    y_hist_1d=y_hist_1d[i],
+                    y_hist_2d=y_hist_2d[i],
+                    rain_hist=rain_hist_2d[i],
+                    rain_future=rain_future_2d[i],
                     make_x_dyn=lambda y, r, data: {
-                        'oneD': torch.zeros((data['oneD'].num_nodes, 1), device=device),
-                        'twoD': torch.cat([y, r], dim=-1),
+                        'oneD': y['oneD'],
+                        'twoD': torch.cat([y['twoD'], r], dim=-1),
                     },
                     rollout_steps=1,
                     device=device,
                 )
-                
-                # Loss on normalized data
-                sample_loss_norm = criterion(predictions, y_future_sample)
+                # predictions = {'oneD': [T, N_1d, 1], 'twoD': [T, N_2d, 1]}
+
+                # Node-count-weighted normalized loss
+                n_1d = predictions['oneD'].shape[1]
+                n_2d = predictions['twoD'].shape[1]
+                n_total = n_1d + n_2d
+                loss_1d = criterion(predictions['oneD'], y_future_1d[i])
+                loss_2d = criterion(predictions['twoD'], y_future_2d[i])
+                sample_loss_norm = (n_1d * loss_1d + n_2d * loss_2d) / n_total
                 batch_loss_norm += sample_loss_norm
-                
-                # Denormalize for interpretability (water level is column 0)
-                pred_denorm = unnormalize_col(predictions, norm_stats, col=0, node_type='twoD')
-                target_denorm = unnormalize_col(y_future_sample, norm_stats, col=0, node_type='twoD')
-                
-                # Loss on denormalized data (in original units)
-                sample_loss_denorm = criterion(pred_denorm, target_denorm)
+
+                # Denormalize using per-type normalizers
+                pred_1d_denorm = unnormalize_col(predictions['oneD'], norm_stats, col=wl_col_1d, node_type='oneD')
+                target_1d_denorm = unnormalize_col(y_future_1d[i], norm_stats, col=wl_col_1d, node_type='oneD')
+                pred_2d_denorm = unnormalize_col(predictions['twoD'], norm_stats, col=wl_col_2d, node_type='twoD')
+                target_2d_denorm = unnormalize_col(y_future_2d[i], norm_stats, col=wl_col_2d, node_type='twoD')
+
+                loss_1d_denorm = criterion(pred_1d_denorm, target_1d_denorm)
+                loss_2d_denorm = criterion(pred_2d_denorm, target_2d_denorm)
+                sample_loss_denorm = (n_1d * loss_1d_denorm + n_2d * loss_2d_denorm) / n_total
                 batch_loss_denorm += sample_loss_denorm
-                
+
                 # Debug: collect error statistics
-                if debug and batch_idx < 5:  # First 5 batches
-                    error_norm = (predictions - y_future_sample).abs()
-                    error_denorm = (pred_denorm - target_denorm).abs()
-                    all_errors_norm.append(error_norm.cpu().numpy())
-                    all_errors_denorm.append(error_denorm.cpu().numpy())
-            
+                if debug and batch_idx < 5:
+                    all_errors_norm.append((predictions['twoD'] - y_future_2d[i]).abs().cpu().numpy())
+                    all_errors_denorm.append((pred_2d_denorm - target_2d_denorm).abs().cpu().numpy())
+
             loss_norm = batch_loss_norm / batch_size
             loss_denorm = batch_loss_denorm / batch_size
             total_loss_norm += loss_norm.item()
             total_loss_denorm += loss_denorm.item()
             num_batches += 1
-            
+
             # Debug print for first few batches
             if debug and batch_idx < 3:
                 print(f"  [DEBUG] Batch {batch_idx}: norm_loss={loss_norm.item():.9f}, denorm_loss={loss_denorm.item():.9f}")
-                print(f"    Pred range (norm): [{predictions.min():.6f}, {predictions.max():.6f}]")
-                print(f"    Target range (norm): [{y_future_sample.min():.6f}, {y_future_sample.max():.6f}]")
-                print(f"    Pred range (denorm): [{pred_denorm.min():.6f}, {pred_denorm.max():.6f}]")
-                print(f"    Target range (denorm): [{target_denorm.min():.6f}, {target_denorm.max():.6f}]")
+                print(f"    1D pred range (norm):   [{predictions['oneD'].min():.6f}, {predictions['oneD'].max():.6f}]")
+                print(f"    1D target range (norm): [{y_future_1d[i].min():.6f}, {y_future_1d[i].max():.6f}]")
+                print(f"    1D pred range (denorm): [{pred_1d_denorm.min():.6f}, {pred_1d_denorm.max():.6f}]")
+                print(f"    1D target range (denorm):[{target_1d_denorm.min():.6f}, {target_1d_denorm.max():.6f}]")
+                print(f"    2D pred range (norm):   [{predictions['twoD'].min():.6f}, {predictions['twoD'].max():.6f}]")
+                print(f"    2D target range (norm): [{y_future_2d[i].min():.6f}, {y_future_2d[i].max():.6f}]")
+                print(f"    2D pred range (denorm): [{pred_2d_denorm.min():.6f}, {pred_2d_denorm.max():.6f}]")
+                print(f"    2D target range (denorm):[{target_2d_denorm.min():.6f}, {target_2d_denorm.max():.6f}]")
     
     avg_loss_norm = total_loss_norm / num_batches if num_batches > 0 else 0
     avg_loss_denorm = total_loss_denorm / num_batches if num_batches > 0 else 0
@@ -203,6 +216,8 @@ def train():
     print("FloodLM Training Script")
     print("="*70)
     
+    wandb.init(project="floodlm", config=CONFIG)
+
     device = torch.device(CONFIG['device'])
     print(f"[INFO] Device: {device}")
     
@@ -291,39 +306,42 @@ def train():
             
             # Extract batch data
             static_graph = batch['static_graph'].to(device)
-            y_hist_2d = batch['y_hist_2d'].to(device)      # [B, H, N, 1]
-            rain_hist_2d = batch['rain_hist_2d'].to(device)  # [B, H, N, R]
-            y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N, 1]
-            rain_future_2d = batch['rain_future_2d'].to(device)  # [B, T, N, R]
-            
+            y_hist_1d = batch['y_hist_1d'].to(device)        # [B, H, N_1d, 1]
+            y_hist_2d = batch['y_hist_2d'].to(device)        # [B, H, N_2d, 1]
+            rain_hist_2d = batch['rain_hist_2d'].to(device)  # [B, H, N_2d, R]
+            y_future_1d = batch['y_future_1d'].to(device)    # [B, T, N_1d, 1]
+            y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N_2d, 1]
+            rain_future_2d = batch['rain_future_2d'].to(device)  # [B, T, N_2d, R]
+
             batch_size = y_hist_2d.size(0)
-            
+
             # Process each sample in the batch
             batch_loss = 0.0
             for i in range(batch_size):
-                # Extract single sample [H, N, 1] or [T, N, R]
-                y_hist_sample = y_hist_2d[i]       # [H, N, 1]
-                rain_hist_sample = rain_hist_2d[i]  # [H, N, R]
-                y_future_sample = y_future_2d[i]    # [T, N, 1]
-                rain_future_sample = rain_future_2d[i]  # [T, N, R]
-                
                 # Forward pass for this sample
                 predictions = model.forward_unroll(
                     data=static_graph,
-                    y_hist_true=y_hist_sample,
-                    rain_hist=rain_hist_sample,
-                    rain_future=rain_future_sample,
+                    y_hist_1d=y_hist_1d[i],
+                    y_hist_2d=y_hist_2d[i],
+                    rain_hist=rain_hist_2d[i],
+                    rain_future=rain_future_2d[i],
                     make_x_dyn=lambda y, r, data: {
-                        'oneD': torch.zeros((data['oneD'].num_nodes, 1), device=device),
-                        'twoD': torch.cat([y, r], dim=-1),
+                        'oneD': y['oneD'],
+                        'twoD': torch.cat([y['twoD'], r], dim=-1),
                     },
                     rollout_steps=CONFIG['forecast_len'],
                     device=device,
                 )
-                
-                # Compute loss for this sample
-                sample_loss = criterion(predictions, y_future_sample)
-                
+                # predictions = {'oneD': [T, N_1d, 1], 'twoD': [T, N_2d, 1]}
+
+                # Node-count-weighted loss across both node types
+                n_1d = predictions['oneD'].shape[1]
+                n_2d = predictions['twoD'].shape[1]
+                n_total = n_1d + n_2d
+                loss_1d = criterion(predictions['oneD'], y_future_1d[i])
+                loss_2d = criterion(predictions['twoD'], y_future_2d[i])
+                sample_loss = (n_1d * loss_1d + n_2d * loss_2d) / n_total
+
                 batch_loss += sample_loss
             
             # Average loss over batch
@@ -346,6 +364,7 @@ def train():
                       f"Loss: {loss.item():.6f} | "
                       f"Avg: {avg_loss:.6f} | "
                       f"{elapsed:.1f}s")
+                wandb.log({'batch_loss': loss.item()})
         
         # End-of-epoch stats
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
@@ -357,6 +376,12 @@ def train():
         print(f"\n[INFO] Running validation...")
         val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=True)
         print(f"[INFO] Comparison: Training Loss (Norm)={avg_epoch_loss:.9f}, Validation Loss (Norm)={val_loss_norm:.9f}")
+
+        wandb.log({
+            'train_loss': avg_epoch_loss,
+            'val_loss_norm': val_loss_norm,
+            'val_loss_denorm': val_loss_denorm,
+        }, step=epoch)
         
         print()
         

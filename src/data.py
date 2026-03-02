@@ -1195,7 +1195,7 @@ def get_model_config():
         "node_static_dims": node_static_dims,
         "node_dyn_input_dims": node_dyn_input_dims,
         "edge_static_dims": edge_static_dims,
-        "pred_node_type": "twoD",  # predict 2D nodes (typically the focus)
+        # pred_node_type removed: model now predicts both oneD and twoD nodes
     }
 
 

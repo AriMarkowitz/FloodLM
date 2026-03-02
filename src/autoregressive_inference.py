@@ -291,8 +291,8 @@ def autoregressive_rollout_both(
     
     with torch.no_grad():
         for t in range(history_len, T_total):
-            d1 = model.head(h['oneD'])
-            d2 = model.head(h['twoD'])
+            d1 = model.heads['oneD'](h['oneD'])
+            d2 = model.heads['twoD'](h['twoD'])
 
             # Model predicts absolute water levels
             y1_next = d1
@@ -341,9 +341,12 @@ def denormalize_predictions(predictions, norm_stats, node_type):
         wl_params = norm.dynamic_params['water_level']
         print(f"[DEBUG] {node_type} water_level normalizer params: {wl_params}")
     
+    cols = norm_stats['node1d_cols'] if node_type == 'oneD' else norm_stats['node2d_cols']
+    wl_col = cols.index('water_level')
+
     denorm_preds = []
     for t in range(T):
-        pred_t = unnormalize_col(predictions[t], norm_stats, col=0, node_type=node_type)
+        pred_t = unnormalize_col(predictions[t], norm_stats, col=wl_col, node_type=node_type)
         denorm_preds.append(pred_t.cpu().numpy())
     
     denorm_stack = np.stack(denorm_preds, axis=0)  # [T, N, 1]

@@ -372,7 +372,7 @@ class FloodAutoregressiveHeteroModel(nn.Module):
     """
     High-level model:
       - HeteroTransportCell: evolves hidden state over time
-      - Head: maps hidden state -> predicted water level (or delta)
+      - Heads: maps hidden state -> predicted water level for both 1D and 2D nodes
     """
     def __init__(
         self,
@@ -381,7 +381,6 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         node_static_dims: dict[str, int],
         node_dyn_input_dims: dict[str, int],
         edge_static_dims: dict[tuple[str, str, str], int],
-        pred_node_type: str,    # node type whose water level we predict
         h_dim: int = 64,
         msg_dim: int = 64,
         hidden_dim: int = 128,
@@ -390,7 +389,6 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
-        self.pred_node_type = pred_node_type
 
         # The recurrent graph cell
         self.cell = HeteroTransportCell(
@@ -406,14 +404,18 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         )
 
         # ------------------------------------------------------------
-        # Prediction head:
-        # "Here we predict our target future water level"
+        # Prediction heads (one per node type):
+        # Each head maps hidden state -> predicted water level
+        # Separate heads allow independent learning per node type
         # ------------------------------------------------------------
-        self.head = nn.Sequential(
-            nn.Linear(h_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.heads = nn.ModuleDict({
+            nt: nn.Sequential(
+                nn.Linear(h_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            for nt in node_types
+        })
 
     def init_hidden(self, data: HeteroData, device: torch.device) -> dict[str, torch.Tensor]:
         """Initialize hidden state (this is the memory of past states)."""
@@ -422,68 +424,80 @@ class FloodAutoregressiveHeteroModel(nn.Module):
             h[nt] = torch.zeros((data[nt].num_nodes, self.cell.h_dim), device=device)
         return h
 
-    def predict_water_level(self, h: dict[str, torch.Tensor]) -> torch.Tensor:
+    def predict_water_levels(self, h: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """
-        Decode hidden state at current step into a prediction for the target nodes.
+        Decode hidden states into water level predictions for all node types.
+
+        Returns:
+            {'oneD': [N_1d, 1], 'twoD': [N_2d, 1]}
         """
-        return self.head(h[self.pred_node_type])  # [N_pred, 1]
+        return {nt: self.heads[nt](h[nt]) for nt in self.heads}
 
     def forward_unroll(
         self,
         data: HeteroData,
-        # Provided by you (depends on how you store your data):
-        y_hist_true: torch.Tensor,     # [H, N_pred, 1] true water levels for warm start
-        rain_hist: torch.Tensor,       # [H, N_pred, R] forcing for warm start
-        rain_future: torch.Tensor,     # [T, N_pred, R] forcing for rollout
-        make_x_dyn,                    # function: builds x_dyn_t dict from (y_input, rain_input)
+        y_hist_1d: torch.Tensor,       # [H, N_1d, 1] true 1D water levels for warm start
+        y_hist_2d: torch.Tensor,       # [H, N_2d, 1] true 2D water levels for warm start
+        rain_hist: torch.Tensor,       # [H, N_2d, R] forcing for warm start
+        rain_future: torch.Tensor,     # [T, N_2d, R] forcing for rollout
+        make_x_dyn,                    # function(y_pred: dict, rain_2d, data) -> x_dyn dict
         rollout_steps: int,
         device: torch.device,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """
         Run:
-          1) Warm start (teacher forcing) for H steps using true y
-          2) Autoregressive rollout for rollout_steps using predicted y
+          1) Warm start (teacher forcing) for H steps using true y for both node types
+          2) Autoregressive rollout for rollout_steps using predicted y for both node types
 
-        Returns predicted water levels:
-          y_preds: [rollout_steps, N_pred, 1]
+        make_x_dyn signature: (y_pred: {'oneD': [N_1d,1], 'twoD': [N_2d,1]}, rain_2d: [N_2d,R], data)
+          -> {'oneD': [N_1d, dyn_1d], 'twoD': [N_2d, dyn_2d]}
+
+        Returns:
+            {'oneD': [rollout_steps, N_1d, 1], 'twoD': [rollout_steps, N_2d, 1]}
         """
         h = self.init_hidden(data, device=device)
 
         # ------------------------------------------------------------
         # (1) Warm start: feed true past states so hidden state learns history
         # ------------------------------------------------------------
-        H = y_hist_true.size(0)
+        H = y_hist_1d.size(0)
         for k in range(H):
-            y_in = y_hist_true[k].to(device)  # true water
-            r_in = rain_hist[k].to(device)    # observed rain
-            x_dyn_t = make_x_dyn(y_in, r_in, data)  # <-- YOU define for all node types
-            h = self.cell(data, h, x_dyn_t)         # <-- hidden state updated
+            y_true_k = {
+                'oneD': y_hist_1d[k].to(device),
+                'twoD': y_hist_2d[k].to(device),
+            }
+            r_in = rain_hist[k].to(device)
+            x_dyn_t = make_x_dyn(y_true_k, r_in, data)
+            h = self.cell(data, h, x_dyn_t)
 
-        # We start rollout from the last observed water level
-        y_t = y_hist_true[-1].to(device)
+        # Start rollout from last observed water levels
+        y_t = {
+            'oneD': y_hist_1d[-1].to(device),
+            'twoD': y_hist_2d[-1].to(device),
+        }
 
-        preds = []
+        preds_1d = []
+        preds_2d = []
 
         # ------------------------------------------------------------
         # (2) Autoregressive rollout:
-        #     - predict next water level
-        #     - feed prediction forward as input at next step
+        #     - predict next water level for both node types
+        #     - feed predictions forward as inputs at next step
         #     - use known future rainfall forecast
         # ------------------------------------------------------------
         for t in range(rollout_steps):
-            # "Here we predict our target future water level (absolute, not delta)"
-            y_next = self.predict_water_level(h)  # [N_pred, 1]
+            y_next = self.predict_water_levels(h)  # {'oneD': [N_1d,1], 'twoD': [N_2d,1]}
 
-            preds.append(y_next)
+            preds_1d.append(y_next['oneD'])
+            preds_2d.append(y_next['twoD'])
 
-            # "Here we pass dynamic data (predicted y + forecast rain) into the graph"
             r_next = rain_future[t].to(device)
             x_dyn_next = make_x_dyn(y_next, r_next, data)
 
-            # update hidden state forward one step
             h = self.cell(data, h, x_dyn_next)
-
-            # advance
             y_t = y_next
 
-        return torch.stack(preds, dim=0)  # [rollout_steps, N_pred, 1]
+        return {
+            'oneD': torch.stack(preds_1d, dim=0),  # [rollout_steps, N_1d, 1]
+            'twoD': torch.stack(preds_2d, dim=0),  # [rollout_steps, N_2d, 1]
+        }
