@@ -38,6 +38,8 @@ CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
     'checkpoint_interval': 1,  # Save every N epochs
+    'early_stopping_patience': 3,   # Stop if val loss doesn't improve for N epochs
+    'early_stopping_min_rel_delta': 0.01,  # Minimum 1% relative improvement to count
 }
 
 def save_normalization_stats(norm_stats, save_dir, model_id=None):
@@ -295,6 +297,8 @@ def train():
     print(f"{'='*70}\n")
 
     best_loss = float('inf')
+    best_val_loss = float('inf')
+    early_stopping_counter = 0
     epoch_start_time = time.time()
     global_step = 0  # Single monotonic step counter for wandb
 
@@ -405,12 +409,27 @@ def train():
             'loss/val_norm': val_loss_norm,
             'loss/val_denorm': val_loss_denorm,
         }, step=global_step)
-        
+
+        # Early stopping: check if val loss improved by at least min_rel_delta
+        min_rel_delta = CONFIG['early_stopping_min_rel_delta']
+        if val_loss_norm < best_val_loss * (1.0 - min_rel_delta):
+            best_val_loss = val_loss_norm
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+            print(f"[INFO] No significant val improvement ({early_stopping_counter}/{CONFIG['early_stopping_patience']})")
+
         print()
-        
+
         # Checkpoint
         if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
             save_checkpoint(model, epoch, avg_epoch_loss, CONFIG['save_dir'], CONFIG)
+
+        # Early stopping trigger
+        if early_stopping_counter >= CONFIG['early_stopping_patience']:
+            print(f"[INFO] Early stopping triggered after {epoch} epochs (no >{min_rel_delta*100:.0f}% val improvement for {CONFIG['early_stopping_patience']} epochs)")
+            wandb.log({'early_stopped_epoch': epoch}, step=global_step)
+            break
         
         # Track best
         if avg_epoch_loss < best_loss:
