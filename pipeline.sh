@@ -146,28 +146,6 @@ EOF
 fi
 
 ################################################################################
-# Pre-flight Checks
-################################################################################
-
-log_info "Performing pre-flight checks..."
-
-# Check data directory
-if [ ! -d "${SCRIPT_DIR}/data" ]; then
-    log_error "Data directory not found: ${SCRIPT_DIR}/data"
-    exit 1
-fi
-
-# Check source files
-for file in src/model.py src/data.py data_config.py example_usage.py; do
-    if [ ! -f "${SCRIPT_DIR}/${file}" ]; then
-        log_error "File not found: ${SCRIPT_DIR}/${file}"
-        exit 1
-    fi
-done
-
-log_info "Pre-flight checks passed"
-
-################################################################################
 # Environment Setup
 ################################################################################
 
