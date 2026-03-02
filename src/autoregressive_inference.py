@@ -42,7 +42,7 @@ from data_config import SELECTED_MODEL, DATA_FOLDER, BASE_PATH
 def load_checkpoint(checkpoint_path, device):
     """Load trained model from checkpoint."""
     print(f"[INFO] Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Get model config
     model_config = get_model_config()
@@ -317,31 +317,7 @@ def autoregressive_rollout_both(
 def denormalize_predictions(predictions, norm_stats, node_type):
     """Denormalize water level predictions for a node type."""
     T, N, _ = predictions.shape
-    
-    # DEBUG: Check pred range before denorm
-    pred_min, pred_max = predictions.min().item(), predictions.max().item()
-    pred_mean = predictions.mean().item()
-    pred_median = torch.median(predictions).item()
-    print(f"[DEBUG] Normalized predictions ({node_type}): min={pred_min:.6f}, max={pred_max:.6f}, mean={pred_mean:.6f}, median={pred_median:.6f}, shape={predictions.shape}")
-    
-    # Check if predictions are outside [0,1] range (indicates denormalization will fail)
-    outside_01 = ((predictions < -0.1) | (predictions > 1.1)).sum().item()
-    if outside_01 > 0:
-        pct = 100 * outside_01 / (T * N)
-        print(f"[WARN] {pct:.1f}% of predictions outside [0,1] range - denormalization will produce garbage!")
-    
-    # DEBUG: Check normalizer params
-    if node_type == 'oneD':
-        norm = norm_stats['normalizer_1d']
-        params_dict = 'dynamic_1d_params'
-    else:
-        norm = norm_stats['normalizer_2d']
-        params_dict = 'dynamic_2d_params'
-    
-    if hasattr(norm, 'dynamic_params') and 'water_level' in norm.dynamic_params:
-        wl_params = norm.dynamic_params['water_level']
-        print(f"[DEBUG] {node_type} water_level normalizer params: {wl_params}")
-    
+
     cols = norm_stats['node1d_cols'] if node_type == 'oneD' else norm_stats['node2d_cols']
     wl_col = cols.index('water_level')
 
@@ -349,16 +325,12 @@ def denormalize_predictions(predictions, norm_stats, node_type):
     for t in range(T):
         pred_t = unnormalize_col(predictions[t], norm_stats, col=wl_col, node_type=node_type)
         denorm_preds.append(pred_t.cpu().numpy())
-    
+
     denorm_stack = np.stack(denorm_preds, axis=0)  # [T, N, 1]
-    
+
     # Clamp to physical bounds: water level cannot be negative
     denorm_stack = np.maximum(denorm_stack, 0.0)
-    
-    # DEBUG: Check denorm range
-    denorm_min, denorm_max = denorm_stack.min(), denorm_stack.max()
-    print(f"[DEBUG] Denormalized predictions ({node_type}): min={denorm_min:.6f}, max={denorm_max:.6f}")
-    
+
     return denorm_stack
 
 
@@ -401,48 +373,25 @@ def process_all_events(
     print(f"\n[INFO] Processing {len(test_events)} test events...")
     
     all_rows = []
-    debug_printed = False
-    
     # Build static graph once (same for all events)
     static_graph = build_static_graph_from_cache(data).to(device)
-    
+
     for event_idx, event_path in enumerate(tqdm(test_events, desc="Processing events")):
         if max_events is not None and event_idx >= max_events:
             break
-        
+
         try:
             # Get event metadata
             event_id, event_dir = get_event_metadata(event_path)
-            
+
             # Load event data
             node_1d, node_2d = load_event_data(event_dir)
-            
-            # DEBUG: Print raw data from first event
-            if event_idx == 0 and not debug_printed:
-                print(f"\n[DEBUG] ===== RAW TEST DATA (Model {model_id}, Event {event_id}) =====")
-                if 'water_level' in node_2d.columns:
-                    raw_wl_2d = node_2d['water_level'].values
-                    print(f"[DEBUG] 2D raw water_level: min={raw_wl_2d.min():.2f}, max={raw_wl_2d.max():.2f}, mean={raw_wl_2d.mean():.2f}")
-                    print(f"[DEBUG]   Sample values: {raw_wl_2d[:5]}")
-                if 'water_level' in node_1d.columns:
-                    raw_wl_1d = node_1d['water_level'].values
-                    print(f"[DEBUG] 1D raw water_level: min={raw_wl_1d.min():.2f}, max={raw_wl_1d.max():.2f}, mean={raw_wl_1d.mean():.2f}")
-                    print(f"[DEBUG]   Sample values: {raw_wl_1d[:5]}")
-                debug_printed = True
-            
+
             # Prepare tensors
             y1_all, y2_all, rain2_all, timesteps, node_ids_1d, node_ids_2d = prepare_event_tensors(
                 node_1d, node_2d, norm_stats, device
             )
-            
-            # DEBUG: Check normalized values after prepare_tensors
-            if event_idx == 0 and debug_printed:
-                print(f"\n[DEBUG] ===== NORMALIZED DATA TO MODEL =====")
-                print(f"[DEBUG] y1_all (1D, normalized): min={y1_all.min():.6f}, max={y1_all.max():.6f}, shape={y1_all.shape}")
-                print(f"[DEBUG]   Sample: {y1_all[:2, 0, 0]}")
-                print(f"[DEBUG] y2_all (2D, normalized): min={y2_all.min():.6f}, max={y2_all.max():.6f}, shape={y2_all.shape}")
-                print(f"[DEBUG]   Sample: {y2_all[:2, 0, 0]}")
-            
+
             T_total = y2_all.size(0)
             
             if T_total < 11:  # Need at least 10 for history + 1 to predict
@@ -632,28 +581,22 @@ def main():
         
         print(f"[INFO] Found {len(test_events)} test events for Model {model_id}")
         
-        # Determine model-specific checkpoint
+        # Find checkpoint in checkpoint_dir (checkpoints/latest/ contains all models)
         checkpoint_dir = args.checkpoint_dir
-        
-        # Try model-specific checkpoint patterns
-        model_checkpoint_path = None
         candidates = [
             os.path.join(checkpoint_dir, f"Model_{model_id}_best.pt"),
+            os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_003.pt"),
             os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_002.pt"),
             os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_001.pt"),
         ]
-        
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                model_checkpoint_path = candidate
-                break
-        
+        model_checkpoint_path = next((c for c in candidates if os.path.exists(c)), None)
+
         if model_checkpoint_path is None:
             print(f"[ERROR] No checkpoint found for Model {model_id}!")
             print(f"[ERROR] Tried: {candidates}")
             print(f"[ERROR] Please train Model_{model_id} first")
             continue
-        
+
         print(f"[INFO] Using checkpoint: {model_checkpoint_path}")
         
         # Load model for this specific model_id (architecture depends on graph size)
@@ -668,15 +611,6 @@ def main():
             norm_stats['normalizer_1d'] = model_normalizers['normalizer_1d']
             norm_stats['normalizer_2d'] = model_normalizers['normalizer_2d']
             print(f"[INFO] Loaded model-specific normalizers for Model {model_id}")
-            
-            # DEBUG: Print normalizer params for water_level
-            norm_1d = model_normalizers['normalizer_1d']
-            norm_2d = model_normalizers['normalizer_2d']
-            if 'water_level' in norm_2d.dynamic_params:
-                wl_params = norm_2d.dynamic_params['water_level']
-                print(f"[DEBUG] water_level (dynamic, 2D): min={wl_params['min']:.6f}, max={wl_params['max']:.6f}, log={wl_params['log']}")
-            else:
-                print(f"[DEBUG] water_level not found in 2D dynamic params. Available: {list(norm_2d.dynamic_params.keys())[:5]}")
         except FileNotFoundError as e:
             print(f"[WARN] {e}")
             print(f"[WARN] Using normalizers from cache (may not match training)")

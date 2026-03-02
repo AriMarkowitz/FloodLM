@@ -964,7 +964,7 @@ class CachedGraphDataset(IterableDataset):
             random.shuffle(files)
         
         for fpath in files:
-            data = torch.load(fpath)
+            data = torch.load(fpath, weights_only=False)
             yield data
 
 

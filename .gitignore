@@ -4,4 +4,4 @@ __pycache__/*
 logs/*
 src/__pycache__/*
 wandb/*
-submission_firsttry.csv
+submission_*.csv

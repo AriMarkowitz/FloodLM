@@ -30,7 +30,7 @@ echo "GPUs:          $CUDA_VISIBLE_DEVICES"
 echo "Started:       $(date)"
 echo ""
 
-bash pipeline.sh auto all
+bash run/pipeline_inference.sh auto all
 
 echo ""
 echo "Finished: $(date)"

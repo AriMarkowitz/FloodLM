@@ -24,7 +24,9 @@
 
   5. **Loss**: `nn.MSELoss` already averages over time steps, so loss scale stays comparable across different `h` values. Apply the same σ-weighted 50/50 formula.
 
-  6. **Log `rollout_steps` to wandb** each batch so you can see the horizon distribution during training.
+  6. **Horizon-stratified wandb logging** — two complementary signals:
+     - `curriculum/rollout_steps` (scalar per batch): lets you verify the horizon distribution is uniform and advancing as expected.
+     - `loss/train_h{rollout_steps}` (e.g. `loss/train_h1`, `loss/train_h8`, `loss/train_h32`): log the batch loss under a horizon-specific key so wandb shows separate curves per rollout length. This answers "is h=32 loss improving while h=1 stays flat?" — the key curriculum training signal. Simple to implement: `wandb.log({f"loss/train_h{rollout_steps}": loss.item(), "curriculum/rollout_steps": rollout_steps})`.
 
   7. **Validation**: evaluate at a fixed horizon (e.g. h=32) AND h=1, so you can track both rollout performance and regression on the 1-step baseline.
 

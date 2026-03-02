@@ -286,15 +286,15 @@ def train():
     wandb.init(project="floodlm", name=run_name, config=CONFIG)
 
     # Create a dated run subdirectory so each training run is isolated.
-    # Also update a 'latest' symlink so inference always finds the most recent run.
+    # Also maintain a shared checkpoints/latest/ directory that always contains
+    # the most recent best checkpoint + normalizers for EVERY model, so inference
+    # can find Model_1 and Model_2 files in one place regardless of training order.
     run_dir = os.path.join(CONFIG['save_dir'], run_name)
     os.makedirs(run_dir, exist_ok=True)
-    latest_link = os.path.join(CONFIG['save_dir'], 'latest')
-    if os.path.islink(latest_link):
-        os.remove(latest_link)
-    os.symlink(os.path.abspath(run_dir), latest_link)
+    latest_dir = os.path.join(CONFIG['save_dir'], 'latest')
+    os.makedirs(latest_dir, exist_ok=True)
     print(f"[INFO] Checkpoint dir: {run_dir}")
-    print(f"[INFO] Latest symlink: {latest_link} → {run_dir}")
+    print(f"[INFO] Latest dir:     {latest_dir}")
 
     device = torch.device(CONFIG['device'])
     print(f"[INFO] Device: {device}")
@@ -526,6 +526,14 @@ def train():
                 import shutil
                 shutil.copy(best_checkpoint, best_path)
                 print(f"[INFO] New best model saved: {best_path} (val_loss={val_loss_norm:.6e})")
+                # Mirror into latest/ so inference always finds all models in one place
+                shutil.copy(best_checkpoint, os.path.join(latest_dir, f'{SELECTED_MODEL}_best.pt'))
+                for fname in [f'{SELECTED_MODEL}_normalizers.pkl',
+                               f'{SELECTED_MODEL}_normalization_stats.json']:
+                    src = os.path.join(run_dir, fname)
+                    if os.path.exists(src):
+                        shutil.copy(src, os.path.join(latest_dir, fname))
+                print(f"[INFO] Mirrored best checkpoint + normalizers to {latest_dir}")
         else:
             early_stopping_counter += 1
             print(f"[INFO] No significant val improvement ({early_stopping_counter}/{CONFIG['early_stopping_patience']})")
@@ -547,7 +555,7 @@ def train():
     print(f"Best validation loss (Normalized): {best_val_loss:.6f}")
     print(f"\nInterpretation: Denormalized loss is in original water level units (meters)")
     print(f"Checkpoints saved to: {run_dir}")
-    print(f"Latest symlink:       {latest_link}")
+    print(f"Latest dir:           {latest_dir}")
     final_model_path = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')
     print(f"Final model: {final_model_path}")
     print(f"Best model: {os.path.join(run_dir, f'{SELECTED_MODEL}_best.pt')}")
