@@ -33,7 +33,7 @@ CONFIG = {
     'history_len': 10,
     'forecast_len': 1,
     'batch_size': 32,
-    'epochs': 10,
+    'epochs': 4,
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
@@ -41,6 +41,44 @@ CONFIG = {
     'early_stopping_patience': 3,   # Stop if val loss doesn't improve for N epochs
     'early_stopping_min_rel_delta': 0.01,  # Minimum 1% relative improvement to count
 }
+
+# Kaggle metric normalization sigmas: {(model_id, node_type): sigma}
+# node_type 1 = 1D, node_type 2 = 2D
+# Source: competition metric definition
+KAGGLE_SIGMA = {
+    (1, 1): 16.878,  # Model_1, 1D nodes
+    (1, 2): 14.379,  # Model_1, 2D nodes
+    (2, 1):  3.192,  # Model_2, 1D nodes
+    (2, 2):  2.727,  # Model_2, 2D nodes
+}
+
+def get_sigma_weights(model_id: int, norm_stats: dict):
+    """Return (w_1d, w_2d) for NRMSE-aligned loss in normalized space.
+
+    Our normalization is min-max:  x_norm = (x - vmin) / (vmax - vmin)
+    So:  MSE_raw = MSE_norm * (vmax - vmin)^2
+
+    The Kaggle metric computes NRMSE = RMSE_raw / kaggle_sigma, so:
+      NRMSE^2 = MSE_raw / kaggle_sigma^2
+              = MSE_norm * (vmax - vmin)^2 / kaggle_sigma^2
+
+    To make the training loss proportional to NRMSE^2 in normalized space:
+      w = (vmax - vmin)^2 / kaggle_sigma^2
+
+    Combined loss = (w_1d * loss_1d + w_2d * loss_2d) / 2
+    gives equal 50/50 contribution per node type, scaled to match the metric.
+    """
+    kaggle_sigma_1d = KAGGLE_SIGMA[(model_id, 1)]
+    kaggle_sigma_2d = KAGGLE_SIGMA[(model_id, 2)]
+
+    wl_params_1d = norm_stats['dynamic_1d_params']['water_level']
+    wl_params_2d = norm_stats['dynamic_2d_params']['water_level']
+    range_1d = wl_params_1d['max'] - wl_params_1d['min']
+    range_2d = wl_params_2d['max'] - wl_params_2d['min']
+
+    w_1d = (range_1d / kaggle_sigma_1d) ** 2
+    w_2d = (range_2d / kaggle_sigma_2d) ** 2
+    return w_1d, w_2d
 
 def save_normalization_stats(norm_stats, save_dir, model_id=None):
     """Save model-specific normalization statistics to disk."""
@@ -109,7 +147,7 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
     
     return checkpoint_path
 
-def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None, batched_static_graph=None):
+def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None, batched_static_graph=None, w_1d=None, w_2d=None):
     """Evaluate model on a dataset with both normalized and denormalized losses.
 
     Args:
@@ -119,8 +157,12 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
     model.eval()
     total_loss_norm = 0.0
     total_loss_denorm = 0.0
+    total_loss_1d_norm = 0.0
+    total_loss_2d_norm = 0.0
+    total_loss_1d_denorm = 0.0
+    total_loss_2d_denorm = 0.0
     num_batches = 0
-    
+
     # Debug statistics
     all_errors_norm = []
     all_errors_denorm = []
@@ -162,13 +204,11 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
                 batched_data=batched_static_graph,
             )
 
-            # Node-count-weighted normalized loss (MSELoss averages over all B*T*N elements)
-            n_1d = predictions['oneD'].shape[2]
-            n_2d = predictions['twoD'].shape[2]
-            n_total = n_1d + n_2d
+            # Sigma-weighted 50/50 loss: (w_1d * loss_1d + w_2d * loss_2d) / 2
+            # Matches Kaggle metric: equal weight per node type, scaled by 1/sigma^2
             loss_1d = criterion(predictions['oneD'], y_future_1d)
             loss_2d = criterion(predictions['twoD'], y_future_2d)
-            loss_norm = (n_1d * loss_1d + n_2d * loss_2d) / n_total
+            loss_norm = (w_1d * loss_1d + w_2d * loss_2d) / 2.0
 
             # Denormalize for interpretable loss
             pred_1d_denorm = unnormalize_col(predictions['oneD'], norm_stats, col=wl_col_1d, node_type='oneD')
@@ -177,10 +217,14 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
             target_2d_denorm = unnormalize_col(y_future_2d, norm_stats, col=wl_col_2d, node_type='twoD')
             loss_1d_denorm = criterion(pred_1d_denorm, target_1d_denorm)
             loss_2d_denorm = criterion(pred_2d_denorm, target_2d_denorm)
-            loss_denorm = (n_1d * loss_1d_denorm + n_2d * loss_2d_denorm) / n_total
+            loss_denorm = (loss_1d_denorm + loss_2d_denorm) / 2.0
 
             total_loss_norm += loss_norm.item()
             total_loss_denorm += loss_denorm.item()
+            total_loss_1d_norm += loss_1d.item()
+            total_loss_2d_norm += loss_2d.item()
+            total_loss_1d_denorm += loss_1d_denorm.item()
+            total_loss_2d_denorm += loss_2d_denorm.item()
             num_batches += 1
 
             # Debug: collect error statistics
@@ -200,19 +244,37 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
                 print(f"    2D pred range (denorm): [{pred_2d_denorm.min():.6f}, {pred_2d_denorm.max():.6f}]")
                 print(f"    2D target range (denorm):[{target_2d_denorm.min():.6f}, {target_2d_denorm.max():.6f}]")
     
-    avg_loss_norm = total_loss_norm / num_batches if num_batches > 0 else 0
-    avg_loss_denorm = total_loss_denorm / num_batches if num_batches > 0 else 0
-    
-    print(f"[INFO] {split_name} Loss (Normalized): {avg_loss_norm:.9f}")
-    print(f"[INFO] {split_name} Loss (Denormalized): {avg_loss_denorm:.9f}")
-    
+    n = num_batches if num_batches > 0 else 1
+    avg_loss_norm    = total_loss_norm / n
+    avg_loss_denorm  = total_loss_denorm / n
+    avg_1d_norm      = total_loss_1d_norm / n
+    avg_2d_norm      = total_loss_2d_norm / n
+    avg_1d_denorm    = total_loss_1d_denorm / n
+    avg_2d_denorm    = total_loss_2d_denorm / n
+
+    # Approx NRMSE per node type (sqrt of weighted normalized MSE)
+    wl_1d = norm_stats['dynamic_1d_params']['water_level']
+    wl_2d = norm_stats['dynamic_2d_params']['water_level']
+    range_1d = wl_1d['max'] - wl_1d['min']
+    range_2d = wl_2d['max'] - wl_2d['min']
+    model_num = int(SELECTED_MODEL.split('_')[-1])
+    nrmse_1d = (avg_1d_norm ** 0.5) * range_1d / KAGGLE_SIGMA[(model_num, 1)]
+    nrmse_2d = (avg_2d_norm ** 0.5) * range_2d / KAGGLE_SIGMA[(model_num, 2)]
+    approx_kaggle = (nrmse_1d + nrmse_2d) / 2.0
+
+    print(f"[INFO] {split_name}:")
+    print(f"  Combined loss (norm):      {avg_loss_norm:.6e}")
+    print(f"  1D MSE (norm):  {avg_1d_norm:.6e}  |  RMSE (m): {(avg_1d_denorm**0.5):.4f}  |  NRMSE≈{nrmse_1d:.4f}")
+    print(f"  2D MSE (norm):  {avg_2d_norm:.6e}  |  RMSE (m): {(avg_2d_denorm**0.5):.4f}  |  NRMSE≈{nrmse_2d:.4f}")
+    print(f"  Approx Kaggle score:       {approx_kaggle:.4f}")
+
     if debug and len(all_errors_norm) > 0:
         errors_norm = np.concatenate(all_errors_norm)
         errors_denorm = np.concatenate(all_errors_denorm)
         print(f"[DEBUG] Error distribution (normalized): mean={errors_norm.mean():.9f}, std={errors_norm.std():.9f}, max={errors_norm.max():.9f}")
         print(f"[DEBUG] Error distribution (denormalized): mean={errors_denorm.mean():.9f}, std={errors_denorm.std():.9f}, max={errors_denorm.max():.9f}")
-    
-    return avg_loss_norm, avg_loss_denorm
+
+    return avg_loss_norm, avg_loss_denorm, avg_1d_norm, avg_2d_norm, avg_1d_denorm, avg_2d_denorm
 
 def train():
     """Main training loop."""
@@ -223,17 +285,28 @@ def train():
     run_name = f"{SELECTED_MODEL}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     wandb.init(project="floodlm", name=run_name, config=CONFIG)
 
+    # Create a dated run subdirectory so each training run is isolated.
+    # Also update a 'latest' symlink so inference always finds the most recent run.
+    run_dir = os.path.join(CONFIG['save_dir'], run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    latest_link = os.path.join(CONFIG['save_dir'], 'latest')
+    if os.path.islink(latest_link):
+        os.remove(latest_link)
+    os.symlink(os.path.abspath(run_dir), latest_link)
+    print(f"[INFO] Checkpoint dir: {run_dir}")
+    print(f"[INFO] Latest symlink: {latest_link} → {run_dir}")
+
     device = torch.device(CONFIG['device'])
     print(f"[INFO] Device: {device}")
-    
+
     # Initialize data and fetch preprocessing
     print(f"\n[INFO] Initializing data...")
     data = initialize_data()
     norm_stats = data['norm_stats']
-    
-    # Save normalization statistics
+
+    # Save normalization statistics into the run directory
     print(f"[INFO] Saving normalization statistics...")
-    save_normalization_stats(norm_stats, CONFIG['save_dir'])
+    save_normalization_stats(norm_stats, run_dir)
     
     # Create dataloaders for train, val, test
     print(f"\n[INFO] Creating dataloaders...")
@@ -280,6 +353,16 @@ def train():
     optimizer = Adam(model.parameters(), lr=CONFIG['lr'])
     criterion = nn.MSELoss()
 
+    # Sigma weights for metric-aligned loss in normalized space:
+    # w = (our_range / kaggle_sigma)^2 accounts for min-max normalization
+    model_id = int(SELECTED_MODEL.split('_')[-1])
+    w_1d, w_2d = get_sigma_weights(model_id, norm_stats)
+    wl_1d = norm_stats['dynamic_1d_params']['water_level']
+    wl_2d = norm_stats['dynamic_2d_params']['water_level']
+    print(f"[INFO] Loss weights (normalized space):")
+    print(f"  1D: range={wl_1d['max']-wl_1d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,1)]}, w={w_1d:.6f}")
+    print(f"  2D: range={wl_2d['max']-wl_2d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,2)]}, w={w_2d:.6f}")
+
     # Pre-build batched static graphs once — reused every forward pass to eliminate
     # per-batch CPU overhead from Batch.from_data_list.
     print(f"\n[INFO] Pre-building batched static graphs (B={CONFIG['batch_size']})...")
@@ -298,7 +381,6 @@ def train():
     print("Training")
     print(f"{'='*70}\n")
 
-    best_loss = float('inf')
     best_val_loss = float('inf')
     early_stopping_counter = 0
     epoch_start_time = time.time()
@@ -347,13 +429,11 @@ def train():
                 batched_data=train_batched_graph,
             )
 
-            # Node-count-weighted loss (MSELoss averages over all B*T*N elements)
-            n_1d = predictions['oneD'].shape[2]
-            n_2d = predictions['twoD'].shape[2]
-            n_total = n_1d + n_2d
+            # Sigma-weighted 50/50 loss: (w_1d * loss_1d + w_2d * loss_2d) / 2
+            # Matches Kaggle metric: equal weight per node type, scaled by 1/sigma^2
             loss_1d = criterion(predictions['oneD'], y_future_1d)
             loss_2d = criterion(predictions['twoD'], y_future_2d)
-            loss = (n_1d * loss_1d + n_2d * loss_2d) / n_total
+            loss = (w_1d * loss_1d + w_2d * loss_2d) / 2.0
             
             # Backward pass
             optimizer.zero_grad()
@@ -369,20 +449,24 @@ def train():
             log_dict = {
                 'loss/train_batch': loss.item(),
                 'loss/train_avg': avg_loss,
+                'loss/train_1d': loss_1d.item(),
+                'loss/train_2d': loss_2d.item(),
             }
 
             # Lightweight validation every N batches — logged at the same step as train
             if (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
-                val_loss_norm, val_loss_denorm = evaluate(
+                val_loss_norm, val_loss_denorm, val_1d_norm, val_2d_norm, val_1d_denorm, val_2d_denorm = evaluate(
                     model, val_dataloader, criterion, device, norm_stats,
                     split_name=f"Val-Subset (Epoch {epoch}, Batch {batch_idx+1})",
                     debug=False,
                     max_batches=VAL_SUBSET_BATCHES,
                     batched_static_graph=val_batched_graph,
+                    w_1d=w_1d, w_2d=w_2d,
                 )
-                print(f"  → Quick Val Loss (Norm): {val_loss_norm:.9f}")
-                log_dict['loss/val_norm'] = val_loss_norm
-                log_dict['loss/val_denorm'] = val_loss_denorm
+                log_dict['loss/val_norm']    = val_loss_norm
+                log_dict['loss/val_denorm']  = val_loss_denorm
+                log_dict['loss/val_1d_norm'] = val_1d_norm
+                log_dict['loss/val_2d_norm'] = val_2d_norm
                 model.train()  # Switch back to training mode
 
             wandb.log(log_dict, step=global_step)
@@ -404,57 +488,69 @@ def train():
         
         # Full validation evaluation (now less frequent due to quick checks)
         print(f"\n[INFO] Running full validation...")
-        val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=False, batched_static_graph=val_batched_graph)
+        val_loss_norm, val_loss_denorm, val_1d_norm, val_2d_norm, val_1d_denorm, val_2d_denorm = evaluate(
+            model, val_dataloader, criterion, device, norm_stats,
+            split_name="Validation", debug=False,
+            batched_static_graph=val_batched_graph, w_1d=w_1d, w_2d=w_2d,
+        )
+
+        # Approx Kaggle NRMSE for wandb
+        range_1d = norm_stats['dynamic_1d_params']['water_level']['max'] - norm_stats['dynamic_1d_params']['water_level']['min']
+        range_2d = norm_stats['dynamic_2d_params']['water_level']['max'] - norm_stats['dynamic_2d_params']['water_level']['min']
+        nrmse_1d = (val_1d_norm ** 0.5) * range_1d / KAGGLE_SIGMA[(model_id, 1)]
+        nrmse_2d = (val_2d_norm ** 0.5) * range_2d / KAGGLE_SIGMA[(model_id, 2)]
 
         wandb.log({
             'loss/train': avg_epoch_loss,
             'loss/val_norm': val_loss_norm,
             'loss/val_denorm': val_loss_denorm,
+            'loss/val_1d_norm': val_1d_norm,
+            'loss/val_2d_norm': val_2d_norm,
+            'nrmse/val_1d': nrmse_1d,
+            'nrmse/val_2d': nrmse_2d,
+            'nrmse/val_kaggle_approx': (nrmse_1d + nrmse_2d) / 2.0,
         }, step=global_step)
 
-        # Early stopping: check if val loss improved by at least min_rel_delta
+        # Checkpoint
+        if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
+            save_checkpoint(model, epoch, avg_epoch_loss, run_dir, CONFIG)
+
+        # Early stopping + best checkpoint: check if val loss improved by at least min_rel_delta
         min_rel_delta = CONFIG['early_stopping_min_rel_delta']
         if val_loss_norm < best_val_loss * (1.0 - min_rel_delta):
             best_val_loss = val_loss_norm
             early_stopping_counter = 0
+            best_checkpoint = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{epoch:03d}.pt')
+            best_path = os.path.join(run_dir, f'{SELECTED_MODEL}_best.pt')
+            if os.path.exists(best_checkpoint):
+                import shutil
+                shutil.copy(best_checkpoint, best_path)
+                print(f"[INFO] New best model saved: {best_path} (val_loss={val_loss_norm:.6e})")
         else:
             early_stopping_counter += 1
             print(f"[INFO] No significant val improvement ({early_stopping_counter}/{CONFIG['early_stopping_patience']})")
 
         print()
 
-        # Checkpoint
-        if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
-            save_checkpoint(model, epoch, avg_epoch_loss, CONFIG['save_dir'], CONFIG)
-
         # Early stopping trigger
         if early_stopping_counter >= CONFIG['early_stopping_patience']:
             print(f"[INFO] Early stopping triggered after {epoch} epochs (no >{min_rel_delta*100:.0f}% val improvement for {CONFIG['early_stopping_patience']} epochs)")
             wandb.log({'early_stopped_epoch': epoch}, step=global_step)
             break
-        
-        # Track best
-        if avg_epoch_loss < best_loss:
-            best_loss = avg_epoch_loss
-            best_checkpoint = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_epoch_{epoch:03d}.pt')
-            best_path = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_best.pt')
-            if os.path.exists(best_checkpoint):
-                import shutil
-                shutil.copy(best_checkpoint, best_path)
-                print(f"[INFO] New best model saved: {best_path}")
-        
+
         epoch_start_time = time.time()
-    
+
     # Final summary
     print("\n" + "="*70)
     print("Training Complete")
     print("="*70)
-    print(f"Best training loss (Normalized): {best_loss:.6f}")
+    print(f"Best validation loss (Normalized): {best_val_loss:.6f}")
     print(f"\nInterpretation: Denormalized loss is in original water level units (meters)")
-    print(f"Checkpoints saved to: {CONFIG['save_dir']}")
-    final_model_path = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')
+    print(f"Checkpoints saved to: {run_dir}")
+    print(f"Latest symlink:       {latest_link}")
+    final_model_path = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')
     print(f"Final model: {final_model_path}")
-    print(f"Best model: {os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_best.pt')}")
+    print(f"Best model: {os.path.join(run_dir, f'{SELECTED_MODEL}_best.pt')}")
     print("="*70 + "\n")
 
 if __name__ == "__main__":

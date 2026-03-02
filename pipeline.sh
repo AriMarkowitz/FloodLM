@@ -186,11 +186,11 @@ header "Stage 1: Training Models"
 
 for MODEL in "${MODELS[@]}"; do
     LOG_FILE="${LOG_DIR}/train_${MODEL}_${TIMESTAMP}.log"
-    
+
     log_info "Training ${MODEL}..."
     log_info "Log file: ${LOG_FILE}"
     log_info "Command: SELECTED_MODEL=${MODEL} ${PYTHON} src/train.py"
-    
+
     if cd "${SCRIPT_DIR}" && SELECTED_MODEL="${MODEL}" ${PYTHON} -u src/train.py 2>&1 | tee "${LOG_FILE}"; then
         log_info "✓ ${MODEL} training completed successfully"
         RESULTS_SUMMARY="${RESULTS_SUMMARY}
@@ -203,7 +203,7 @@ for MODEL in "${MODELS[@]}"; do
         RESULTS_SUMMARY="${RESULTS_SUMMARY}
 ✗ ${MODEL}: Training failed (exit code ${TRAIN_EXIT_CODE})"
     fi
-    
+
     echo ""
 done
 
@@ -215,19 +215,31 @@ header "Stage 2: Running Autoregressive Inference"
 
 LOG_FILE="${LOG_DIR}/inference_${TIMESTAMP}.log"
 
-log_info "Running inference for all trained models..."
-log_info "Log file: ${LOG_FILE}"
-log_info "Command: ${PYTHON} src/autoregressive_inference.py --checkpoint-dir checkpoints --output submission.csv"
+# Use the 'latest' symlink written by train.py to point at the most recent run dir.
+# Falls back to plain checkpoints/ if no symlink exists (e.g. inference-only runs).
+if [ -L "${SCRIPT_DIR}/checkpoints/latest" ]; then
+    CHECKPOINT_DIR="${SCRIPT_DIR}/checkpoints/latest"
+else
+    CHECKPOINT_DIR="${SCRIPT_DIR}/checkpoints"
+    log_warn "No checkpoints/latest symlink found — using ${CHECKPOINT_DIR}"
+fi
+log_info "Checkpoint dir for inference: ${CHECKPOINT_DIR}"
 
-if cd "${SCRIPT_DIR}" && ${PYTHON} -u src/autoregressive_inference.py --checkpoint-dir checkpoints --output submission.csv 2>&1 | tee "${LOG_FILE}"; then
+SUBMISSION_FILE="submission_${TIMESTAMP}.csv"
+
+log_info "Running inference for all trained models..."
+log_info "Output file: ${SUBMISSION_FILE}"
+log_info "Log file: ${LOG_FILE}"
+log_info "Command: ${PYTHON} src/autoregressive_inference.py --checkpoint-dir ${CHECKPOINT_DIR} --output ${SUBMISSION_FILE}"
+
+if cd "${SCRIPT_DIR}" && ${PYTHON} -u src/autoregressive_inference.py --checkpoint-dir "${CHECKPOINT_DIR}" --output "${SUBMISSION_FILE}" 2>&1 | tee "${LOG_FILE}"; then
     log_info "✓ Inference completed successfully"
     RESULTS_SUMMARY="${RESULTS_SUMMARY}
 ✓ Inference: Passed"
-    
-    # Check if submission file was created
-    if [ -f "${SCRIPT_DIR}/submission.csv" ]; then
-        SUBMISSION_SIZE=$(wc -l < "${SCRIPT_DIR}/submission.csv")
-        log_info "✓ Submission file created: submission.csv (${SUBMISSION_SIZE} rows)"
+
+    if [ -f "${SCRIPT_DIR}/${SUBMISSION_FILE}" ]; then
+        SUBMISSION_SIZE=$(wc -l < "${SCRIPT_DIR}/${SUBMISSION_FILE}")
+        log_info "✓ Submission file created: ${SUBMISSION_FILE} (${SUBMISSION_SIZE} rows)"
     fi
 else
     INFERENCE_EXIT_CODE=$?
@@ -250,9 +262,9 @@ LOG_FILE="${LOG_DIR}/rmse_${TIMESTAMP}.log"
 
 log_info "Calculating RMSE metrics..."
 log_info "Log file: ${LOG_FILE}"
-log_info "Command: ${PYTHON} calculate_rmse.py"
+log_info "Command: ${PYTHON} calculate_rmse.py ${SUBMISSION_FILE} submission_firsttry.csv"
 
-if cd "${SCRIPT_DIR}" && ${PYTHON} -u calculate_rmse.py 2>&1 | tee "${LOG_FILE}"; then
+if cd "${SCRIPT_DIR}" && ${PYTHON} -u calculate_rmse.py "${SUBMISSION_FILE}" submission_firsttry.csv 2>&1 | tee "${LOG_FILE}"; then
     log_info "✓ RMSE calculation completed successfully"
     RESULTS_SUMMARY="${RESULTS_SUMMARY}
 ✓ RMSE Calculation: Passed"
@@ -267,6 +279,42 @@ fi
 
 echo ""
 
+# ============================================================================
+# Stage 4: Kaggle Submission
+# ============================================================================
+
+header "Stage 4: Submitting to Kaggle"
+
+LOG_FILE="${LOG_DIR}/kaggle_${TIMESTAMP}.log"
+
+SUBMISSION_MSG="${KAGGLE_MESSAGE:-FloodLM ${TIMESTAMP}}"
+
+log_info "Submitting ${SUBMISSION_FILE} to Kaggle..."
+log_info "Message: ${SUBMISSION_MSG}"
+log_info "Log file: ${LOG_FILE}"
+
+if [ -f "${SCRIPT_DIR}/${SUBMISSION_FILE}" ]; then
+    if cd "${SCRIPT_DIR}" && ${PYTHON} -u submit_to_kaggle.py "${SUBMISSION_FILE}" \
+            --message "${SUBMISSION_MSG}" --yes 2>&1 | tee "${LOG_FILE}"; then
+        log_info "✓ Kaggle submission completed"
+        RESULTS_SUMMARY="${RESULTS_SUMMARY}
+✓ Kaggle Submission: Passed"
+    else
+        KAGGLE_EXIT_CODE=$?
+        log_error "✗ Kaggle submission failed with exit code ${KAGGLE_EXIT_CODE}"
+        log_error "Check log: ${LOG_FILE}"
+        OVERALL_SUCCESS=1
+        RESULTS_SUMMARY="${RESULTS_SUMMARY}
+✗ Kaggle Submission: Failed (exit code ${KAGGLE_EXIT_CODE})"
+    fi
+else
+    log_warn "${SUBMISSION_FILE} not found — skipping Kaggle submission"
+    RESULTS_SUMMARY="${RESULTS_SUMMARY}
+⚠ Kaggle Submission: Skipped (no ${SUBMISSION_FILE})"
+fi
+
+echo ""
+
 ################################################################################
 # Summary
 ################################################################################
@@ -275,8 +323,9 @@ header "Pipeline Complete - Summary"
 
 log_info "Pipeline stages executed:"
 log_info "  1. Training: ${MODELS[*]}"
-log_info "  2. Inference: All models combined"
+log_info "  2. Inference: All models combined (checkpoints/latest)"
 log_info "  3. Evaluation: RMSE calculation"
+log_info "  4. Kaggle Submission"
 log_info ""
 log_info "Results:"
 echo "${RESULTS_SUMMARY}"
@@ -284,7 +333,7 @@ echo "${RESULTS_SUMMARY}"
 if [ ${OVERALL_SUCCESS} -eq 0 ]; then
     log_info "✓ All pipeline stages passed!"
     log_info "Output files:"
-    [ -f "${SCRIPT_DIR}/submission.csv" ] && log_info "  - submission.csv"
+    [ -f "${SCRIPT_DIR}/${SUBMISSION_FILE}" ] && log_info "  - ${SUBMISSION_FILE}"
 else
     log_error "✗ Some pipeline stages failed"
 fi

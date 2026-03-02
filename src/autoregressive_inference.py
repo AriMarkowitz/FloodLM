@@ -273,42 +273,43 @@ def autoregressive_rollout_both(
     if T_total <= history_len:
         raise RuntimeError(f"Need >{history_len} timesteps for rollout, got {T_total}")
 
-    h = model.init_hidden(static_graph, device)
+    # B=1 inference — use the vectorized API with a single-sample batch
+    B = 1
+    batched_graph = model._make_batched_graph(static_graph, B).to(device)
+    h = model.init_hidden(static_graph, B, device=device)  # [B*N, h_dim] = [N, h_dim]
 
-    # Warm start with true history
+    N1 = y1_hist.size(1)
+    N2 = y2_hist.size(1)
+
+    # Warm start with true history — inputs are [N, F], reshape to [B*N, F] = [N, F]
     for t in range(history_len):
         x_dyn_t = {
-            'oneD': y1_hist[t],
-            'twoD': torch.cat([y2_hist[t], rain2_all[t]], dim=-1),
+            'oneD': y1_hist[t].reshape(B * N1, 1),
+            'twoD': torch.cat([y2_hist[t], rain2_all[t]], dim=-1).reshape(B * N2, -1),
         }
-        h = model.cell(static_graph, h, x_dyn_t)
-
-    y1_prev = y1_hist[-1]
-    y2_prev = y2_hist[-1]
+        h = model.cell(batched_graph, h, x_dyn_t)
 
     preds_1d = []
     preds_2d = []
-    
+
     with torch.no_grad():
         for t in range(history_len, T_total):
-            d1 = model.heads['oneD'](h['oneD'])
-            d2 = model.heads['twoD'](h['twoD'])
+            # Predict from current hidden state
+            node_counts = {'oneD': N1, 'twoD': N2}
+            y_next = model.predict_water_levels(h, B, node_counts)
+            # y_next['oneD']: [B, N1, 1], y_next['twoD']: [B, N2, 1]
 
-            # Model predicts absolute water levels
-            y1_next = d1
-            y2_next = d2
+            y1_next = y_next['oneD'].squeeze(0)  # [N1, 1]
+            y2_next = y_next['twoD'].squeeze(0)  # [N2, 1]
 
             preds_1d.append(y1_next)
             preds_2d.append(y2_next)
 
             x_dyn_next = {
-                'oneD': y1_next,
-                'twoD': torch.cat([y2_next, rain2_all[t]], dim=-1),
+                'oneD': y1_next.reshape(B * N1, 1),
+                'twoD': torch.cat([y2_next, rain2_all[t]], dim=-1).reshape(B * N2, -1),
             }
-            h = model.cell(static_graph, h, x_dyn_next)
-
-            y1_prev = y1_next
-            y2_prev = y2_next
+            h = model.cell(batched_graph, h, x_dyn_next)
 
     return torch.stack(preds_1d, dim=0), torch.stack(preds_2d, dim=0)
 

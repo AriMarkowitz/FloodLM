@@ -30,9 +30,11 @@ from datetime import datetime
 def check_kaggle_api(args=None):
     """Check if kaggle API is installed and configured.
 
-    Auth is considered configured if either:
-    1) KAGGLE_USERNAME and KAGGLE_KEY are set, or
-    2) kaggle.json exists in KAGGLE_CONFIG_DIR or ~/.kaggle.
+    Auth is considered configured if any of:
+    1) KAGGLE_API_TOKEN env var is set (new preferred method), or
+    2) KAGGLE_USERNAME and KAGGLE_KEY are both set (legacy env vars), or
+    3) ~/.kaggle/access_token file exists (new token file), or
+    4) kaggle.json exists in KAGGLE_CONFIG_DIR or ~/.kaggle (legacy).
     """
     try:
         result = subprocess.run(['kaggle', '--version'], capture_output=True, text=True)
@@ -47,21 +49,32 @@ def check_kaggle_api(args=None):
             if getattr(args, 'kaggle_config_dir', None):
                 os.environ['KAGGLE_CONFIG_DIR'] = args.kaggle_config_dir
 
-        # Option A: env vars (StackOverflow method)
+        # Option A: new single-token env var
+        if os.environ.get('KAGGLE_API_TOKEN'):
+            return True, None
+
+        # Option B: legacy env vars
         if os.environ.get('KAGGLE_USERNAME') and os.environ.get('KAGGLE_KEY'):
             return True, None
 
-        # Option B: kaggle.json in config dir
         config_dir = os.environ.get('KAGGLE_CONFIG_DIR')
         kaggle_dir = Path(config_dir) if config_dir else (Path.home() / '.kaggle')
-        if not (kaggle_dir / 'kaggle.json').exists():
-            return False, (
-                "Kaggle credentials not found. Set KAGGLE_USERNAME/KAGGLE_KEY "
-                "or provide kaggle.json in KAGGLE_CONFIG_DIR (or ~/.kaggle)."
-            )
-        
-        return True, None
-        
+
+        # Option C: new access_token file
+        if (kaggle_dir / 'access_token').exists():
+            return True, None
+
+        # Option D: legacy kaggle.json
+        if (kaggle_dir / 'kaggle.json').exists():
+            return True, None
+
+        return False, (
+            "Kaggle credentials not found. Options:\n"
+            "  1) export KAGGLE_API_TOKEN=<token>  (from kaggle.com/settings → API)\n"
+            "  2) Save token to ~/.kaggle/access_token\n"
+            "  3) Legacy: save kaggle.json to ~/.kaggle/kaggle.json"
+        )
+
     except FileNotFoundError:
         return False, "kaggle CLI not installed. Run: pip install kaggle"
 
@@ -104,7 +117,7 @@ def validate_submission(csv_path):
     return True, None
 
 
-def submit_to_kaggle(csv_path, message, competition='playground-series-s5e1', args=None):
+def submit_to_kaggle(csv_path, message, competition='urban-flood-modelling', args=None):
     """Submit to Kaggle using kaggle API."""
     
     print(f"\n{'='*70}")
@@ -141,10 +154,14 @@ def submit_to_kaggle(csv_path, message, competition='playground-series-s5e1', ar
     print(f"  Message: {message}")
     print(f"  Size: {os.path.getsize(csv_path) / 1024 / 1024:.2f} MB")
     
-    response = input(f"\n  Proceed with submission? (y/n): ").strip().lower()
-    if response != 'y':
-        print("[INFO] Submission cancelled")
-        return False
+    auto_yes = args is not None and getattr(args, 'yes', False)
+    if auto_yes:
+        print("\n  [INFO] --yes flag set, proceeding automatically")
+    else:
+        response = input(f"\n  Proceed with submission? (y/n): ").strip().lower()
+        if response != 'y':
+            print("[INFO] Submission cancelled")
+            return False
     
     # Submit
     print(f"\n[4/5] Uploading to Kaggle...")
@@ -210,7 +227,7 @@ def submit_to_kaggle(csv_path, message, competition='playground-series-s5e1', ar
     return True
 
 
-def check_recent_submissions(competition='playground-series-s5e1'):
+def check_recent_submissions(competition='urban-flood-modelling'):
     """Check recent submissions for competition."""
     try:
         cmd = [
@@ -271,7 +288,7 @@ Examples:
                         help='Path to submission CSV file')
     parser.add_argument('--message', type=str, default='FloodLM submission',
                         help='Submission message (default: "FloodLM submission")')
-    parser.add_argument('--competition', type=str, default='playground-series-s5e1',
+    parser.add_argument('--competition', type=str, default='urban-flood-modelling',
                         help='Kaggle competition name')
     parser.add_argument('--dry-run', action='store_true',
                         help='Validate without submitting')
@@ -283,6 +300,8 @@ Examples:
                         help='Kaggle API key (alternative to kaggle.json)')
     parser.add_argument('--kaggle-config-dir', type=str, default=None,
                         help='Directory containing kaggle.json (sets KAGGLE_CONFIG_DIR)')
+    parser.add_argument('--yes', '-y', action='store_true',
+                        help='Skip confirmation prompt (for use in pipelines)')
     
     args = parser.parse_args()
     
