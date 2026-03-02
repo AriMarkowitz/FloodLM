@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import pickle
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -217,7 +218,8 @@ def train():
     print("FloodLM Training Script")
     print("="*70)
     
-    wandb.init(project="floodlm", config=CONFIG)
+    run_name = f"{SELECTED_MODEL}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    wandb.init(project="floodlm", name=run_name, config=CONFIG)
 
     device = torch.device(CONFIG['device'])
     print(f"[INFO] Device: {device}")
