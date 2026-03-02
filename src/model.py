@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_geometric.data import HeteroData
+from torch_geometric.data import HeteroData, Batch
 from torch_geometric.nn import MessagePassing, HeteroConv
 
 
@@ -41,6 +41,9 @@ class StaticDynamicEdgeMP(MessagePassing):
       - dynamic hidden state (h_j, h_i): time-varying factors
 
     Then we form a message from source node j and aggregate into node i.
+
+    Operates on [B*N, *] tensors — the batch dimension is folded into
+    the node dimension so a single graph call covers all B samples.
     """
     def __init__(
         self,
@@ -124,12 +127,10 @@ class StaticDynamicEdgeMP(MessagePassing):
         **kwargs
     ) -> torch.Tensor:
         """
-        Returns aggregated messages M_dst: [N_dst, msg_dim]
+        Returns aggregated messages M_dst: [B*N_dst, msg_dim]
 
-        Context (h_src, h_dst, edge_attr_static, x_static_src, x_static_dst) 
+        Context (h_src, h_dst, edge_attr_static, x_static_src, x_static_dst)
         must be set via _set_context() before calling forward().
-        
-        This design allows HeteroConv to call modules with standard signature.
         """
         h_src = self._h_src
         h_dst = self._h_dst
@@ -149,34 +150,34 @@ class StaticDynamicEdgeMP(MessagePassing):
 
     def message(
         self,
-        h_src_j: torch.Tensor,                # [E, h_dim]   src hidden for each edge
-        h_dst_i: torch.Tensor,                # [E, h_dim]   dst hidden for each edge
-        edge_attr_static: torch.Tensor,       # [E, edge_static_dim]
-        x_static_src_j: torch.Tensor,         # [E, node_static_dim_src]
-        x_static_dst_i: torch.Tensor,         # [E, node_static_dim_dst]
+        h_src_j: torch.Tensor,                # [B*E, h_dim]   src hidden for each edge
+        h_dst_i: torch.Tensor,                # [B*E, h_dim]   dst hidden for each edge
+        edge_attr_static: torch.Tensor,       # [B*E, edge_static_dim]
+        x_static_src_j: torch.Tensor,         # [B*E, node_static_dim_src]
+        x_static_dst_i: torch.Tensor,         # [B*E, node_static_dim_dst]
     ) -> torch.Tensor:
         # ------------------------------------------------------------
         # 1) Static part: embed static edge + endpoint node features
         # ------------------------------------------------------------
         static_cat = torch.cat([edge_attr_static, x_static_src_j, x_static_dst_i], dim=-1)
-        u_e = self.edge_static_embed(static_cat)                 # [E, hidden_dim]
-        b_e = F.softplus(self.base_weight(u_e))                  # [E, 1] (positive)
+        u_e = self.edge_static_embed(static_cat)                 # [B*E, hidden_dim]
+        b_e = F.softplus(self.base_weight(u_e))                  # [B*E, 1] (positive)
 
         # ------------------------------------------------------------
         # 2) Dynamic part: gate based on current hidden states
         # ------------------------------------------------------------
         gate_in = torch.cat([h_src_j, h_dst_i], dim=-1)
-        g_e = torch.sigmoid(self.dynamic_gate(gate_in))          # [E, 1]
+        g_e = torch.sigmoid(self.dynamic_gate(gate_in))          # [B*E, 1]
 
         # ------------------------------------------------------------
         # 3) Payload: what is actually sent along the edge
         # ------------------------------------------------------------
-        v = self.payload(h_src_j)                                # [E, msg_dim]
+        v = self.payload(h_src_j)                                # [B*E, msg_dim]
 
         # ------------------------------------------------------------
         # 4) Effective message: static base weight * dynamic gate * payload
         # ------------------------------------------------------------
-        m = (b_e * g_e) * v                                      # [E, msg_dim]
+        m = (b_e * g_e) * v                                      # [B*E, msg_dim]
         return m
 
 
@@ -193,10 +194,10 @@ class HeteroTransportCell(nn.Module):
     A single time step update:
         h_{t+1} = Update(h_t, dynamic_inputs_t, messages_t)
 
-    where messages_t are produced by hetero message passing using:
-      - static graph (edge_index)
-      - static features (node & edge)
-      - current hidden states h_t (dynamic memory)
+    Operates on batched inputs — hidden states and dynamic inputs have
+    shape [B*N, *] where B is the batch size and N is the node count.
+    The graph (edge_index, static features) is a PyG Batch of B copies
+    of the same static graph, so edges are already offset correctly.
     """
     def __init__(
         self,
@@ -238,17 +239,13 @@ class HeteroTransportCell(nn.Module):
             f"{src}_{rel}_{dst}": mp for (src, rel, dst), mp in conv_dict.items()
         })
         self.edge_types = list(conv_dict.keys())  # Store for iteration
-        
+
         # Use HeteroConv to orchestrate message passing (for clean PyG integration)
         self.hetero_conv = HeteroConv(conv_dict, aggr="sum")
 
         # ------------------------------------------------------------
         # B) Dynamic input projection per node type
         #    "This is where the dynamic data is passed to the graph"
-        #
-        # Example dynamic inputs for a node type:
-        #   [current water level estimate, rainfall_t, rainfall_t-1, ...]
-        # We project those into msg_dim so they combine nicely with messages.
         # ------------------------------------------------------------
         self.dyn_proj = nn.ModuleDict({
             nt: nn.Linear(node_dyn_input_dims[nt], msg_dim) for nt in node_types
@@ -256,8 +253,7 @@ class HeteroTransportCell(nn.Module):
 
         # ------------------------------------------------------------
         # C) Recurrent update per node type
-        #    This is where "past states are embedded":
-        #    h_t is the memory of previous steps, updated each time step.
+        #    GRUCell operates on [B*N, *] directly.
         # ------------------------------------------------------------
         self.update = nn.ModuleDict({
             nt: nn.GRUCell(input_size=2 * msg_dim, hidden_size=h_dim) for nt in node_types
@@ -270,32 +266,28 @@ class HeteroTransportCell(nn.Module):
         x_dyn_t: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         """
-        Perform ONE timestep update.
+        Perform ONE timestep update over a batch of B graphs.
 
-        data contains STATIC graph structure & static features:
-          data[nt].x_static              [N_nt, node_static_dim]
-          data[etype].edge_index         [2, E]
-          data[etype].edge_attr_static   [E, edge_static_dim]
+        data: PyG Batch of B copies of the static graph.
+              data[nt].x_static              [B*N_nt, node_static_dim]
+              data[etype].edge_index         [2, B*E]  (offsets applied by Batch)
+              data[etype].edge_attr_static   [B*E, edge_static_dim]
 
-        h_t is the DYNAMIC hidden state (memory) from previous step:
-          h_t[nt]                        [N_nt, h_dim]
-
-        x_dyn_t is the DYNAMIC observed input at this timestep:
-          x_dyn_t[nt]                    [N_nt, dyn_dim_nt]
+        h_t[nt]:     [B*N_nt, h_dim]   — hidden state (memory) from previous step
+        x_dyn_t[nt]: [B*N_nt, dyn_dim] — dynamic observed input at this timestep
 
         Returns:
-          h_{t+1} dict
+          h_{t+1} dict, same shapes as h_t
         """
-        # Grab static node features dict (constant over time)
+        # Grab static node features dict (constant over time, replicated B times by Batch)
         x_static = {nt: data[nt].x_static for nt in self.node_types}
 
         # Grab edge static attributes per edge type
         edge_static = {et: data[et].edge_attr_static for et in self.edge_types}
 
         # ------------------------------------------------------------
-        # 1) Inject context into each MP module, then call HeteroConv
-        #    HeteroConv will call each module's forward() with standard args
-        #    But our modules can access the injected context during propagate()
+        # 1) Inject context into each MP module, then call HeteroConv.
+        #    All tensors are already in [B*N, *] / [B*E, *] space.
         # ------------------------------------------------------------
         for (src_type, rel, dst_type) in self.edge_types:
             key = f"{src_type}_{rel}_{dst_type}"
@@ -308,22 +300,19 @@ class HeteroTransportCell(nn.Module):
                 x_static_dst=x_static[dst_type],
             )
 
-        # Build edge_index_dict and x_dict for HeteroConv (standard PyG interface)
+        # Build edge_index_dict and x_dict for HeteroConv (standard PyG interface).
+        # Pass h_t as x so HeteroConv correctly infers per-type node counts [B*N_nt, *].
         edge_index_dict = {et: data[et].edge_index for et in self.edge_types}
-        x_dict = {nt: torch.zeros((data[nt].num_nodes, 1), device=h_t[nt].device) for nt in self.node_types}  # Dummy x
+        x_dict = {nt: h_t[nt] for nt in self.node_types}
 
-        # Call HeteroConv which orchestrates all message passing
-        # Returns: dict keyed by DESTINATION NODE TYPE (not edge type!)
-        # messages[node_type] = [N_dst_type, msg_dim]
-        # HeteroConv already aggregates messages from ALL incoming edge types per destination
+        # Call HeteroConv — returns messages[node_type] = [B*N_dst, msg_dim]
         messages = self.hetero_conv(x_dict, edge_index_dict)
-        
-        # Ensure all destination node types have messages (add zero tensors if missing)
+
+        # Ensure all destination node types have messages
         for nt in self.node_types:
             if nt not in messages:
                 messages[nt] = torch.zeros((data[nt].num_nodes, self.msg_dim), device=h_t[nt].device)
-            
-            # Validate message shape matches destination node count
+
             expected_n_dst = h_t[nt].size(0)
             if messages[nt].size(0) != expected_n_dst:
                 raise RuntimeError(
@@ -333,31 +322,15 @@ class HeteroTransportCell(nn.Module):
                 )
 
         # ------------------------------------------------------------
-        # 2) Inject DYNAMIC inputs (rain, water estimate, etc.)
-        #    "This is where dynamic data enters the model each timestep"
+        # 2) Inject DYNAMIC inputs and run GRU update.
+        #    All in [B*N, *] space — GRUCell handles this natively.
         # ------------------------------------------------------------
         h_next = {}
         for nt in self.node_types:
-            dyn_emb = self.dyn_proj[nt](x_dyn_t[nt])  # [N, msg_dim]
-            
-            # Get aggregated message for this node type
-            msg_emb = messages[nt]  # [N, msg_dim]
-            
-            # Validate shapes match
-            if msg_emb.size(0) != dyn_emb.size(0):
-                raise RuntimeError(
-                    f"Node count mismatch for '{nt}': "
-                    f"expected {msg_emb.size(0)} nodes but dyn_emb has {dyn_emb.size(0)} "
-                    f"(msg_emb: {msg_emb.shape}, dyn_emb: {dyn_emb.shape})"
-                )
-            
-            upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)         # [N, 2*msg_dim]
-
-            # --------------------------------------------------------
-            # 3) Recurrent update: embeds history into h
-            #    "Here the model embeds past states"
-            # --------------------------------------------------------
-            h_next[nt] = self.update[nt](upd_in, h_t[nt])           # [N, h_dim]
+            dyn_emb = self.dyn_proj[nt](x_dyn_t[nt])  # [B*N, msg_dim]
+            msg_emb = messages[nt]                      # [B*N, msg_dim]
+            upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)  # [B*N, 2*msg_dim]
+            h_next[nt] = self.update[nt](upd_in, h_t[nt])   # [B*N, h_dim]
 
         return h_next
 
@@ -373,6 +346,10 @@ class FloodAutoregressiveHeteroModel(nn.Module):
     High-level model:
       - HeteroTransportCell: evolves hidden state over time
       - Heads: maps hidden state -> predicted water level for both 1D and 2D nodes
+
+    All operations are vectorized over the batch dimension B.
+    Hidden states have shape [B*N, h_dim]; the static graph is replicated
+    B times via PyG's Batch so message passing covers all samples at once.
     """
     def __init__(
         self,
@@ -389,6 +366,7 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
+        self.h_dim = h_dim
 
         # The recurrent graph cell
         self.cell = HeteroTransportCell(
@@ -405,8 +383,8 @@ class FloodAutoregressiveHeteroModel(nn.Module):
 
         # ------------------------------------------------------------
         # Prediction heads (one per node type):
-        # Each head maps hidden state -> predicted water level
-        # Separate heads allow independent learning per node type
+        # Each head maps hidden state -> predicted water level.
+        # Operates on [B*N, h_dim] -> [B*N, 1].
         # ------------------------------------------------------------
         self.heads = nn.ModuleDict({
             nt: nn.Sequential(
@@ -417,63 +395,110 @@ class FloodAutoregressiveHeteroModel(nn.Module):
             for nt in node_types
         })
 
-    def init_hidden(self, data: HeteroData, device: torch.device) -> dict[str, torch.Tensor]:
-        """Initialize hidden state (this is the memory of past states)."""
+    def _make_batched_graph(self, data: HeteroData, B: int) -> HeteroData:
+        """
+        Replicate the static graph B times using PyG's Batch mechanism.
+        Returns a batched HeteroData where:
+          - node features: [B*N_nt, *]
+          - edge indices:  [2, B*E] with correct per-copy offsets
+          - edge features: [B*E, *]
+
+        num_nodes must be set explicitly so PyG can compute edge index offsets.
+        """
+        # Ensure num_nodes is set on each node type store so Batch can offset edges
+        for nt in self.node_types:
+            data[nt].num_nodes = data[nt].x_static.size(0)
+        return Batch.from_data_list([data] * B)
+
+    def init_hidden(self, data: HeteroData, B: int, device: torch.device) -> dict[str, torch.Tensor]:
+        """
+        Initialize hidden state for a batch of B samples.
+        Returns h[nt]: [B*N_nt, h_dim]
+        """
         h = {}
         for nt in self.node_types:
-            h[nt] = torch.zeros((data[nt].num_nodes, self.cell.h_dim), device=device)
+            N = data[nt].num_nodes
+            h[nt] = torch.zeros((B * N, self.cell.h_dim), device=device)
         return h
 
-    def predict_water_levels(self, h: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def predict_water_levels(
+        self,
+        h: dict[str, torch.Tensor],
+        B: int,
+        node_counts: dict[str, int],
+    ) -> dict[str, torch.Tensor]:
         """
-        Decode hidden states into water level predictions for all node types.
+        Decode hidden states into water level predictions.
 
-        Returns:
-            {'oneD': [N_1d, 1], 'twoD': [N_2d, 1]}
+        h[nt]: [B*N_nt, h_dim]
+        Returns: {'oneD': [B, N_1d, 1], 'twoD': [B, N_2d, 1]}
         """
-        return {nt: self.heads[nt](h[nt]) for nt in self.heads}
+        out = {}
+        for nt in self.heads:
+            N = node_counts[nt]
+            pred_flat = self.heads[nt](h[nt])          # [B*N, 1]
+            out[nt] = pred_flat.view(B, N, 1)           # [B, N, 1]
+        return out
 
     def forward_unroll(
         self,
         data: HeteroData,
-        y_hist_1d: torch.Tensor,       # [H, N_1d, 1] true 1D water levels for warm start
-        y_hist_2d: torch.Tensor,       # [H, N_2d, 1] true 2D water levels for warm start
-        rain_hist: torch.Tensor,       # [H, N_2d, R] forcing for warm start
-        rain_future: torch.Tensor,     # [T, N_2d, R] forcing for rollout
+        y_hist_1d: torch.Tensor,       # [B, H, N_1d, 1]
+        y_hist_2d: torch.Tensor,       # [B, H, N_2d, 1]
+        rain_hist: torch.Tensor,       # [B, H, N_2d, R]
+        rain_future: torch.Tensor,     # [B, T, N_2d, R]
         make_x_dyn,                    # function(y_pred: dict, rain_2d, data) -> x_dyn dict
         rollout_steps: int,
         device: torch.device,
+        batched_data: HeteroData = None,  # Pre-built batched graph (optional, avoids rebuild each call)
     ) -> dict[str, torch.Tensor]:
         """
-        Run:
-          1) Warm start (teacher forcing) for H steps using true y for both node types
-          2) Autoregressive rollout for rollout_steps using predicted y for both node types
+        Vectorized forward pass over a batch of B samples.
 
-        make_x_dyn signature: (y_pred: {'oneD': [N_1d,1], 'twoD': [N_2d,1]}, rain_2d: [N_2d,R], data)
-          -> {'oneD': [N_1d, dyn_1d], 'twoD': [N_2d, dyn_2d]}
+        Run:
+          1) Warm start (teacher forcing) for H steps using true y
+          2) Autoregressive rollout for rollout_steps using predicted y
+
+        make_x_dyn signature:
+          (y_pred: {'oneD': [B*N_1d, 1], 'twoD': [B*N_2d, 1]},
+           rain_2d: [B*N_2d, R],
+           data: batched HeteroData)
+          -> {'oneD': [B*N_1d, dyn_1d], 'twoD': [B*N_2d, dyn_2d]}
 
         Returns:
-            {'oneD': [rollout_steps, N_1d, 1], 'twoD': [rollout_steps, N_2d, 1]}
+            {'oneD': [B, rollout_steps, N_1d, 1],
+             'twoD': [B, rollout_steps, N_2d, 1]}
         """
-        h = self.init_hidden(data, device=device)
+        B = y_hist_1d.size(0)
+        N_1d = y_hist_1d.size(2)
+        N_2d = y_hist_2d.size(2)
+        node_counts = {'oneD': N_1d, 'twoD': N_2d}
+
+        # Use pre-built batched graph if provided, otherwise build it now
+        if batched_data is None:
+            batched_data = self._make_batched_graph(data, B)
+
+        h = self.init_hidden(data, B, device=device)
 
         # ------------------------------------------------------------
         # (1) Warm start: feed true past states so hidden state learns history
+        # Reshape [B, H, N, F] inputs to [B*N, F] for each timestep k
         # ------------------------------------------------------------
-        H = y_hist_1d.size(0)
+        H = y_hist_1d.size(1)
         for k in range(H):
-            y_true_k = {
-                'oneD': y_hist_1d[k].to(device),
-                'twoD': y_hist_2d[k].to(device),
-            }
-            r_in = rain_hist[k].to(device)
-            x_dyn_t = make_x_dyn(y_true_k, r_in, data)
-            h = self.cell(data, h, x_dyn_t)
+            # [B, N, 1] -> [B*N, 1]
+            y1d_k = y_hist_1d[:, k, :, :].reshape(B * N_1d, 1)
+            y2d_k = y_hist_2d[:, k, :, :].reshape(B * N_2d, 1)
+            r_k   = rain_hist[:, k, :, :].reshape(B * N_2d, -1)
 
-        # Start rollout from last observed water levels
+            y_true_k = {'oneD': y1d_k, 'twoD': y2d_k}
+            x_dyn_t = make_x_dyn(y_true_k, r_k, batched_data)
+            h = self.cell(batched_data, h, x_dyn_t)
+
+        # Start rollout from last observed water levels (flattened)
         y_t = {
-            'oneD': y_hist_1d[-1].to(device),
-            'twoD': y_hist_2d[-1].to(device),
+            'oneD': y_hist_1d[:, -1, :, :].reshape(B * N_1d, 1),
+            'twoD': y_hist_2d[:, -1, :, :].reshape(B * N_2d, 1),
         }
 
         preds_1d = []
@@ -481,23 +506,27 @@ class FloodAutoregressiveHeteroModel(nn.Module):
 
         # ------------------------------------------------------------
         # (2) Autoregressive rollout:
-        #     - predict next water level for both node types
+        #     - predict next water level for all B samples at once
         #     - feed predictions forward as inputs at next step
-        #     - use known future rainfall forecast
         # ------------------------------------------------------------
         for t in range(rollout_steps):
-            y_next = self.predict_water_levels(h)  # {'oneD': [N_1d,1], 'twoD': [N_2d,1]}
+            y_next = self.predict_water_levels(h, B, node_counts)
+            # y_next['oneD']: [B, N_1d, 1], y_next['twoD']: [B, N_2d, 1]
 
-            preds_1d.append(y_next['oneD'])
-            preds_2d.append(y_next['twoD'])
+            preds_1d.append(y_next['oneD'])   # [B, N_1d, 1]
+            preds_2d.append(y_next['twoD'])   # [B, N_2d, 1]
 
-            r_next = rain_future[t].to(device)
-            x_dyn_next = make_x_dyn(y_next, r_next, data)
-
-            h = self.cell(data, h, x_dyn_next)
-            y_t = y_next
+            # Flatten for cell input
+            r_next = rain_future[:, t, :, :].reshape(B * N_2d, -1)
+            y_flat = {
+                'oneD': y_next['oneD'].reshape(B * N_1d, 1),
+                'twoD': y_next['twoD'].reshape(B * N_2d, 1),
+            }
+            x_dyn_next = make_x_dyn(y_flat, r_next, batched_data)
+            h = self.cell(batched_data, h, x_dyn_next)
+            y_t = y_flat
 
         return {
-            'oneD': torch.stack(preds_1d, dim=0),  # [rollout_steps, N_1d, 1]
-            'twoD': torch.stack(preds_2d, dim=0),  # [rollout_steps, N_2d, 1]
+            'oneD': torch.stack(preds_1d, dim=1),  # [B, rollout_steps, N_1d, 1]
+            'twoD': torch.stack(preds_2d, dim=1),  # [B, rollout_steps, N_2d, 1]
         }

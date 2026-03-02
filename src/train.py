@@ -31,7 +31,7 @@ from data_config import SELECTED_MODEL
 CONFIG = {
     'history_len': 10,
     'forecast_len': 1,
-    'batch_size': 16,
+    'batch_size': 32,
     'epochs': 10,
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
@@ -106,11 +106,12 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
     
     return checkpoint_path
 
-def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None):
+def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None, batched_static_graph=None):
     """Evaluate model on a dataset with both normalized and denormalized losses.
-    
+
     Args:
         max_batches: If set, only evaluate on the first N batches (useful for faster validation)
+        batched_static_graph: Pre-built PyG Batch of B copies of the static graph (avoids rebuild each call)
     """
     model.eval()
     total_loss_norm = 0.0
@@ -129,78 +130,70 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
             # Stop early if max_batches is set
             if max_batches is not None and batch_idx >= max_batches:
                 break
-                
+
             if batch is None:
                 continue
 
             static_graph = batch['static_graph'].to(device)
-            y_hist_1d = batch['y_hist_1d'].to(device)
-            y_hist_2d = batch['y_hist_2d'].to(device)
-            rain_hist_2d = batch['rain_hist_2d'].to(device)
-            y_future_1d = batch['y_future_1d'].to(device)
-            y_future_2d = batch['y_future_2d'].to(device)
+            y_hist_1d = batch['y_hist_1d'].to(device)        # [B, H, N_1d, 1]
+            y_hist_2d = batch['y_hist_2d'].to(device)        # [B, H, N_2d, 1]
+            rain_hist_2d = batch['rain_hist_2d'].to(device)  # [B, H, N_2d, R]
+            y_future_1d = batch['y_future_1d'].to(device)    # [B, T, N_1d, 1]
+            y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N_2d, 1]
             rain_future_2d = batch['rain_future_2d'].to(device)
 
-            batch_size = y_hist_2d.size(0)
-            batch_loss_norm = 0.0
-            batch_loss_denorm = 0.0
+            # Vectorized forward pass over all B samples at once
+            # predictions: {'oneD': [B, T, N_1d, 1], 'twoD': [B, T, N_2d, 1]}
+            predictions = model.forward_unroll(
+                data=static_graph,
+                y_hist_1d=y_hist_1d,
+                y_hist_2d=y_hist_2d,
+                rain_hist=rain_hist_2d,
+                rain_future=rain_future_2d,
+                make_x_dyn=lambda y, r, data: {
+                    'oneD': y['oneD'],
+                    'twoD': torch.cat([y['twoD'], r], dim=-1),
+                },
+                rollout_steps=1,
+                device=device,
+                batched_data=batched_static_graph,
+            )
 
-            for i in range(batch_size):
-                predictions = model.forward_unroll(
-                    data=static_graph,
-                    y_hist_1d=y_hist_1d[i],
-                    y_hist_2d=y_hist_2d[i],
-                    rain_hist=rain_hist_2d[i],
-                    rain_future=rain_future_2d[i],
-                    make_x_dyn=lambda y, r, data: {
-                        'oneD': y['oneD'],
-                        'twoD': torch.cat([y['twoD'], r], dim=-1),
-                    },
-                    rollout_steps=1,
-                    device=device,
-                )
-                # predictions = {'oneD': [T, N_1d, 1], 'twoD': [T, N_2d, 1]}
+            # Node-count-weighted normalized loss (MSELoss averages over all B*T*N elements)
+            n_1d = predictions['oneD'].shape[2]
+            n_2d = predictions['twoD'].shape[2]
+            n_total = n_1d + n_2d
+            loss_1d = criterion(predictions['oneD'], y_future_1d)
+            loss_2d = criterion(predictions['twoD'], y_future_2d)
+            loss_norm = (n_1d * loss_1d + n_2d * loss_2d) / n_total
 
-                # Node-count-weighted normalized loss
-                n_1d = predictions['oneD'].shape[1]
-                n_2d = predictions['twoD'].shape[1]
-                n_total = n_1d + n_2d
-                loss_1d = criterion(predictions['oneD'], y_future_1d[i])
-                loss_2d = criterion(predictions['twoD'], y_future_2d[i])
-                sample_loss_norm = (n_1d * loss_1d + n_2d * loss_2d) / n_total
-                batch_loss_norm += sample_loss_norm
+            # Denormalize for interpretable loss
+            pred_1d_denorm = unnormalize_col(predictions['oneD'], norm_stats, col=wl_col_1d, node_type='oneD')
+            target_1d_denorm = unnormalize_col(y_future_1d, norm_stats, col=wl_col_1d, node_type='oneD')
+            pred_2d_denorm = unnormalize_col(predictions['twoD'], norm_stats, col=wl_col_2d, node_type='twoD')
+            target_2d_denorm = unnormalize_col(y_future_2d, norm_stats, col=wl_col_2d, node_type='twoD')
+            loss_1d_denorm = criterion(pred_1d_denorm, target_1d_denorm)
+            loss_2d_denorm = criterion(pred_2d_denorm, target_2d_denorm)
+            loss_denorm = (n_1d * loss_1d_denorm + n_2d * loss_2d_denorm) / n_total
 
-                # Denormalize using per-type normalizers
-                pred_1d_denorm = unnormalize_col(predictions['oneD'], norm_stats, col=wl_col_1d, node_type='oneD')
-                target_1d_denorm = unnormalize_col(y_future_1d[i], norm_stats, col=wl_col_1d, node_type='oneD')
-                pred_2d_denorm = unnormalize_col(predictions['twoD'], norm_stats, col=wl_col_2d, node_type='twoD')
-                target_2d_denorm = unnormalize_col(y_future_2d[i], norm_stats, col=wl_col_2d, node_type='twoD')
-
-                loss_1d_denorm = criterion(pred_1d_denorm, target_1d_denorm)
-                loss_2d_denorm = criterion(pred_2d_denorm, target_2d_denorm)
-                sample_loss_denorm = (n_1d * loss_1d_denorm + n_2d * loss_2d_denorm) / n_total
-                batch_loss_denorm += sample_loss_denorm
-
-                # Debug: collect error statistics
-                if debug and batch_idx < 5:
-                    all_errors_norm.append((predictions['twoD'] - y_future_2d[i]).abs().cpu().numpy())
-                    all_errors_denorm.append((pred_2d_denorm - target_2d_denorm).abs().cpu().numpy())
-
-            loss_norm = batch_loss_norm / batch_size
-            loss_denorm = batch_loss_denorm / batch_size
             total_loss_norm += loss_norm.item()
             total_loss_denorm += loss_denorm.item()
             num_batches += 1
+
+            # Debug: collect error statistics
+            if debug and batch_idx < 5:
+                all_errors_norm.append((predictions['twoD'] - y_future_2d).abs().cpu().numpy())
+                all_errors_denorm.append((pred_2d_denorm - target_2d_denorm).abs().cpu().numpy())
 
             # Debug print for first few batches
             if debug and batch_idx < 3:
                 print(f"  [DEBUG] Batch {batch_idx}: norm_loss={loss_norm.item():.9f}, denorm_loss={loss_denorm.item():.9f}")
                 print(f"    1D pred range (norm):   [{predictions['oneD'].min():.6f}, {predictions['oneD'].max():.6f}]")
-                print(f"    1D target range (norm): [{y_future_1d[i].min():.6f}, {y_future_1d[i].max():.6f}]")
+                print(f"    1D target range (norm): [{y_future_1d.min():.6f}, {y_future_1d.max():.6f}]")
                 print(f"    1D pred range (denorm): [{pred_1d_denorm.min():.6f}, {pred_1d_denorm.max():.6f}]")
                 print(f"    1D target range (denorm):[{target_1d_denorm.min():.6f}, {target_1d_denorm.max():.6f}]")
                 print(f"    2D pred range (norm):   [{predictions['twoD'].min():.6f}, {predictions['twoD'].max():.6f}]")
-                print(f"    2D target range (norm): [{y_future_2d[i].min():.6f}, {y_future_2d[i].max():.6f}]")
+                print(f"    2D target range (norm): [{y_future_2d.min():.6f}, {y_future_2d.max():.6f}]")
                 print(f"    2D pred range (denorm): [{pred_2d_denorm.min():.6f}, {pred_2d_denorm.max():.6f}]")
                 print(f"    2D target range (denorm):[{target_2d_denorm.min():.6f}, {target_2d_denorm.max():.6f}]")
     
@@ -280,17 +273,25 @@ def train():
     # Setup optimizer and loss
     optimizer = Adam(model.parameters(), lr=CONFIG['lr'])
     criterion = nn.MSELoss()
-    
+
+    # Pre-build batched static graphs once — reused every forward pass to eliminate
+    # per-batch CPU overhead from Batch.from_data_list.
+    print(f"\n[INFO] Pre-building batched static graphs (B={CONFIG['batch_size']})...")
+    _static_graph_cpu = next(iter(train_dataloader))['static_graph']
+    train_batched_graph = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
+    val_batched_graph   = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
+    print(f"[INFO] Batched graphs ready.")
+
     print(f"\n[INFO] Training configuration:")
     print(f"  Learning rate: {CONFIG['lr']}")
     print(f"  Epochs: {CONFIG['epochs']}")
     print(f"  Checkpoint interval: {CONFIG['checkpoint_interval']}")
-    
+
     # Training loop
     print(f"\n{'='*70}")
     print("Training")
     print(f"{'='*70}\n")
-    
+
     best_loss = float('inf')
     epoch_start_time = time.time()
     global_step = 0  # Single monotonic step counter for wandb
@@ -321,39 +322,30 @@ def train():
             y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N_2d, 1]
             rain_future_2d = batch['rain_future_2d'].to(device)  # [B, T, N_2d, R]
 
-            batch_size = y_hist_2d.size(0)
+            # Vectorized forward pass over all B samples at once
+            # predictions: {'oneD': [B, T, N_1d, 1], 'twoD': [B, T, N_2d, 1]}
+            predictions = model.forward_unroll(
+                data=static_graph,
+                y_hist_1d=y_hist_1d,
+                y_hist_2d=y_hist_2d,
+                rain_hist=rain_hist_2d,
+                rain_future=rain_future_2d,
+                make_x_dyn=lambda y, r, data: {
+                    'oneD': y['oneD'],
+                    'twoD': torch.cat([y['twoD'], r], dim=-1),
+                },
+                rollout_steps=CONFIG['forecast_len'],
+                device=device,
+                batched_data=train_batched_graph,
+            )
 
-            # Process each sample in the batch
-            batch_loss = 0.0
-            for i in range(batch_size):
-                # Forward pass for this sample
-                predictions = model.forward_unroll(
-                    data=static_graph,
-                    y_hist_1d=y_hist_1d[i],
-                    y_hist_2d=y_hist_2d[i],
-                    rain_hist=rain_hist_2d[i],
-                    rain_future=rain_future_2d[i],
-                    make_x_dyn=lambda y, r, data: {
-                        'oneD': y['oneD'],
-                        'twoD': torch.cat([y['twoD'], r], dim=-1),
-                    },
-                    rollout_steps=CONFIG['forecast_len'],
-                    device=device,
-                )
-                # predictions = {'oneD': [T, N_1d, 1], 'twoD': [T, N_2d, 1]}
-
-                # Node-count-weighted loss across both node types
-                n_1d = predictions['oneD'].shape[1]
-                n_2d = predictions['twoD'].shape[1]
-                n_total = n_1d + n_2d
-                loss_1d = criterion(predictions['oneD'], y_future_1d[i])
-                loss_2d = criterion(predictions['twoD'], y_future_2d[i])
-                sample_loss = (n_1d * loss_1d + n_2d * loss_2d) / n_total
-
-                batch_loss += sample_loss
-            
-            # Average loss over batch
-            loss = batch_loss / batch_size
+            # Node-count-weighted loss (MSELoss averages over all B*T*N elements)
+            n_1d = predictions['oneD'].shape[2]
+            n_2d = predictions['twoD'].shape[2]
+            n_total = n_1d + n_2d
+            loss_1d = criterion(predictions['oneD'], y_future_1d)
+            loss_2d = criterion(predictions['twoD'], y_future_2d)
+            loss = (n_1d * loss_1d + n_2d * loss_2d) / n_total
             
             # Backward pass
             optimizer.zero_grad()
@@ -363,32 +355,38 @@ def train():
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
+            avg_loss = epoch_loss / num_batches
 
-            # Print progress and log frequently
+            # Build the wandb log dict for this step — always includes train loss
+            log_dict = {
+                'loss/train_batch': loss.item(),
+                'loss/train_avg': avg_loss,
+            }
+
+            # Lightweight validation every N batches — logged at the same step as train
+            if (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
+                val_loss_norm, val_loss_denorm = evaluate(
+                    model, val_dataloader, criterion, device, norm_stats,
+                    split_name=f"Val-Subset (Epoch {epoch}, Batch {batch_idx+1})",
+                    debug=False,
+                    max_batches=VAL_SUBSET_BATCHES,
+                    batched_static_graph=val_batched_graph,
+                )
+                print(f"  → Quick Val Loss (Norm): {val_loss_norm:.9f}")
+                log_dict['loss/val_norm'] = val_loss_norm
+                log_dict['loss/val_denorm'] = val_loss_denorm
+                model.train()  # Switch back to training mode
+
+            wandb.log(log_dict, step=global_step)
+
+            # Console progress every 10 batches
             if (batch_idx + 1) % 10 == 0:
-                avg_loss = epoch_loss / num_batches
                 elapsed = time.time() - batch_start_time
                 print(f"Epoch {epoch}/{CONFIG['epochs']} | "
                       f"Batch {batch_idx+1:3d} | "
                       f"Loss: {loss.item():.6f} | "
                       f"Avg: {avg_loss:.6f} | "
                       f"{elapsed:.1f}s")
-                wandb.log({'loss/train_batch': loss.item(), 'loss/train_avg': avg_loss}, step=global_step)
-
-            # Lightweight validation every N batches (very cheap!)
-            if (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
-                val_loss_norm, val_loss_denorm = evaluate(
-                    model, val_dataloader, criterion, device, norm_stats,
-                    split_name=f"Val-Subset (Epoch {epoch}, Batch {batch_idx+1})",
-                    debug=False,
-                    max_batches=VAL_SUBSET_BATCHES
-                )
-                print(f"  → Quick Val Loss (Norm): {val_loss_norm:.9f}")
-                wandb.log({
-                    'loss/val_norm': val_loss_norm,
-                    'loss/val_denorm': val_loss_denorm,
-                }, step=global_step)
-                model.train()  # Switch back to training mode
         
         # End-of-epoch stats
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
@@ -398,7 +396,7 @@ def train():
         
         # Full validation evaluation (now less frequent due to quick checks)
         print(f"\n[INFO] Running full validation...")
-        val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=False)
+        val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=False, batched_static_graph=val_batched_graph)
 
         wandb.log({
             'loss/train': avg_epoch_loss,
