@@ -273,6 +273,8 @@ def train():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
+
+    wandb.watch(model, log='all', log_freq=50)  # logs gradients + weights every 50 steps
     
     # Setup optimizer and loss
     optimizer = Adam(model.parameters(), lr=CONFIG['lr'])

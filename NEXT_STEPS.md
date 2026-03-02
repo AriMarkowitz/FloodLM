@@ -14,6 +14,7 @@
 
 ## Architecture
 - [ ] Investigate attention-based message passing (e.g., GAT) vs. current GNN conv layers
+- [ ] **PE-GNN-style positional encodings** (try if autoregressive rollout struggles): add Laplacian eigenvector or random walk PE to encode structural roles (confluence nodes, end-of-chain nodes, catchment hierarchy) that 3D coordinates don't capture. Most likely to help with error propagation in long rollouts where upstream/downstream position in the network matters.
 
 ## Data
 - [ ] Evaluate whether 20% val split is sufficient or if more events are needed
