@@ -386,13 +386,11 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         msg_dim: int = 64,
         hidden_dim: int = 128,
         dropout: float = 0.0,
-        predict_delta: bool = True,
     ):
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
         self.pred_node_type = pred_node_type
-        self.predict_delta = predict_delta
 
         # The recurrent graph cell
         self.cell = HeteroTransportCell(
@@ -473,13 +471,8 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         #     - use known future rainfall forecast
         # ------------------------------------------------------------
         for t in range(rollout_steps):
-            # "Here we predict our target future water level"
-            delta_or_abs = self.predict_water_level(h)  # [N_pred, 1]
-
-            if self.predict_delta:
-                y_next = y_t + delta_or_abs
-            else:
-                y_next = delta_or_abs
+            # "Here we predict our target future water level (absolute, not delta)"
+            y_next = self.predict_water_level(h)  # [N_pred, 1]
 
             preds.append(y_next)
 

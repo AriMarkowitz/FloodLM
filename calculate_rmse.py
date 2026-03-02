@@ -85,7 +85,7 @@ def calculate_rmse(pred_file1, pred_file2):
 if __name__ == "__main__":
     # File paths
     floodlm_dir = Path(__file__).parent
-    submission_file = floodlm_dir / "final_submission.csv"
+    submission_file = floodlm_dir / "kaggle_submission.csv"
     reference_file = Path("/Users/Lion/Desktop/UrbanFloodModeling/FloodModel/predictions.csv")
     
     if not submission_file.exists():

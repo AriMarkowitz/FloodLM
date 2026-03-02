@@ -9,8 +9,8 @@ This script:
 4. Formats output to match sample_submission.csv
 
 Usage:
-    # Generate predictions
-    python autoregressive_inference.py --checkpoint checkpoints/model_best.pt --output submission.csv
+    # Generate predictions from project root
+    python src/autoregressive_inference.py --checkpoint-dir checkpoints --output submission.csv
 """
 
 import os
@@ -25,8 +25,13 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# Setup paths
-sys.path.insert(0, 'src')
+# Setup paths (works whether launched from project root or another cwd)
+THIS_DIR = Path(__file__).resolve().parent
+ROOT_DIR = THIS_DIR.parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from data import unnormalize_col, get_model_config, create_static_hetero_graph
 from model import FloodAutoregressiveHeteroModel
@@ -289,12 +294,9 @@ def autoregressive_rollout_both(
             d1 = model.head(h['oneD'])
             d2 = model.head(h['twoD'])
 
-            if model.predict_delta:
-                y1_next = y1_prev + d1
-                y2_next = y2_prev + d2
-            else:
-                y1_next = d1
-                y2_next = d2
+            # Model predicts absolute water levels
+            y1_next = d1
+            y2_next = d2
 
             preds_1d.append(y1_next)
             preds_2d.append(y2_next)
@@ -315,12 +317,45 @@ def denormalize_predictions(predictions, norm_stats, node_type):
     """Denormalize water level predictions for a node type."""
     T, N, _ = predictions.shape
     
+    # DEBUG: Check pred range before denorm
+    pred_min, pred_max = predictions.min().item(), predictions.max().item()
+    pred_mean = predictions.mean().item()
+    pred_median = torch.median(predictions).item()
+    print(f"[DEBUG] Normalized predictions ({node_type}): min={pred_min:.6f}, max={pred_max:.6f}, mean={pred_mean:.6f}, median={pred_median:.6f}, shape={predictions.shape}")
+    
+    # Check if predictions are outside [0,1] range (indicates denormalization will fail)
+    outside_01 = ((predictions < -0.1) | (predictions > 1.1)).sum().item()
+    if outside_01 > 0:
+        pct = 100 * outside_01 / (T * N)
+        print(f"[WARN] {pct:.1f}% of predictions outside [0,1] range - denormalization will produce garbage!")
+    
+    # DEBUG: Check normalizer params
+    if node_type == 'oneD':
+        norm = norm_stats['normalizer_1d']
+        params_dict = 'dynamic_1d_params'
+    else:
+        norm = norm_stats['normalizer_2d']
+        params_dict = 'dynamic_2d_params'
+    
+    if hasattr(norm, 'dynamic_params') and 'water_level' in norm.dynamic_params:
+        wl_params = norm.dynamic_params['water_level']
+        print(f"[DEBUG] {node_type} water_level normalizer params: {wl_params}")
+    
     denorm_preds = []
     for t in range(T):
         pred_t = unnormalize_col(predictions[t], norm_stats, col=0, node_type=node_type)
         denorm_preds.append(pred_t.cpu().numpy())
     
-    return np.stack(denorm_preds, axis=0)  # [T, N, 1]
+    denorm_stack = np.stack(denorm_preds, axis=0)  # [T, N, 1]
+    
+    # Clamp to physical bounds: water level cannot be negative
+    denorm_stack = np.maximum(denorm_stack, 0.0)
+    
+    # DEBUG: Check denorm range
+    denorm_min, denorm_max = denorm_stack.min(), denorm_stack.max()
+    print(f"[DEBUG] Denormalized predictions ({node_type}): min={denorm_min:.6f}, max={denorm_max:.6f}")
+    
+    return denorm_stack
 
 
 def create_submission_rows(predictions, event_id, model_id, node_ids, node_type):
@@ -362,6 +397,7 @@ def process_all_events(
     print(f"\n[INFO] Processing {len(test_events)} test events...")
     
     all_rows = []
+    debug_printed = False
     
     # Build static graph once (same for all events)
     static_graph = build_static_graph_from_cache(data).to(device)
@@ -377,10 +413,31 @@ def process_all_events(
             # Load event data
             node_1d, node_2d = load_event_data(event_dir)
             
+            # DEBUG: Print raw data from first event
+            if event_idx == 0 and not debug_printed:
+                print(f"\n[DEBUG] ===== RAW TEST DATA (Model {model_id}, Event {event_id}) =====")
+                if 'water_level' in node_2d.columns:
+                    raw_wl_2d = node_2d['water_level'].values
+                    print(f"[DEBUG] 2D raw water_level: min={raw_wl_2d.min():.2f}, max={raw_wl_2d.max():.2f}, mean={raw_wl_2d.mean():.2f}")
+                    print(f"[DEBUG]   Sample values: {raw_wl_2d[:5]}")
+                if 'water_level' in node_1d.columns:
+                    raw_wl_1d = node_1d['water_level'].values
+                    print(f"[DEBUG] 1D raw water_level: min={raw_wl_1d.min():.2f}, max={raw_wl_1d.max():.2f}, mean={raw_wl_1d.mean():.2f}")
+                    print(f"[DEBUG]   Sample values: {raw_wl_1d[:5]}")
+                debug_printed = True
+            
             # Prepare tensors
             y1_all, y2_all, rain2_all, timesteps, node_ids_1d, node_ids_2d = prepare_event_tensors(
                 node_1d, node_2d, norm_stats, device
             )
+            
+            # DEBUG: Check normalized values after prepare_tensors
+            if event_idx == 0 and debug_printed:
+                print(f"\n[DEBUG] ===== NORMALIZED DATA TO MODEL =====")
+                print(f"[DEBUG] y1_all (1D, normalized): min={y1_all.min():.6f}, max={y1_all.max():.6f}, shape={y1_all.shape}")
+                print(f"[DEBUG]   Sample: {y1_all[:2, 0, 0]}")
+                print(f"[DEBUG] y2_all (2D, normalized): min={y2_all.min():.6f}, max={y2_all.max():.6f}, shape={y2_all.shape}")
+                print(f"[DEBUG]   Sample: {y2_all[:2, 0, 0]}")
             
             T_total = y2_all.size(0)
             
@@ -538,9 +595,38 @@ def main():
         dc.SELECTED_MODEL = f"Model_{model_id}"
         dc.BASE_PATH = f"data/{dc.SELECTED_MODEL}"
         
-        # Reload modules to pick up new paths
+        # Reload modules to pick up new paths (critical for data)
         import data_lazy
         importlib.reload(data_lazy)
+        
+        # CRITICAL: Re-import after reload to get fresh function refs
+        from data_lazy import initialize_data as initialize_data_fresh
+        
+        # Clear any stale data references
+        print(f"[INFO] Initializing fresh data for Model {model_id}...")
+        data_fresh = initialize_data_fresh()
+        if 'norm_stats' not in data_fresh:
+            raise KeyError(f"Missing norm_stats in Model {model_id} data cache")
+        
+        norm_stats = data_fresh['norm_stats']
+        
+        # Find test events for this model
+        from pathlib import Path as PathlibPath
+        test_root = PathlibPath(dc.BASE_PATH) / 'test'
+        if not test_root.exists():
+            print(f"[ERROR] No test directory for Model {model_id}!")
+            continue
+        
+        test_events = sorted(
+            [str(p) for p in test_root.glob('event_*') if p.is_dir()],
+            key=lambda p: int(PathlibPath(p).name.split('_')[-1])
+        )
+        
+        if len(test_events) == 0:
+            print(f"[ERROR] No test events found for Model {model_id}!")
+            continue
+        
+        print(f"[INFO] Found {len(test_events)} test events for Model {model_id}")
         
         # Determine model-specific checkpoint
         checkpoint_dir = args.checkpoint_dir
@@ -569,8 +655,8 @@ def main():
         # Load model for this specific model_id (architecture depends on graph size)
         model, checkpoint = load_checkpoint(model_checkpoint_path, device)
         
-        # Load test data for this model
-        test_events, norm_stats, data = load_test_data()
+        # Use freshly loaded data (Model_1 and Model_2 have different graph structures)
+        data = data_fresh
         
         # Load model-specific normalizers (trained on this model's data)
         try:
@@ -578,13 +664,18 @@ def main():
             norm_stats['normalizer_1d'] = model_normalizers['normalizer_1d']
             norm_stats['normalizer_2d'] = model_normalizers['normalizer_2d']
             print(f"[INFO] Loaded model-specific normalizers for Model {model_id}")
+            
+            # DEBUG: Print normalizer params for water_level
+            norm_1d = model_normalizers['normalizer_1d']
+            norm_2d = model_normalizers['normalizer_2d']
+            if 'water_level' in norm_2d.dynamic_params:
+                wl_params = norm_2d.dynamic_params['water_level']
+                print(f"[DEBUG] water_level (dynamic, 2D): min={wl_params['min']:.6f}, max={wl_params['max']:.6f}, log={wl_params['log']}")
+            else:
+                print(f"[DEBUG] water_level not found in 2D dynamic params. Available: {list(norm_2d.dynamic_params.keys())[:5]}")
         except FileNotFoundError as e:
             print(f"[WARN] {e}")
             print(f"[WARN] Using normalizers from cache (may not match training)")
-        
-        if len(test_events) == 0:
-            print(f"[ERROR] No test events found for Model {model_id}!")
-            continue
         
         # Process events for this model
         predictions_df = process_all_events(

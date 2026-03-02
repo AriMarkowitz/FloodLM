@@ -1,23 +1,8 @@
 #!/bin/bash
 
 ################################################################################
-# FloodLM Test Pipeline Script
-# 
-# Executes the complete training and inference pipeline on a data subset
-# with GPU optimizations and performance monitoring
-#
-# Supports testing both Model_1 and Model_2 with separate graph structures
-#
-# Usage:
-#   ./test_pipeline.sh [GPU_ID] [MODEL]
-#
-# Examples:
-#   ./test_pipeline.sh           # Auto GPU, test Model_1
-#   ./test_pipeline.sh 0         # GPU 0, test Model_1
-#   ./test_pipeline.sh 0 Model_1 # GPU 0, test Model_1
-#   ./test_pipeline.sh 0 Model_2 # GPU 0, test Model_2
-#   ./test_pipeline.sh 0 all     # GPU 0, test both models
-#
+# FloodLM Pipeline Script
+
 ################################################################################
 
 set -euo pipefail
@@ -97,11 +82,11 @@ update_data_config() {
 # Initialization
 ################################################################################
 
-header "FloodLM Multi-Model Test Pipeline"
+header "FloodLM Training & Inference Pipeline"
 
 log_info "Script directory: ${SCRIPT_DIR}"
 log_info "GPU ID: ${GPU_ID}"
-log_info "Models to test: ${MODELS[*]}"
+log_info "Models to train: ${MODELS[*]}"
 log_info "Number of models: ${#MODELS[@]}"
 
 # Check dependencies
@@ -161,10 +146,10 @@ EOF
 fi
 
 ################################################################################
-# Pre-test Checks
+# Pre-flight Checks
 ################################################################################
 
-log_info "Performing pre-test checks..."
+log_info "Performing pre-flight checks..."
 
 # Check data directory
 if [ ! -d "${SCRIPT_DIR}/data" ]; then
@@ -180,7 +165,7 @@ for file in src/model.py src/data.py data_config.py example_usage.py; do
     fi
 done
 
-log_info "Pre-test checks passed"
+log_info "Pre-flight checks passed"
 
 ################################################################################
 # Environment Setup
@@ -207,82 +192,128 @@ fi
 log_info "OMP_NUM_THREADS=${OMP_NUM_THREADS}"
 
 ################################################################################
-# Run Tests for Each Model
+# Run Training for Each Model
 ################################################################################
 
 OVERALL_SUCCESS=0
 RESULTS_SUMMARY=""
 
+header "FloodLM Full Pipeline: Train → Inference → Evaluate"
+
+# ============================================================================
+# Stage 1: Training
+# ============================================================================
+
+header "Stage 1: Training Models"
+
 for MODEL in "${MODELS[@]}"; do
-    LOG_FILE="${LOG_DIR}/test_${MODEL}_${TIMESTAMP}.log"
+    LOG_FILE="${LOG_DIR}/train_${MODEL}_${TIMESTAMP}.log"
     
-    header "Testing ${MODEL}"
-    
+    log_info "Training ${MODEL}..."
     log_info "Log file: ${LOG_FILE}"
+    log_info "Command: SELECTED_MODEL=${MODEL} ${PYTHON} src/train.py"
     
-    # Update data configuration
-    update_data_config "${MODEL}"
-    
-    # Verify data configuration
-    log_info "Verifying data configuration for ${MODEL}..."
-    if ! SELECTED_MODEL="${MODEL}" ${PYTHON} data_config.py >> "${LOG_FILE}" 2>&1; then
-        log_error "Data validation failed for ${MODEL}"
-        log_error "Check log: ${LOG_FILE}"
-        OVERALL_SUCCESS=1
+    if cd "${SCRIPT_DIR}" && SELECTED_MODEL="${MODEL}" ${PYTHON} -u src/train.py 2>&1 | tee "${LOG_FILE}"; then
+        log_info "✓ ${MODEL} training completed successfully"
         RESULTS_SUMMARY="${RESULTS_SUMMARY}
-✗ ${MODEL}: Data validation failed"
-        continue
-    fi
-    
-    log_info "✓ Data validation successful"
-    
-    # Run test
-    log_info "Starting test execution for ${MODEL}..."
-    log_info "Command: cd ${SCRIPT_DIR} && SELECTED_MODEL=${MODEL} ${PYTHON} -u example_usage.py"
-    
-    if cd "${SCRIPT_DIR}" && SELECTED_MODEL="${MODEL}" ${PYTHON} -u example_usage.py 2>&1 | tee -a "${LOG_FILE}"; then
-        TEST_EXIT_CODE=0
-        log_info "✓ ${MODEL} test completed successfully"
-        RESULTS_SUMMARY="${RESULTS_SUMMARY}
-✓ ${MODEL}: Test passed"
+✓ ${MODEL}: Training passed"
     else
-        TEST_EXIT_CODE=$?
-        log_error "✗ ${MODEL} test failed with exit code ${TEST_EXIT_CODE}"
+        TRAIN_EXIT_CODE=$?
+        log_error "✗ ${MODEL} training failed with exit code ${TRAIN_EXIT_CODE}"
         log_error "Check log: ${LOG_FILE}"
         OVERALL_SUCCESS=1
         RESULTS_SUMMARY="${RESULTS_SUMMARY}
-✗ ${MODEL}: Test failed (exit code ${TEST_EXIT_CODE})"
-    fi
-    
-    # Post-test GPU status
-    if command -v nvidia-smi &> /dev/null; then
-        log_info "GPU Memory Status for ${MODEL}:"
-        nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader | while read line; do
-            log_info "  $line"
-        done
+✗ ${MODEL}: Training failed (exit code ${TRAIN_EXIT_CODE})"
     fi
     
     echo ""
 done
 
+# ============================================================================
+# Stage 2: Inference
+# ============================================================================
+
+header "Stage 2: Running Autoregressive Inference"
+
+LOG_FILE="${LOG_DIR}/inference_${TIMESTAMP}.log"
+
+log_info "Running inference for all trained models..."
+log_info "Log file: ${LOG_FILE}"
+log_info "Command: ${PYTHON} src/autoregressive_inference.py --checkpoint-dir checkpoints --output submission.csv"
+
+if cd "${SCRIPT_DIR}" && ${PYTHON} -u src/autoregressive_inference.py --checkpoint-dir checkpoints --output submission.csv 2>&1 | tee "${LOG_FILE}"; then
+    log_info "✓ Inference completed successfully"
+    RESULTS_SUMMARY="${RESULTS_SUMMARY}
+✓ Inference: Passed"
+    
+    # Check if submission file was created
+    if [ -f "${SCRIPT_DIR}/submission.csv" ]; then
+        SUBMISSION_SIZE=$(wc -l < "${SCRIPT_DIR}/submission.csv")
+        log_info "✓ Submission file created: submission.csv (${SUBMISSION_SIZE} rows)"
+    fi
+else
+    INFERENCE_EXIT_CODE=$?
+    log_error "✗ Inference failed with exit code ${INFERENCE_EXIT_CODE}"
+    log_error "Check log: ${LOG_FILE}"
+    OVERALL_SUCCESS=1
+    RESULTS_SUMMARY="${RESULTS_SUMMARY}
+✗ Inference: Failed (exit code ${INFERENCE_EXIT_CODE})"
+fi
+
+echo ""
+
+# ============================================================================
+# Stage 3: Evaluation (Calculate RMSE)
+# ============================================================================
+
+header "Stage 3: Calculating RMSE"
+
+LOG_FILE="${LOG_DIR}/rmse_${TIMESTAMP}.log"
+
+log_info "Calculating RMSE metrics..."
+log_info "Log file: ${LOG_FILE}"
+log_info "Command: ${PYTHON} calculate_rmse.py"
+
+if cd "${SCRIPT_DIR}" && ${PYTHON} -u calculate_rmse.py 2>&1 | tee "${LOG_FILE}"; then
+    log_info "✓ RMSE calculation completed successfully"
+    RESULTS_SUMMARY="${RESULTS_SUMMARY}
+✓ RMSE Calculation: Passed"
+else
+    RMSE_EXIT_CODE=$?
+    log_error "✗ RMSE calculation failed with exit code ${RMSE_EXIT_CODE}"
+    log_error "Check log: ${LOG_FILE}"
+    OVERALL_SUCCESS=1
+    RESULTS_SUMMARY="${RESULTS_SUMMARY}
+✗ RMSE Calculation: Failed (exit code ${RMSE_EXIT_CODE})"
+fi
+
+echo ""
+
 ################################################################################
 # Summary
 ################################################################################
 
-header "Test Summary"
+header "Pipeline Complete - Summary"
 
-log_info "Models tested: ${MODELS[*]}"
+log_info "Pipeline stages executed:"
+log_info "  1. Training: ${MODELS[*]}"
+log_info "  2. Inference: All models combined"
+log_info "  3. Evaluation: RMSE calculation"
+log_info ""
 log_info "Results:"
 echo "${RESULTS_SUMMARY}"
 
 if [ ${OVERALL_SUCCESS} -eq 0 ]; then
-    log_info "✓ All tests passed!"
+    log_info "✓ All pipeline stages passed!"
+    log_info "Output files:"
+    [ -f "${SCRIPT_DIR}/submission.csv" ] && log_info "  - submission.csv"
 else
-    log_error "✗ Some tests failed"
+    log_error "✗ Some pipeline stages failed"
 fi
 
+log_info ""
 log_info "Log files saved to: ${LOG_DIR}/"
-log_info "View logs with: tail -f ${LOG_DIR}/test_*.log"
+log_info "View logs with: tail -f ${LOG_DIR}/*.log"
 
 exit ${OVERALL_SUCCESS}
 
