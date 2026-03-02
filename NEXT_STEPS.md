@@ -5,10 +5,10 @@
 - [ ] **Switch training loss from MSE to RMSE**: The metric is RMSE not MSE. Minor for optimization direction but worth aligning once other changes are in.
 
 ## Model Evaluation
-- [ ] **Multi-step autoregressive rollout evaluation**: Add fixed-horizon val pass (e.g. h=32 or 64) that unrolls autoregressively. Requires `forecast_len >= fixed_horizon` in the dataloader. Currently val uses `rollout_steps=1`.
+- [x] **Multi-step autoregressive rollout evaluation**: Added `evaluate_rollout()` — runs fixed-horizon val at h=1 (always) and h=32 (once `max_h` reaches 32). Logged as `rollout_val/h1_*` and `rollout_val/h32_*` in wandb.
 
 ## Training
-- [ ] **Curriculum horizon training (top priority)**: Train with gradually increasing autoregressive rollout length to push the model past its 1-step plateau.
+- [x] **Curriculum horizon training**: Implemented. `forecast_len=64`, `max_h = min(64, 2**((epoch-1)//3))`, per-batch `rollout_steps ~ Uniform{1..max_h}`. Horizon-stratified wandb logging (`loss/train_h{N}`, `curriculum/rollout_steps`, `curriculum/max_h`). `epochs=30`, `early_stopping_patience=6`.
 
   **Implementation plan (uniform-per-batch sampling):**
 

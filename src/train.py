@@ -31,15 +31,16 @@ from data_config import SELECTED_MODEL
 # Configuration
 CONFIG = {
     'history_len': 10,
-    'forecast_len': 1,
+    'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
     'batch_size': 32,
-    'epochs': 4,
+    'epochs': 10,                # Curriculum hits max_h=64 at epoch 7 (2^(epoch-1)); epochs 7-10 train at full horizon
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
-    'checkpoint_interval': 1,  # Save every N epochs
-    'early_stopping_patience': 3,   # Stop if val loss doesn't improve for N epochs
+    'checkpoint_interval': 1,   # Save every N epochs
+    'early_stopping_patience': 3,  # Don't stop before horizon has grown to max (hits 64 at epoch 7)
     'early_stopping_min_rel_delta': 0.01,  # Minimum 1% relative improvement to count
+    'curriculum_val_horizon': 32,  # Fixed horizon for multi-step val rollout
 }
 
 # Kaggle metric normalization sigmas: {(model_id, node_type): sigma}
@@ -65,8 +66,11 @@ def get_sigma_weights(model_id: int, norm_stats: dict):
     To make the training loss proportional to NRMSE^2 in normalized space:
       w = (vmax - vmin)^2 / kaggle_sigma^2
 
-    Combined loss = (w_1d * loss_1d + w_2d * loss_2d) / 2
-    gives equal 50/50 contribution per node type, scaled to match the metric.
+    Combined loss = (w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)
+    is a normalized convex combination: same optimization direction as the metric,
+    but loss scale stays ~1x raw MSE so the learning rate remains well-calibrated.
+    Dividing by 2 instead would inflate the loss by ~17x (Model 1) or ~64x (Model 2),
+    effectively multiplying the learning rate by that factor and destabilizing training.
     """
     kaggle_sigma_1d = KAGGLE_SIGMA[(model_id, 1)]
     kaggle_sigma_2d = KAGGLE_SIGMA[(model_id, 2)]
@@ -147,6 +151,48 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
     
     return checkpoint_path
 
+def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_steps, batched_static_graph=None, w_1d=None, w_2d=None, max_batches=None):
+    """Evaluate at a fixed multi-step rollout horizon. Returns (combined_norm, 1d_norm, 2d_norm)."""
+    model.eval()
+    total, total_1d, total_2d = 0.0, 0.0, 0.0
+    n = 0
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            if batch is None:
+                continue
+            avail = batch['y_future_1d'].shape[1]
+            h = min(rollout_steps, avail)
+            static_graph = batch['static_graph'].to(device)
+            y_hist_1d     = batch['y_hist_1d'].to(device)
+            y_hist_2d     = batch['y_hist_2d'].to(device)
+            rain_hist_2d  = batch['rain_hist_2d'].to(device)
+            y_future_1d   = batch['y_future_1d'].to(device)
+            y_future_2d   = batch['y_future_2d'].to(device)
+            rain_future_2d = batch['rain_future_2d'].to(device)
+            predictions = model.forward_unroll(
+                data=static_graph,
+                y_hist_1d=y_hist_1d, y_hist_2d=y_hist_2d,
+                rain_hist=rain_hist_2d, rain_future=rain_future_2d,
+                make_x_dyn=lambda y, r, data: {
+                    'oneD': y['oneD'],
+                    'twoD': torch.cat([y['twoD'], r], dim=-1),
+                },
+                rollout_steps=h, device=device,
+                batched_data=batched_static_graph,
+            )
+            loss_1d = criterion(predictions['oneD'], y_future_1d[:, :h])
+            loss_2d = criterion(predictions['twoD'], y_future_2d[:, :h])
+            total_1d += loss_1d.item()
+            total_2d += loss_2d.item()
+            total += ((w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)).item()
+            n += 1
+    if n == 0:
+        return float('nan'), float('nan'), float('nan')
+    return total / n, total_1d / n, total_2d / n
+
+
 def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None, batched_static_graph=None, w_1d=None, w_2d=None):
     """Evaluate model on a dataset with both normalized and denormalized losses.
 
@@ -204,17 +250,17 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
                 batched_data=batched_static_graph,
             )
 
-            # Sigma-weighted 50/50 loss: (w_1d * loss_1d + w_2d * loss_2d) / 2
-            # Matches Kaggle metric: equal weight per node type, scaled by 1/sigma^2
-            loss_1d = criterion(predictions['oneD'], y_future_1d)
-            loss_2d = criterion(predictions['twoD'], y_future_2d)
-            loss_norm = (w_1d * loss_1d + w_2d * loss_2d) / 2.0
+            # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
+            # Slice targets to 1 step to match rollout_steps=1 prediction shape
+            loss_1d = criterion(predictions['oneD'], y_future_1d[:, :1])
+            loss_2d = criterion(predictions['twoD'], y_future_2d[:, :1])
+            loss_norm = (w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)
 
             # Denormalize for interpretable loss
             pred_1d_denorm = unnormalize_col(predictions['oneD'], norm_stats, col=wl_col_1d, node_type='oneD')
-            target_1d_denorm = unnormalize_col(y_future_1d, norm_stats, col=wl_col_1d, node_type='oneD')
+            target_1d_denorm = unnormalize_col(y_future_1d[:, :1], norm_stats, col=wl_col_1d, node_type='oneD')
             pred_2d_denorm = unnormalize_col(predictions['twoD'], norm_stats, col=wl_col_2d, node_type='twoD')
-            target_2d_denorm = unnormalize_col(y_future_2d, norm_stats, col=wl_col_2d, node_type='twoD')
+            target_2d_denorm = unnormalize_col(y_future_2d[:, :1], norm_stats, col=wl_col_2d, node_type='twoD')
             loss_1d_denorm = criterion(pred_1d_denorm, target_1d_denorm)
             loss_2d_denorm = criterion(pred_2d_denorm, target_2d_denorm)
             loss_denorm = (loss_1d_denorm + loss_2d_denorm) / 2.0
@@ -229,7 +275,7 @@ def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Valid
 
             # Debug: collect error statistics
             if debug and batch_idx < 5:
-                all_errors_norm.append((predictions['twoD'] - y_future_2d).abs().cpu().numpy())
+                all_errors_norm.append((predictions['twoD'] - y_future_2d[:, :1]).abs().cpu().numpy())
                 all_errors_denorm.append((pred_2d_denorm - target_2d_denorm).abs().cpu().numpy())
 
             # Debug print for first few batches
@@ -359,9 +405,9 @@ def train():
     w_1d, w_2d = get_sigma_weights(model_id, norm_stats)
     wl_1d = norm_stats['dynamic_1d_params']['water_level']
     wl_2d = norm_stats['dynamic_2d_params']['water_level']
-    print(f"[INFO] Loss weights (normalized space):")
-    print(f"  1D: range={wl_1d['max']-wl_1d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,1)]}, w={w_1d:.6f}")
-    print(f"  2D: range={wl_2d['max']-wl_2d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,2)]}, w={w_2d:.6f}")
+    print(f"[INFO] Loss weights (normalized convex combo — scale stays ~1x raw MSE):")
+    print(f"  1D: range={wl_1d['max']-wl_1d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,1)]}, w={w_1d:.6f} ({100*w_1d/(w_1d+w_2d):.1f}%)")
+    print(f"  2D: range={wl_2d['max']-wl_2d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,2)]}, w={w_2d:.6f} ({100*w_2d/(w_1d+w_2d):.1f}%)")
 
     # Pre-build batched static graphs once — reused every forward pass to eliminate
     # per-batch CPU overhead from Batch.from_data_list.
@@ -399,10 +445,20 @@ def train():
         # Epoch boundary marker — visible as a vertical annotation in wandb
         wandb.log({'epoch': epoch}, step=global_step)
         
+        # Curriculum: max horizon doubles every epoch, starts at 1, caps at forecast_len
+        # epoch 1→1, 2→2, 3→4, 4→8, 5→16, 6→32, 7→64 (full horizon from epoch 7 onward)
+        max_h = min(CONFIG['forecast_len'], 2 ** (epoch - 1))
+        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h} (batches will sample h ~ Uniform{{1..{max_h}}})")
+
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
                 continue
-            
+
+            # Sample a random rollout horizon for this batch: Uniform{1, ..., max_h}
+            # Cap at actual future length available in the batch
+            avail = batch['y_future_1d'].shape[1]
+            rollout_steps = torch.randint(1, min(max_h, avail) + 1, (1,)).item()
+
             # Extract batch data
             static_graph = batch['static_graph'].to(device)
             y_hist_1d = batch['y_hist_1d'].to(device)        # [B, H, N_1d, 1]
@@ -413,7 +469,7 @@ def train():
             rain_future_2d = batch['rain_future_2d'].to(device)  # [B, T, N_2d, R]
 
             # Vectorized forward pass over all B samples at once
-            # predictions: {'oneD': [B, T, N_1d, 1], 'twoD': [B, T, N_2d, 1]}
+            # predictions: {'oneD': [B, rollout_steps, N_1d, 1], 'twoD': [B, rollout_steps, N_2d, 1]}
             predictions = model.forward_unroll(
                 data=static_graph,
                 y_hist_1d=y_hist_1d,
@@ -424,22 +480,22 @@ def train():
                     'oneD': y['oneD'],
                     'twoD': torch.cat([y['twoD'], r], dim=-1),
                 },
-                rollout_steps=CONFIG['forecast_len'],
+                rollout_steps=rollout_steps,
                 device=device,
                 batched_data=train_batched_graph,
             )
 
-            # Sigma-weighted 50/50 loss: (w_1d * loss_1d + w_2d * loss_2d) / 2
-            # Matches Kaggle metric: equal weight per node type, scaled by 1/sigma^2
-            loss_1d = criterion(predictions['oneD'], y_future_1d)
-            loss_2d = criterion(predictions['twoD'], y_future_2d)
-            loss = (w_1d * loss_1d + w_2d * loss_2d) / 2.0
-            
+            # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
+            # Slice targets to match the sampled rollout_steps
+            loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
+            loss_2d = criterion(predictions['twoD'], y_future_2d[:, :rollout_steps])
+            loss = (w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)
+
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
@@ -451,6 +507,10 @@ def train():
                 'loss/train_avg': avg_loss,
                 'loss/train_1d': loss_1d.item(),
                 'loss/train_2d': loss_2d.item(),
+                # Horizon-stratified: separate curve per rollout length in wandb
+                f'loss/train_h{rollout_steps}': loss.item(),
+                'curriculum/rollout_steps': rollout_steps,
+                'curriculum/max_h': max_h,
             }
 
             # Lightweight validation every N batches — logged at the same step as train
@@ -484,7 +544,7 @@ def train():
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
         epoch_time = time.time() - epoch_start_time
         
-        print(f"\n[INFO] Epoch {epoch}/{CONFIG['epochs']}: Training Loss={avg_epoch_loss:.6f} | Time: {epoch_time:.1f}s")
+        print(f"\n[INFO] Epoch {epoch}/{CONFIG['epochs']}: Training Loss={avg_epoch_loss:.6f} | max_h={max_h} | Time: {epoch_time:.1f}s")
         
         # Full validation evaluation (now less frequent due to quick checks)
         print(f"\n[INFO] Running full validation...")
@@ -509,7 +569,37 @@ def train():
             'nrmse/val_1d': nrmse_1d,
             'nrmse/val_2d': nrmse_2d,
             'nrmse/val_kaggle_approx': (nrmse_1d + nrmse_2d) / 2.0,
+            'curriculum/epoch_max_h': max_h,
         }, step=global_step)
+
+        # Multi-step rollout validation: h=1 baseline + fixed curriculum horizon
+        # Only run h=32 once the curriculum has reached that horizon
+        print(f"\n[INFO] Multi-step val (h=1)...")
+        ms1_combined, ms1_1d, ms1_2d = evaluate_rollout(
+            model, val_dataloader, criterion, device, norm_stats,
+            rollout_steps=1, batched_static_graph=val_batched_graph,
+            w_1d=w_1d, w_2d=w_2d, max_batches=10,
+        )
+        rollout_log = {
+            'rollout_val/h1_combined': ms1_combined,
+            'rollout_val/h1_1d': ms1_1d,
+            'rollout_val/h1_2d': ms1_2d,
+        }
+        print(f"  h=1  combined={ms1_combined:.6e}  1d={ms1_1d:.6e}  2d={ms1_2d:.6e}")
+        if max_h >= CONFIG['curriculum_val_horizon']:
+            h_cv = CONFIG['curriculum_val_horizon']
+            print(f"\n[INFO] Multi-step val (h={h_cv})...")
+            ms_combined, ms_1d, ms_2d = evaluate_rollout(
+                model, val_dataloader, criterion, device, norm_stats,
+                rollout_steps=h_cv, batched_static_graph=val_batched_graph,
+                w_1d=w_1d, w_2d=w_2d, max_batches=10,
+            )
+            rollout_log[f'rollout_val/h{h_cv}_combined'] = ms_combined
+            rollout_log[f'rollout_val/h{h_cv}_1d'] = ms_1d
+            rollout_log[f'rollout_val/h{h_cv}_2d'] = ms_2d
+            print(f"  h={h_cv} combined={ms_combined:.6e}  1d={ms_1d:.6e}  2d={ms_2d:.6e}")
+        model.train()
+        wandb.log(rollout_log, step=global_step)
 
         # Checkpoint
         if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
