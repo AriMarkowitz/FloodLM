@@ -1,0 +1,398 @@
+#!/usr/bin/env python
+"""Full training script for FloodLM with model and normalization checkpointing."""
+
+import os
+import sys
+import json
+import time
+import pickle
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+import numpy as np
+
+# Setup paths (works whether launched via train.py wrapper or directly)
+THIS_DIR = Path(__file__).resolve().parent
+ROOT_DIR = THIS_DIR.parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from data import get_recurrent_dataloader, get_model_config, unnormalize_col
+from model import FloodAutoregressiveHeteroModel
+from data_lazy import initialize_data
+from data_config import SELECTED_MODEL
+
+# Configuration
+CONFIG = {
+    'history_len': 10,
+    'forecast_len': 1,
+    'batch_size': 12,
+    'epochs': 2,
+    'lr': 1e-3,
+    'device': 'mps' if torch.backends.mps.is_available() else 'cpu',
+    'save_dir': 'checkpoints',
+    'checkpoint_interval': 1,  # Save every N epochs
+}
+
+def save_normalization_stats(norm_stats, save_dir, model_id=None):
+    """Save model-specific normalization statistics to disk."""
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Use model ID from SELECTED_MODEL if not provided
+    if model_id is None:
+        model_id = SELECTED_MODEL
+    
+    # Extract serializable components
+    stats_to_save = {
+        'static_1d_params': norm_stats.get('static_1d_params', {}),
+        'static_2d_params': norm_stats.get('static_2d_params', {}),
+        'dynamic_1d_params': norm_stats.get('dynamic_1d_params', {}),
+        'dynamic_2d_params': norm_stats.get('dynamic_2d_params', {}),
+        'node1d_cols': norm_stats.get('node1d_cols', []),
+        'node2d_cols': norm_stats.get('node2d_cols', []),
+        'edge1_cols': norm_stats.get('edge1_cols', []),
+        'edge2_cols': norm_stats.get('edge2_cols', []),
+        'feature_type_1d': norm_stats.get('feature_type_1d', {}),
+        'feature_type_2d': norm_stats.get('feature_type_2d', {}),
+    }
+    
+    # Convert torch tensors to lists for JSON serialization
+    for key in ['oneD_mu', 'oneD_sigma', 'twoD_mu', 'twoD_sigma', 
+                'edge1_mu', 'edge1_sigma', 'edge2_mu', 'edge2_sigma']:
+        if key in norm_stats and isinstance(norm_stats[key], torch.Tensor):
+            stats_to_save[key] = norm_stats[key].cpu().numpy().tolist()
+    
+    # Save as JSON
+    stats_path = os.path.join(save_dir, f'{model_id}_normalization_stats.json')
+    with open(stats_path, 'w') as f:
+        json.dump(stats_to_save, f, indent=2, default=str)
+    
+    # Also save as pickle for full FeatureNormalizer objects (optional, for reference)
+    normalizer_path = os.path.join(save_dir, f'{model_id}_normalizers.pkl')
+    normalizers_data = {
+        'normalizer_1d': norm_stats.get('normalizer_1d'),
+        'normalizer_2d': norm_stats.get('normalizer_2d'),
+    }
+    with open(normalizer_path, 'wb') as f:
+        pickle.dump(normalizers_data, f)
+    
+    print(f"[INFO] Saved normalization statistics to {stats_path}")
+    print(f"[INFO] Saved normalizer objects to {normalizer_path}")
+
+def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
+    """Save model checkpoint and related information."""
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Use model ID from SELECTED_MODEL if not provided
+    if model_id is None:
+        model_id = SELECTED_MODEL
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state': model.state_dict(),
+        'config': config,
+        'loss': loss,
+        'model_id': model_id,
+    }
+    
+    checkpoint_path = os.path.join(save_dir, f'{model_id}_epoch_{epoch:03d}.pt')
+    torch.save(checkpoint, checkpoint_path)
+    print(f"[INFO] Saved checkpoint: {checkpoint_path}")
+    
+    return checkpoint_path
+
+def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False):
+    """Evaluate model on a dataset with both normalized and denormalized losses."""
+    model.eval()
+    total_loss_norm = 0.0
+    total_loss_denorm = 0.0
+    num_batches = 0
+    
+    # Debug statistics
+    all_errors_norm = []
+    all_errors_denorm = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch is None:
+                continue
+            
+            static_graph = batch['static_graph'].to(device)
+            y_hist_2d = batch['y_hist_2d'].to(device)
+            rain_hist_2d = batch['rain_hist_2d'].to(device)
+            y_future_2d = batch['y_future_2d'].to(device)
+            rain_future_2d = batch['rain_future_2d'].to(device)
+            
+            batch_size = y_hist_2d.size(0)
+            batch_loss_norm = 0.0
+            batch_loss_denorm = 0.0
+            
+            for i in range(batch_size):
+                y_hist_sample = y_hist_2d[i]
+                rain_hist_sample = rain_hist_2d[i]
+                y_future_sample = y_future_2d[i]
+                rain_future_sample = rain_future_2d[i]
+                
+                predictions = model.forward_unroll(
+                    data=static_graph,
+                    y_hist_true=y_hist_sample,
+                    rain_hist=rain_hist_sample,
+                    rain_future=rain_future_sample,
+                    make_x_dyn=lambda y, r, data: {
+                        'oneD': torch.zeros((data['oneD'].num_nodes, 1), device=device),
+                        'twoD': torch.cat([y, r], dim=-1),
+                    },
+                    rollout_steps=1,
+                    device=device,
+                )
+                
+                # Loss on normalized data
+                sample_loss_norm = criterion(predictions, y_future_sample)
+                batch_loss_norm += sample_loss_norm
+                
+                # Denormalize for interpretability (water level is column 0)
+                pred_denorm = unnormalize_col(predictions, norm_stats, col=0, node_type='twoD')
+                target_denorm = unnormalize_col(y_future_sample, norm_stats, col=0, node_type='twoD')
+                
+                # Loss on denormalized data (in original units)
+                sample_loss_denorm = criterion(pred_denorm, target_denorm)
+                batch_loss_denorm += sample_loss_denorm
+                
+                # Debug: collect error statistics
+                if debug and batch_idx < 5:  # First 5 batches
+                    error_norm = (predictions - y_future_sample).abs()
+                    error_denorm = (pred_denorm - target_denorm).abs()
+                    all_errors_norm.append(error_norm.cpu().numpy())
+                    all_errors_denorm.append(error_denorm.cpu().numpy())
+            
+            loss_norm = batch_loss_norm / batch_size
+            loss_denorm = batch_loss_denorm / batch_size
+            total_loss_norm += loss_norm.item()
+            total_loss_denorm += loss_denorm.item()
+            num_batches += 1
+            
+            # Debug print for first few batches
+            if debug and batch_idx < 3:
+                print(f"  [DEBUG] Batch {batch_idx}: norm_loss={loss_norm.item():.9f}, denorm_loss={loss_denorm.item():.9f}")
+                print(f"    Pred range (norm): [{predictions.min():.6f}, {predictions.max():.6f}]")
+                print(f"    Target range (norm): [{y_future_sample.min():.6f}, {y_future_sample.max():.6f}]")
+                print(f"    Pred range (denorm): [{pred_denorm.min():.6f}, {pred_denorm.max():.6f}]")
+                print(f"    Target range (denorm): [{target_denorm.min():.6f}, {target_denorm.max():.6f}]")
+    
+    avg_loss_norm = total_loss_norm / num_batches if num_batches > 0 else 0
+    avg_loss_denorm = total_loss_denorm / num_batches if num_batches > 0 else 0
+    
+    print(f"[INFO] {split_name} Loss (Normalized): {avg_loss_norm:.9f}")
+    print(f"[INFO] {split_name} Loss (Denormalized): {avg_loss_denorm:.9f}")
+    
+    if debug and len(all_errors_norm) > 0:
+        errors_norm = np.concatenate(all_errors_norm)
+        errors_denorm = np.concatenate(all_errors_denorm)
+        print(f"[DEBUG] Error distribution (normalized): mean={errors_norm.mean():.9f}, std={errors_norm.std():.9f}, max={errors_norm.max():.9f}")
+        print(f"[DEBUG] Error distribution (denormalized): mean={errors_denorm.mean():.9f}, std={errors_denorm.std():.9f}, max={errors_denorm.max():.9f}")
+    
+    return avg_loss_norm, avg_loss_denorm
+
+def train():
+    """Main training loop."""
+    print("\n" + "="*70)
+    print("FloodLM Training Script")
+    print("="*70)
+    
+    device = torch.device(CONFIG['device'])
+    print(f"[INFO] Device: {device}")
+    
+    # Initialize data and fetch preprocessing
+    print(f"\n[INFO] Initializing data...")
+    data = initialize_data()
+    norm_stats = data['norm_stats']
+    
+    # Save normalization statistics
+    print(f"[INFO] Saving normalization statistics...")
+    save_normalization_stats(norm_stats, CONFIG['save_dir'])
+    
+    # Create dataloaders for train, val, test
+    print(f"\n[INFO] Creating dataloaders...")
+    print(f"  History: {CONFIG['history_len']}, Forecast: {CONFIG['forecast_len']}")
+    print(f"  Batch size: {CONFIG['batch_size']}")
+    print(f"  Split: train (data leakage prevention: normalization computed on train only)")
+    
+    train_dataloader = get_recurrent_dataloader(
+        history_len=CONFIG['history_len'],
+        forecast_len=CONFIG['forecast_len'],
+        batch_size=CONFIG['batch_size'],
+        shuffle=True,
+        split='train',
+    )
+    
+    val_dataloader = get_recurrent_dataloader(
+        history_len=CONFIG['history_len'],
+        forecast_len=CONFIG['forecast_len'],
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        split='val',
+    )
+    
+    test_dataloader = get_recurrent_dataloader(
+        history_len=CONFIG['history_len'],
+        forecast_len=CONFIG['forecast_len'],
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        split='test',
+    )
+    
+    # Get model config
+    print(f"\n[INFO] Getting model configuration...")
+    model_config = get_model_config()
+    print(f"  Node types: {model_config['node_types']}")
+    print(f"  Node static dims: {model_config['node_static_dims']}")
+    print(f"  Node dynamic dims: {model_config['node_dyn_input_dims']}")
+    
+    # Initialize model
+    print(f"\n[INFO] Building model...")
+    model = FloodAutoregressiveHeteroModel(**model_config)
+    model = model.to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    
+    # Setup optimizer and loss
+    optimizer = Adam(model.parameters(), lr=CONFIG['lr'])
+    criterion = nn.MSELoss()
+    
+    print(f"\n[INFO] Training configuration:")
+    print(f"  Learning rate: {CONFIG['lr']}")
+    print(f"  Epochs: {CONFIG['epochs']}")
+    print(f"  Checkpoint interval: {CONFIG['checkpoint_interval']}")
+    
+    # Training loop
+    print(f"\n{'='*70}")
+    print("Training")
+    print(f"{'='*70}\n")
+    
+    best_loss = float('inf')
+    epoch_start_time = time.time()
+    
+    for epoch in range(1, CONFIG['epochs'] + 1):
+        model.train()
+        epoch_loss = 0.0
+        num_batches = 0
+        batch_start_time = time.time()
+        
+        for batch_idx, batch in enumerate(train_dataloader):
+            if batch is None:
+                continue
+            
+            # Extract batch data
+            static_graph = batch['static_graph'].to(device)
+            y_hist_2d = batch['y_hist_2d'].to(device)      # [B, H, N, 1]
+            rain_hist_2d = batch['rain_hist_2d'].to(device)  # [B, H, N, R]
+            y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N, 1]
+            rain_future_2d = batch['rain_future_2d'].to(device)  # [B, T, N, R]
+            
+            batch_size = y_hist_2d.size(0)
+            
+            # Process each sample in the batch
+            batch_loss = 0.0
+            for i in range(batch_size):
+                # Extract single sample [H, N, 1] or [T, N, R]
+                y_hist_sample = y_hist_2d[i]       # [H, N, 1]
+                rain_hist_sample = rain_hist_2d[i]  # [H, N, R]
+                y_future_sample = y_future_2d[i]    # [T, N, 1]
+                rain_future_sample = rain_future_2d[i]  # [T, N, R]
+                
+                # Forward pass for this sample
+                predictions = model.forward_unroll(
+                    data=static_graph,
+                    y_hist_true=y_hist_sample,
+                    rain_hist=rain_hist_sample,
+                    rain_future=rain_future_sample,
+                    make_x_dyn=lambda y, r, data: {
+                        'oneD': torch.zeros((data['oneD'].num_nodes, 1), device=device),
+                        'twoD': torch.cat([y, r], dim=-1),
+                    },
+                    rollout_steps=CONFIG['forecast_len'],
+                    device=device,
+                )
+                
+                # Compute loss for this sample
+                sample_loss = criterion(predictions, y_future_sample)
+                
+                batch_loss += sample_loss
+            
+            # Average loss over batch
+            loss = batch_loss / batch_size
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+            
+            # Print progress
+            if (batch_idx + 1) % 10 == 0:
+                avg_loss = epoch_loss / num_batches
+                elapsed = time.time() - batch_start_time
+                print(f"Epoch {epoch}/{CONFIG['epochs']} | "
+                      f"Batch {batch_idx+1:3d} | "
+                      f"Loss: {loss.item():.6f} | "
+                      f"Avg: {avg_loss:.6f} | "
+                      f"{elapsed:.1f}s")
+        
+        # End-of-epoch stats
+        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        epoch_time = time.time() - epoch_start_time
+        
+        print(f"\n[INFO] Epoch {epoch}/{CONFIG['epochs']}: Training Loss={avg_epoch_loss:.6f} | Time: {epoch_time:.1f}s")
+        
+        # Validation evaluation
+        print(f"\n[INFO] Running validation...")
+        val_loss_norm, val_loss_denorm = evaluate(model, val_dataloader, criterion, device, norm_stats, split_name="Validation", debug=True)
+        print(f"[INFO] Comparison: Training Loss (Norm)={avg_epoch_loss:.9f}, Validation Loss (Norm)={val_loss_norm:.9f}")
+        
+        print()
+        
+        # Checkpoint
+        if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
+            save_checkpoint(model, epoch, avg_epoch_loss, CONFIG['save_dir'], CONFIG)
+        
+        # Track best
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            best_checkpoint = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_epoch_{epoch:03d}.pt')
+            best_path = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_best.pt')
+            if os.path.exists(best_checkpoint):
+                import shutil
+                shutil.copy(best_checkpoint, best_path)
+                print(f"[INFO] New best model saved: {best_path}")
+        
+        epoch_start_time = time.time()
+    
+    # Final test evaluation
+    print("\n[INFO] Running final test set evaluation...")
+    test_loss_norm, test_loss_denorm = evaluate(model, test_dataloader, criterion, device, norm_stats, split_name="Test")
+    
+    # Final summary
+    print("\n" + "="*70)
+    print("Training Complete")
+    print("="*70)
+    print(f"Best training loss (Normalized): {best_loss:.6f}")
+    print(f"Test Loss (Normalized): {test_loss_norm:.9f}")
+    print(f"Test Loss (Denormalized): {test_loss_denorm:.6f}")
+    print(f"\nInterpretation: Denormalized loss is in original water level units (meters)")
+    print(f"Checkpoints saved to: {CONFIG['save_dir']}")
+    final_model_path = os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')
+    print(f"Final model: {final_model_path}")
+    print(f"Best model: {os.path.join(CONFIG['save_dir'], f'{SELECTED_MODEL}_best.pt')}")
+    print("="*70 + "\n")
+
+if __name__ == "__main__":
+    train()
