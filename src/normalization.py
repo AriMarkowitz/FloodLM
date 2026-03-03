@@ -236,21 +236,23 @@ class FeatureNormalizer:
                 continue
 
             vals_out = vals.copy()
-            
-            if params['log']:
-                vals_out[mask] = np.log1p(np.abs(vals_out[mask])) * np.sign(vals_out[mask])
-            
-            vmin, vmax = params['min'], params['max']
-            if vmax > vmin:
-                vals_out[mask] = (vals_out[mask] - vmin) / (vmax - vmin)
+
+            if params.get('type', 'minmax') == 'meanstd':
+                vals_out[mask] = (vals_out[mask] - params['mean']) / params['sigma']
             else:
-                vals_out[mask] = 0.0
-            
+                if params['log']:
+                    vals_out[mask] = np.log1p(np.abs(vals_out[mask])) * np.sign(vals_out[mask])
+                vmin, vmax = params['min'], params['max']
+                if vmax > vmin:
+                    vals_out[mask] = (vals_out[mask] - vmin) / (vmax - vmin)
+                else:
+                    vals_out[mask] = 0.0
+
             # Convert column to float to avoid dtype errors
             df[col] = vals_out.astype(np.float32)
-        
+
         return df
-    
+
     def unnormalize(self, vals: torch.Tensor, feature_name: str, feature_type: str) -> torch.Tensor:
         """
         Unnormalize a feature.
@@ -265,15 +267,16 @@ class FeatureNormalizer:
             return vals
         
         params = params_dict[feature_name]
+
+        if params.get('type', 'minmax') == 'meanstd':
+            return vals * params['sigma'] + params['mean']
+
         vmin, vmax = params['min'], params['max']
-        
         # Reverse min-max
         vals_scaled = vals * (vmax - vmin) + vmin
-        
         # Reverse log transform
         if params['log']:
             vals_scaled = torch.sign(vals_scaled) * (torch.exp(torch.abs(vals_scaled)) - 1)
-        
         return vals_scaled
     
     def get_params_dict(self) -> Dict:

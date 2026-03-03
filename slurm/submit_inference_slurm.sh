@@ -21,6 +21,9 @@ mkdir -p /users/admarkowitz/FloodLM/logs
 source /opt/local/miniconda3/etc/profile.d/conda.sh
 conda activate floodlm
 
+# Configure CUDA memory management
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Move to project root
 cd /users/admarkowitz/FloodLM
 

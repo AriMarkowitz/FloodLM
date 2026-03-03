@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from torch_geometric.data import HeteroData, Batch
 from torch_geometric.nn import MessagePassing, HeteroConv
@@ -451,6 +452,7 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         rollout_steps: int,
         device: torch.device,
         batched_data: HeteroData = None,  # Pre-built batched graph (optional, avoids rebuild each call)
+        use_grad_checkpoint: bool = False,  # Trades recompute for memory at long horizons
     ) -> dict[str, torch.Tensor]:
         """
         Vectorized forward pass over a batch of B samples.
@@ -508,6 +510,9 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         # (2) Autoregressive rollout:
         #     - predict next water level for all B samples at once
         #     - feed predictions forward as inputs at next step
+        # Gradient checkpointing (use_grad_checkpoint=True) trades recompute
+        # for memory at long horizons — each cell step recomputes its activations
+        # during backward instead of storing them.
         # ------------------------------------------------------------
         for t in range(rollout_steps):
             y_next = self.predict_water_levels(h, B, node_counts)
@@ -523,7 +528,19 @@ class FloodAutoregressiveHeteroModel(nn.Module):
                 'twoD': y_next['twoD'].reshape(B * N_2d, 1),
             }
             x_dyn_next = make_x_dyn(y_flat, r_next, batched_data)
-            h = self.cell(batched_data, h, x_dyn_next)
+            if use_grad_checkpoint and self.training:
+                # checkpoint requires all inputs to be tensors; pass h values as a flat list
+                h_1d, h_2d = h['oneD'], h['twoD']
+                def _cell_step(h_1d, h_2d, dyn_1d, dyn_2d):
+                    return self.cell(batched_data,
+                                     {'oneD': h_1d, 'twoD': h_2d},
+                                     {'oneD': dyn_1d, 'twoD': dyn_2d})
+                h_out = grad_checkpoint(_cell_step, h_1d, h_2d,
+                                        x_dyn_next['oneD'], x_dyn_next['twoD'],
+                                        use_reentrant=False)
+                h = h_out
+            else:
+                h = self.cell(batched_data, h, x_dyn_next)
             y_t = y_flat
 
         return {

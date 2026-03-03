@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import pickle
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,7 @@ if str(THIS_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from data import get_recurrent_dataloader, get_model_config, unnormalize_col
+from data import get_recurrent_dataloader, get_model_config
 from model import FloodAutoregressiveHeteroModel
 from data_lazy import initialize_data
 from data_config import SELECTED_MODEL
@@ -43,46 +44,14 @@ CONFIG = {
     'curriculum_val_horizon': 32,  # Fixed horizon for multi-step val rollout
 }
 
-# Kaggle metric normalization sigmas: {(model_id, node_type): sigma}
-# node_type 1 = 1D, node_type 2 = 2D
-# Source: competition metric definition
+# Kaggle sigmas — used only for logging RMSE in meters and approx Kaggle score.
+# Water level is normalized by these sigmas (meanstd), so sqrt(MSE_norm) == NRMSE directly.
 KAGGLE_SIGMA = {
     (1, 1): 16.878,  # Model_1, 1D nodes
     (1, 2): 14.379,  # Model_1, 2D nodes
     (2, 1):  3.192,  # Model_2, 1D nodes
     (2, 2):  2.727,  # Model_2, 2D nodes
 }
-
-def get_sigma_weights(model_id: int, norm_stats: dict):
-    """Return (w_1d, w_2d) for NRMSE-aligned loss in normalized space.
-
-    Our normalization is min-max:  x_norm = (x - vmin) / (vmax - vmin)
-    So:  MSE_raw = MSE_norm * (vmax - vmin)^2
-
-    The Kaggle metric computes NRMSE = RMSE_raw / kaggle_sigma, so:
-      NRMSE^2 = MSE_raw / kaggle_sigma^2
-              = MSE_norm * (vmax - vmin)^2 / kaggle_sigma^2
-
-    To make the training loss proportional to NRMSE^2 in normalized space:
-      w = (vmax - vmin)^2 / kaggle_sigma^2
-
-    Combined loss = (w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)
-    is a normalized convex combination: same optimization direction as the metric,
-    but loss scale stays ~1x raw MSE so the learning rate remains well-calibrated.
-    Dividing by 2 instead would inflate the loss by ~17x (Model 1) or ~64x (Model 2),
-    effectively multiplying the learning rate by that factor and destabilizing training.
-    """
-    kaggle_sigma_1d = KAGGLE_SIGMA[(model_id, 1)]
-    kaggle_sigma_2d = KAGGLE_SIGMA[(model_id, 2)]
-
-    wl_params_1d = norm_stats['dynamic_1d_params']['water_level']
-    wl_params_2d = norm_stats['dynamic_2d_params']['water_level']
-    range_1d = wl_params_1d['max'] - wl_params_1d['min']
-    range_2d = wl_params_2d['max'] - wl_params_2d['min']
-
-    w_1d = (range_1d / kaggle_sigma_1d) ** 2
-    w_2d = (range_2d / kaggle_sigma_2d) ** 2
-    return w_1d, w_2d
 
 def save_normalization_stats(norm_stats, save_dir, model_id=None):
     """Save model-specific normalization statistics to disk."""
@@ -151,7 +120,7 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
     
     return checkpoint_path
 
-def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_steps, batched_static_graph=None, w_1d=None, w_2d=None, max_batches=None):
+def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_steps, batched_static_graph=None, max_batches=None, use_mixed_precision=False):
     """Evaluate at a fixed multi-step rollout horizon. Returns (combined_norm, 1d_norm, 2d_norm)."""
     model.eval()
     total, total_1d, total_2d = 0.0, 0.0, 0.0
@@ -171,159 +140,44 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
             y_future_1d   = batch['y_future_1d'].to(device)
             y_future_2d   = batch['y_future_2d'].to(device)
             rain_future_2d = batch['rain_future_2d'].to(device)
-            predictions = model.forward_unroll(
-                data=static_graph,
-                y_hist_1d=y_hist_1d, y_hist_2d=y_hist_2d,
-                rain_hist=rain_hist_2d, rain_future=rain_future_2d,
-                make_x_dyn=lambda y, r, data: {
-                    'oneD': y['oneD'],
-                    'twoD': torch.cat([y['twoD'], r], dim=-1),
-                },
-                rollout_steps=h, device=device,
-                batched_data=batched_static_graph,
-            )
-            loss_1d = criterion(predictions['oneD'], y_future_1d[:, :h])
-            loss_2d = criterion(predictions['twoD'], y_future_2d[:, :h])
+            with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+                predictions = model.forward_unroll(
+                    data=static_graph,
+                    y_hist_1d=y_hist_1d, y_hist_2d=y_hist_2d,
+                    rain_hist=rain_hist_2d, rain_future=rain_future_2d,
+                    make_x_dyn=lambda y, r, data: {
+                        'oneD': y['oneD'],
+                        'twoD': torch.cat([y['twoD'], r], dim=-1),
+                    },
+                    rollout_steps=h, device=device,
+                    batched_data=batched_static_graph,
+                )
+                loss_1d = criterion(predictions['oneD'], y_future_1d[:, :h])
+                loss_2d = criterion(predictions['twoD'], y_future_2d[:, :h])
             total_1d += loss_1d.item()
             total_2d += loss_2d.item()
-            total += ((w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)).item()
+            total += ((loss_1d + loss_2d) / 2).item()
             n += 1
     if n == 0:
         return float('nan'), float('nan'), float('nan')
     return total / n, total_1d / n, total_2d / n
 
 
-def evaluate(model, dataloader, criterion, device, norm_stats, split_name='Validation', debug=False, max_batches=None, batched_static_graph=None, w_1d=None, w_2d=None):
-    """Evaluate model on a dataset with both normalized and denormalized losses.
-
+def train(resume_from=None, use_mixed_precision=False):
+    """Main training loop.
+    
     Args:
-        max_batches: If set, only evaluate on the first N batches (useful for faster validation)
-        batched_static_graph: Pre-built PyG Batch of B copies of the static graph (avoids rebuild each call)
+        resume_from: Path to checkpoint directory to resume from
+        use_mixed_precision: Whether to use mixed precision (float16) training
     """
-    model.eval()
-    total_loss_norm = 0.0
-    total_loss_denorm = 0.0
-    total_loss_1d_norm = 0.0
-    total_loss_2d_norm = 0.0
-    total_loss_1d_denorm = 0.0
-    total_loss_2d_denorm = 0.0
-    num_batches = 0
-
-    # Debug statistics
-    all_errors_norm = []
-    all_errors_denorm = []
     
-    wl_col_1d = norm_stats['node1d_cols'].index('water_level')
-    wl_col_2d = norm_stats['node2d_cols'].index('water_level')
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            # Stop early if max_batches is set
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-
-            if batch is None:
-                continue
-
-            static_graph = batch['static_graph'].to(device)
-            y_hist_1d = batch['y_hist_1d'].to(device)        # [B, H, N_1d, 1]
-            y_hist_2d = batch['y_hist_2d'].to(device)        # [B, H, N_2d, 1]
-            rain_hist_2d = batch['rain_hist_2d'].to(device)  # [B, H, N_2d, R]
-            y_future_1d = batch['y_future_1d'].to(device)    # [B, T, N_1d, 1]
-            y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N_2d, 1]
-            rain_future_2d = batch['rain_future_2d'].to(device)
-
-            # Vectorized forward pass over all B samples at once
-            # predictions: {'oneD': [B, T, N_1d, 1], 'twoD': [B, T, N_2d, 1]}
-            predictions = model.forward_unroll(
-                data=static_graph,
-                y_hist_1d=y_hist_1d,
-                y_hist_2d=y_hist_2d,
-                rain_hist=rain_hist_2d,
-                rain_future=rain_future_2d,
-                make_x_dyn=lambda y, r, data: {
-                    'oneD': y['oneD'],
-                    'twoD': torch.cat([y['twoD'], r], dim=-1),
-                },
-                rollout_steps=1,
-                device=device,
-                batched_data=batched_static_graph,
-            )
-
-            # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
-            # Slice targets to 1 step to match rollout_steps=1 prediction shape
-            loss_1d = criterion(predictions['oneD'], y_future_1d[:, :1])
-            loss_2d = criterion(predictions['twoD'], y_future_2d[:, :1])
-            loss_norm = (w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)
-
-            # Denormalize for interpretable loss
-            pred_1d_denorm = unnormalize_col(predictions['oneD'], norm_stats, col=wl_col_1d, node_type='oneD')
-            target_1d_denorm = unnormalize_col(y_future_1d[:, :1], norm_stats, col=wl_col_1d, node_type='oneD')
-            pred_2d_denorm = unnormalize_col(predictions['twoD'], norm_stats, col=wl_col_2d, node_type='twoD')
-            target_2d_denorm = unnormalize_col(y_future_2d[:, :1], norm_stats, col=wl_col_2d, node_type='twoD')
-            loss_1d_denorm = criterion(pred_1d_denorm, target_1d_denorm)
-            loss_2d_denorm = criterion(pred_2d_denorm, target_2d_denorm)
-            loss_denorm = (loss_1d_denorm + loss_2d_denorm) / 2.0
-
-            total_loss_norm += loss_norm.item()
-            total_loss_denorm += loss_denorm.item()
-            total_loss_1d_norm += loss_1d.item()
-            total_loss_2d_norm += loss_2d.item()
-            total_loss_1d_denorm += loss_1d_denorm.item()
-            total_loss_2d_denorm += loss_2d_denorm.item()
-            num_batches += 1
-
-            # Debug: collect error statistics
-            if debug and batch_idx < 5:
-                all_errors_norm.append((predictions['twoD'] - y_future_2d[:, :1]).abs().cpu().numpy())
-                all_errors_denorm.append((pred_2d_denorm - target_2d_denorm).abs().cpu().numpy())
-
-            # Debug print for first few batches
-            if debug and batch_idx < 3:
-                print(f"  [DEBUG] Batch {batch_idx}: norm_loss={loss_norm.item():.9f}, denorm_loss={loss_denorm.item():.9f}")
-                print(f"    1D pred range (norm):   [{predictions['oneD'].min():.6f}, {predictions['oneD'].max():.6f}]")
-                print(f"    1D target range (norm): [{y_future_1d.min():.6f}, {y_future_1d.max():.6f}]")
-                print(f"    1D pred range (denorm): [{pred_1d_denorm.min():.6f}, {pred_1d_denorm.max():.6f}]")
-                print(f"    1D target range (denorm):[{target_1d_denorm.min():.6f}, {target_1d_denorm.max():.6f}]")
-                print(f"    2D pred range (norm):   [{predictions['twoD'].min():.6f}, {predictions['twoD'].max():.6f}]")
-                print(f"    2D target range (norm): [{y_future_2d.min():.6f}, {y_future_2d.max():.6f}]")
-                print(f"    2D pred range (denorm): [{pred_2d_denorm.min():.6f}, {pred_2d_denorm.max():.6f}]")
-                print(f"    2D target range (denorm):[{target_2d_denorm.min():.6f}, {target_2d_denorm.max():.6f}]")
-    
-    n = num_batches if num_batches > 0 else 1
-    avg_loss_norm    = total_loss_norm / n
-    avg_loss_denorm  = total_loss_denorm / n
-    avg_1d_norm      = total_loss_1d_norm / n
-    avg_2d_norm      = total_loss_2d_norm / n
-    avg_1d_denorm    = total_loss_1d_denorm / n
-    avg_2d_denorm    = total_loss_2d_denorm / n
-
-    # Approx NRMSE per node type (sqrt of weighted normalized MSE)
-    wl_1d = norm_stats['dynamic_1d_params']['water_level']
-    wl_2d = norm_stats['dynamic_2d_params']['water_level']
-    range_1d = wl_1d['max'] - wl_1d['min']
-    range_2d = wl_2d['max'] - wl_2d['min']
-    model_num = int(SELECTED_MODEL.split('_')[-1])
-    nrmse_1d = (avg_1d_norm ** 0.5) * range_1d / KAGGLE_SIGMA[(model_num, 1)]
-    nrmse_2d = (avg_2d_norm ** 0.5) * range_2d / KAGGLE_SIGMA[(model_num, 2)]
-    approx_kaggle = (nrmse_1d + nrmse_2d) / 2.0
-
-    print(f"[INFO] {split_name}:")
-    print(f"  Combined loss (norm):      {avg_loss_norm:.6e}")
-    print(f"  1D MSE (norm):  {avg_1d_norm:.6e}  |  RMSE (m): {(avg_1d_denorm**0.5):.4f}  |  NRMSE≈{nrmse_1d:.4f}")
-    print(f"  2D MSE (norm):  {avg_2d_norm:.6e}  |  RMSE (m): {(avg_2d_denorm**0.5):.4f}  |  NRMSE≈{nrmse_2d:.4f}")
-    print(f"  Approx Kaggle score:       {approx_kaggle:.4f}")
-
-    if debug and len(all_errors_norm) > 0:
-        errors_norm = np.concatenate(all_errors_norm)
-        errors_denorm = np.concatenate(all_errors_denorm)
-        print(f"[DEBUG] Error distribution (normalized): mean={errors_norm.mean():.9f}, std={errors_norm.std():.9f}, max={errors_norm.max():.9f}")
-        print(f"[DEBUG] Error distribution (denormalized): mean={errors_denorm.mean():.9f}, std={errors_denorm.std():.9f}, max={errors_denorm.max():.9f}")
-
-    return avg_loss_norm, avg_loss_denorm, avg_1d_norm, avg_2d_norm, avg_1d_denorm, avg_2d_denorm
-
-def train():
-    """Main training loop."""
+    # Determine if resuming
+    resume_path = None
+    if resume_from:
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
+            raise ValueError(f"Resume checkpoint not found: {resume_path}")
+        print(f"\n[INFO] Resuming training from: {resume_path}")
     print("\n" + "="*70)
     print("FloodLM Training Script")
     print("="*70)
@@ -399,19 +253,53 @@ def train():
     optimizer = Adam(model.parameters(), lr=CONFIG['lr'])
     criterion = nn.MSELoss()
 
-    # Sigma weights for metric-aligned loss in normalized space:
-    # w = (our_range / kaggle_sigma)^2 accounts for min-max normalization
+    # Mixed precision: GradScaler for stable fp16 backward pass
+    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+
+    # Load checkpoint if resuming
+    start_epoch = 1
+    if resume_path:
+        try:
+            # Try to find the latest checkpoint in the resume directory
+            checkpoint_files = sorted(resume_path.glob('*.pt'))
+            if not checkpoint_files:
+                raise FileNotFoundError(f"No checkpoints found in {resume_path}")
+            
+            # Load the latest checkpoint
+            checkpoint_path = checkpoint_files[-1]
+            print(f"[INFO] Loading checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # Restore model and optimizer states
+            if 'model_state' in checkpoint:
+                model.load_state_dict(checkpoint['model_state'])
+                print(f"[INFO] Model weights restored")
+            
+            if 'optimizer_state' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state'])
+                print(f"[INFO] Optimizer state restored")
+            
+            # Get start epoch from checkpoint metadata
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                print(f"[INFO] Resuming from epoch {start_epoch} (last saved epoch: {checkpoint['epoch']})")
+            
+            print(f"[INFO] Checkpoint successfully loaded")
+        except Exception as e:
+            print(f"[WARNING] Failed to load checkpoint: {e}")
+            print(f"[WARNING] Starting fresh from epoch 1")
+            start_epoch = 1
+
+    # Water level is normalized by kaggle_sigma (meanstd), so sqrt(MSE_norm) == NRMSE directly.
+    # Loss = (loss_1d + loss_2d) / 2 — equal weight, directly Kaggle-aligned.
     model_id = int(SELECTED_MODEL.split('_')[-1])
     kaggle_sigma_1d = KAGGLE_SIGMA[(model_id, 1)]
     kaggle_sigma_2d = KAGGLE_SIGMA[(model_id, 2)]
-    w_1d, w_2d = get_sigma_weights(model_id, norm_stats)
     wl_1d = norm_stats['dynamic_1d_params']['water_level']
     wl_2d = norm_stats['dynamic_2d_params']['water_level']
-    range_1d = wl_1d['max'] - wl_1d['min']
-    range_2d = wl_2d['max'] - wl_2d['min']
-    print(f"[INFO] Loss weights (normalized convex combo — scale stays ~1x raw MSE):")
-    print(f"  1D: range={wl_1d['max']-wl_1d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,1)]}, w={w_1d:.6f} ({100*w_1d/(w_1d+w_2d):.1f}%)")
-    print(f"  2D: range={wl_2d['max']-wl_2d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,2)]}, w={w_2d:.6f} ({100*w_2d/(w_1d+w_2d):.1f}%)")
+    print(f"[INFO] Loss: (loss_1d + loss_2d) / 2  — water_level normalized by kaggle_sigma, so MSE_norm = NRMSE²")
+    print(f"  1D: mean={wl_1d['mean']:.3f}m, kaggle_σ={kaggle_sigma_1d}")
+    print(f"  2D: mean={wl_2d['mean']:.3f}m, kaggle_σ={kaggle_sigma_2d}")
 
     # Pre-build batched static graphs once — reused every forward pass to eliminate
     # per-batch CPU overhead from Batch.from_data_list.
@@ -434,11 +322,13 @@ def train():
     epoch_start_time = time.time()
     global_step = 0  # Single monotonic step counter for wandb
 
-    # Configuration for frequent monitoring
-    VAL_CHECK_INTERVAL = 50  # Every N training batches, do lightweight validation
-    VAL_SUBSET_BATCHES = 3   # Use only 3 batches for lightweight validation (very fast)
+    # Mid-epoch validation disabled — at h=64 even 3-batch rollouts are expensive.
+    # Full validation runs at end of each epoch instead.
+    # Set VAL_CHECK_INTERVAL to an integer (e.g. 50) to re-enable.
+    VAL_CHECK_INTERVAL = None
+    VAL_SUBSET_BATCHES = 3
 
-    for epoch in range(1, CONFIG['epochs'] + 1):
+    for epoch in range(start_epoch, CONFIG['epochs'] + 1):
         model.train()
         epoch_loss = 0.0
         num_batches = 0
@@ -473,31 +363,38 @@ def train():
 
             # Vectorized forward pass over all B samples at once
             # predictions: {'oneD': [B, rollout_steps, N_1d, 1], 'twoD': [B, rollout_steps, N_2d, 1]}
-            predictions = model.forward_unroll(
-                data=static_graph,
-                y_hist_1d=y_hist_1d,
-                y_hist_2d=y_hist_2d,
-                rain_hist=rain_hist_2d,
-                rain_future=rain_future_2d,
-                make_x_dyn=lambda y, r, data: {
-                    'oneD': y['oneD'],
-                    'twoD': torch.cat([y['twoD'], r], dim=-1),
-                },
-                rollout_steps=rollout_steps,
-                device=device,
-                batched_data=train_batched_graph,
-            )
-
-            # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
-            # Slice targets to match the sampled rollout_steps
-            loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
-            loss_2d = criterion(predictions['twoD'], y_future_2d[:, :rollout_steps])
-            loss = (w_1d * loss_1d + w_2d * loss_2d) / (w_1d + w_2d)
-
-            # Backward pass
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+                predictions = model.forward_unroll(
+                    data=static_graph,
+                    y_hist_1d=y_hist_1d,
+                    y_hist_2d=y_hist_2d,
+                    rain_hist=rain_hist_2d,
+                    rain_future=rain_future_2d,
+                    make_x_dyn=lambda y, r, data: {
+                        'oneD': y['oneD'],
+                        'twoD': torch.cat([y['twoD'], r], dim=-1),
+                    },
+                    rollout_steps=rollout_steps,
+                    device=device,
+                    batched_data=train_batched_graph,
+                    use_grad_checkpoint=use_mixed_precision,
+                )
+
+                # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
+                # Slice targets to match the sampled rollout_steps
+                loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
+                loss_2d = criterion(predictions['twoD'], y_future_2d[:, :rollout_steps])
+                loss = (loss_1d + loss_2d) / 2
+
+            # Backward pass (scaler handles fp16 gradient scaling when enabled)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             epoch_loss += loss.item()
             num_batches += 1
@@ -516,19 +413,20 @@ def train():
                 'curriculum/max_h': max_h,
             }
 
-            # Lightweight validation every N batches at current curriculum horizon
-            if (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
+            # Mid-epoch validation (disabled when VAL_CHECK_INTERVAL is None)
+            if VAL_CHECK_INTERVAL is not None and (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
                 val_combined_mid, val_1d_mid, val_2d_mid = evaluate_rollout(
                     model, val_dataloader, criterion, device, norm_stats,
                     rollout_steps=max_h,
                     batched_static_graph=val_batched_graph,
-                    w_1d=w_1d, w_2d=w_2d,
                     max_batches=VAL_SUBSET_BATCHES,
+                    use_mixed_precision=use_mixed_precision,
                 )
-                val_rmse_1d_mid  = (val_1d_mid ** 0.5) * range_1d
-                val_rmse_2d_mid  = (val_2d_mid ** 0.5) * range_2d
-                val_nrmse_1d_mid = val_rmse_1d_mid / kaggle_sigma_1d
-                val_nrmse_2d_mid = val_rmse_2d_mid / kaggle_sigma_2d
+                # sqrt(MSE_norm) == NRMSE directly (water_level normalized by kaggle_sigma)
+                val_nrmse_1d_mid = val_1d_mid ** 0.5
+                val_nrmse_2d_mid = val_2d_mid ** 0.5
+                val_rmse_1d_mid  = val_nrmse_1d_mid * kaggle_sigma_1d
+                val_rmse_2d_mid  = val_nrmse_2d_mid * kaggle_sigma_2d
                 val_kaggle_mid   = (val_nrmse_1d_mid + val_nrmse_2d_mid) / 2
                 print(f"[INFO] Val-Subset (Epoch {epoch}, Batch {batch_idx+1}, h={max_h}):")
                 print(f"  Combined (norm): {val_combined_mid:.6e}  "
@@ -568,37 +466,19 @@ def train():
         val_combined, val_1d, val_2d = evaluate_rollout(
             model, val_dataloader, criterion, device, norm_stats,
             rollout_steps=max_h, batched_static_graph=val_batched_graph,
-            w_1d=w_1d, w_2d=w_2d,
+            use_mixed_precision=use_mixed_precision,
         )
-        # val_loss_norm is the combined sigma-weighted loss — used for early stopping
         val_loss_norm = val_combined
-        # Denormalize: MSE_norm * range^2 = MSE_raw, RMSE_raw = sqrt(MSE_raw)
-        val_rmse_1d  = (val_1d  ** 0.5) * range_1d
-        val_rmse_2d  = (val_2d  ** 0.5) * range_2d
-        val_nrmse_1d = val_rmse_1d  / kaggle_sigma_1d
-        val_nrmse_2d = val_rmse_2d  / kaggle_sigma_2d
+        # sqrt(MSE_norm) == NRMSE directly; * kaggle_sigma gives RMSE in meters
+        val_nrmse_1d = val_1d ** 0.5
+        val_nrmse_2d = val_2d ** 0.5
+        val_rmse_1d  = val_nrmse_1d * kaggle_sigma_1d
+        val_rmse_2d  = val_nrmse_2d * kaggle_sigma_2d
         val_nrmse_combined = (val_nrmse_1d + val_nrmse_2d) / 2
         print(f"  h={max_h}  combined={val_combined:.6e}  "
               f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
               f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
               f"approx_kaggle={val_nrmse_combined:.4f}")
-
-        # h=1 baseline — always logged so we can track single-step accuracy across epochs
-        print(f"\n[INFO] Baseline val (h=1)...")
-        ms1_combined, ms1_1d, ms1_2d = evaluate_rollout(
-            model, val_dataloader, criterion, device, norm_stats,
-            rollout_steps=1, batched_static_graph=val_batched_graph,
-            w_1d=w_1d, w_2d=w_2d, max_batches=10,
-        )
-        ms1_rmse_1d  = (ms1_1d ** 0.5) * range_1d
-        ms1_rmse_2d  = (ms1_2d ** 0.5) * range_2d
-        ms1_nrmse_1d = ms1_rmse_1d / kaggle_sigma_1d
-        ms1_nrmse_2d = ms1_rmse_2d / kaggle_sigma_2d
-        ms1_nrmse_combined = (ms1_nrmse_1d + ms1_nrmse_2d) / 2
-        print(f"  h=1   combined={ms1_combined:.6e}  "
-              f"1d={ms1_1d:.6e} (RMSE={ms1_rmse_1d:.4f}m, NRMSE={ms1_nrmse_1d:.4f})  "
-              f"2d={ms1_2d:.6e} (RMSE={ms1_rmse_2d:.4f}m, NRMSE={ms1_nrmse_2d:.4f})  "
-              f"approx_kaggle={ms1_nrmse_combined:.4f}")
 
         model.train()
 
@@ -612,14 +492,6 @@ def train():
             f'rollout_val/h{max_h}_1d_nrmse': val_nrmse_1d,
             f'rollout_val/h{max_h}_2d_nrmse': val_nrmse_2d,
             f'rollout_val/h{max_h}_approx_kaggle': val_nrmse_combined,
-            'rollout_val/h1_combined': ms1_combined,
-            'rollout_val/h1_1d_mse_norm': ms1_1d,
-            'rollout_val/h1_2d_mse_norm': ms1_2d,
-            'rollout_val/h1_1d_rmse_m': ms1_rmse_1d,
-            'rollout_val/h1_2d_rmse_m': ms1_rmse_2d,
-            'rollout_val/h1_1d_nrmse': ms1_nrmse_1d,
-            'rollout_val/h1_2d_nrmse': ms1_nrmse_2d,
-            'rollout_val/h1_approx_kaggle': ms1_nrmse_combined,
             'curriculum/epoch_max_h': max_h,
         }, step=global_step)
 
@@ -660,4 +532,31 @@ def train():
     print("="*70 + "\n")
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Train FloodLM with optional resume from checkpoint")
+    parser.add_argument('--resume', type=str, default=None, 
+                        help='Path to checkpoint directory to resume from (e.g., checkpoints/latest/ or checkpoints/Model_2_20260303_003721/)')
+    parser.add_argument('--mixed-precision', action='store_true', 
+                        help='Use mixed precision (float16) training to reduce GPU memory usage')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override batch size for resume training')
+    parser.add_argument('--learning-rate', '--lr', type=float, default=None,
+                        help='Override learning rate for resume training')
+    parser.add_argument('--max-h', type=int, default=None,
+                        help='Override max curriculum horizon (default: 64)')
+    args = parser.parse_args()
+    
+    # Apply command-line overrides to CONFIG
+    if args.batch_size is not None:
+        CONFIG['batch_size'] = args.batch_size
+    if args.learning_rate is not None:
+        CONFIG['lr'] = args.learning_rate
+    if args.max_h is not None:
+        CONFIG['forecast_len'] = args.max_h
+    
+    # Enable mixed precision if requested
+    if args.mixed_precision:
+        print("[INFO] Mixed precision training enabled")
+        torch.set_float32_matmul_precision('medium')  # Speeds up matmuls on L40S/A100
+        # Actual fp16 autocast + GradScaler is applied inside train()
+    
+    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision)
