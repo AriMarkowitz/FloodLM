@@ -195,7 +195,7 @@ for MODEL in "${MODELS[@]}"; do
     log_info "Log file: ${LOG_FILE}"
     log_info "Command: SELECTED_MODEL=${MODEL} ${PYTHON} src/train.py"
 
-    if cd "${PROJECT_DIR}" && SELECTED_MODEL="${MODEL}" ${PYTHON} -u src/train.py 2>&1 | tee "${LOG_FILE}"; then
+    if cd "${PROJECT_DIR}" && SELECTED_MODEL="${MODEL}" ${PYTHON} -u src/train.py --mixed-precision 2>&1 | tee "${LOG_FILE}"; then
         log_info "✓ ${MODEL} training completed successfully"
         RESULTS_SUMMARY="${RESULTS_SUMMARY}
 ✓ ${MODEL}: Training passed"
