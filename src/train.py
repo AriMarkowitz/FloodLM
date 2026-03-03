@@ -32,14 +32,14 @@ from data_config import SELECTED_MODEL
 CONFIG = {
     'history_len': 10,
     'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
-    'batch_size': 32,
-    'epochs': 10,                # Curriculum hits max_h=64 at epoch 7 (2^(epoch-1)); epochs 7-10 train at full horizon
+    'batch_size': 16,
+    'epochs': 16,                # 2 epochs per curriculum stage; hits max_h=64 at epoch 13, stays there through 16
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
     'checkpoint_interval': 1,   # Save every N epochs
-    'early_stopping_patience': 3,  # Don't stop before horizon has grown to max (hits 64 at epoch 7)
-    'early_stopping_min_rel_delta': 0.01,  # Minimum 1% relative improvement to count
+    'early_stopping_patience': None,  # Disabled: val loss is incomparable across epochs (different max_h each epoch)
+    'early_stopping_min_rel_delta': 0.01,
     'curriculum_val_horizon': 32,  # Fixed horizon for multi-step val rollout
 }
 
@@ -402,9 +402,13 @@ def train():
     # Sigma weights for metric-aligned loss in normalized space:
     # w = (our_range / kaggle_sigma)^2 accounts for min-max normalization
     model_id = int(SELECTED_MODEL.split('_')[-1])
+    kaggle_sigma_1d = KAGGLE_SIGMA[(model_id, 1)]
+    kaggle_sigma_2d = KAGGLE_SIGMA[(model_id, 2)]
     w_1d, w_2d = get_sigma_weights(model_id, norm_stats)
     wl_1d = norm_stats['dynamic_1d_params']['water_level']
     wl_2d = norm_stats['dynamic_2d_params']['water_level']
+    range_1d = wl_1d['max'] - wl_1d['min']
+    range_2d = wl_2d['max'] - wl_2d['min']
     print(f"[INFO] Loss weights (normalized convex combo — scale stays ~1x raw MSE):")
     print(f"  1D: range={wl_1d['max']-wl_1d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,1)]}, w={w_1d:.6f} ({100*w_1d/(w_1d+w_2d):.1f}%)")
     print(f"  2D: range={wl_2d['max']-wl_2d['min']:.3f}m, kaggle_σ={KAGGLE_SIGMA[(model_id,2)]}, w={w_2d:.6f} ({100*w_2d/(w_1d+w_2d):.1f}%)")
@@ -427,8 +431,6 @@ def train():
     print("Training")
     print(f"{'='*70}\n")
 
-    best_val_loss = float('inf')
-    early_stopping_counter = 0
     epoch_start_time = time.time()
     global_step = 0  # Single monotonic step counter for wandb
 
@@ -445,28 +447,29 @@ def train():
         # Epoch boundary marker — visible as a vertical annotation in wandb
         wandb.log({'epoch': epoch}, step=global_step)
         
-        # Curriculum: max horizon doubles every epoch, starts at 1, caps at forecast_len
-        # epoch 1→1, 2→2, 3→4, 4→8, 5→16, 6→32, 7→64 (full horizon from epoch 7 onward)
-        max_h = min(CONFIG['forecast_len'], 2 ** (epoch - 1))
-        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h} (batches will sample h ~ Uniform{{1..{max_h}}})")
+        # Curriculum: max horizon doubles every 2 epochs, starts at 1, caps at forecast_len
+        # epoch 1-2→1, 3-4→2, 5-6→4, 7-8→8, 9-10→16, 11-12→32, 13-14→64
+        max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // 2))
+        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h} (all batches train at h={max_h})")
 
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
                 continue
 
-            # Sample a random rollout horizon for this batch: Uniform{1, ..., max_h}
-            # Cap at actual future length available in the batch
+            # Train at the full curriculum horizon for this epoch — no sampling.
+            # Each epoch IS the curriculum stage; always training at max_h maximizes
+            # exposure to the deployment-length rollout (target ~50 steps).
             avail = batch['y_future_1d'].shape[1]
-            rollout_steps = torch.randint(1, min(max_h, avail) + 1, (1,)).item()
+            rollout_steps = min(max_h, avail)
 
             # Extract batch data
-            static_graph = batch['static_graph'].to(device)
-            y_hist_1d = batch['y_hist_1d'].to(device)        # [B, H, N_1d, 1]
-            y_hist_2d = batch['y_hist_2d'].to(device)        # [B, H, N_2d, 1]
-            rain_hist_2d = batch['rain_hist_2d'].to(device)  # [B, H, N_2d, R]
-            y_future_1d = batch['y_future_1d'].to(device)    # [B, T, N_1d, 1]
-            y_future_2d = batch['y_future_2d'].to(device)    # [B, T, N_2d, 1]
-            rain_future_2d = batch['rain_future_2d'].to(device)  # [B, T, N_2d, R]
+            static_graph = batch['static_graph'].to(device, non_blocking=True)
+            y_hist_1d = batch['y_hist_1d'].to(device, non_blocking=True)        # [B, H, N_1d, 1]
+            y_hist_2d = batch['y_hist_2d'].to(device, non_blocking=True)        # [B, H, N_2d, 1]
+            rain_hist_2d = batch['rain_hist_2d'].to(device, non_blocking=True)  # [B, H, N_2d, R]
+            y_future_1d = batch['y_future_1d'].to(device, non_blocking=True)    # [B, T, N_1d, 1]
+            y_future_2d = batch['y_future_2d'].to(device, non_blocking=True)    # [B, T, N_2d, 1]
+            rain_future_2d = batch['rain_future_2d'].to(device, non_blocking=True)  # [B, T, N_2d, R]
 
             # Vectorized forward pass over all B samples at once
             # predictions: {'oneD': [B, rollout_steps, N_1d, 1], 'twoD': [B, rollout_steps, N_2d, 1]}
@@ -507,26 +510,39 @@ def train():
                 'loss/train_avg': avg_loss,
                 'loss/train_1d': loss_1d.item(),
                 'loss/train_2d': loss_2d.item(),
-                # Horizon-stratified: separate curve per rollout length in wandb
+                # Horizon-stratified: separate curve per epoch's rollout length in wandb
                 f'loss/train_h{rollout_steps}': loss.item(),
                 'curriculum/rollout_steps': rollout_steps,
                 'curriculum/max_h': max_h,
             }
 
-            # Lightweight validation every N batches — logged at the same step as train
+            # Lightweight validation every N batches at current curriculum horizon
             if (batch_idx + 1) % VAL_CHECK_INTERVAL == 0:
-                val_loss_norm, val_loss_denorm, val_1d_norm, val_2d_norm, val_1d_denorm, val_2d_denorm = evaluate(
+                val_combined_mid, val_1d_mid, val_2d_mid = evaluate_rollout(
                     model, val_dataloader, criterion, device, norm_stats,
-                    split_name=f"Val-Subset (Epoch {epoch}, Batch {batch_idx+1})",
-                    debug=False,
-                    max_batches=VAL_SUBSET_BATCHES,
+                    rollout_steps=max_h,
                     batched_static_graph=val_batched_graph,
                     w_1d=w_1d, w_2d=w_2d,
+                    max_batches=VAL_SUBSET_BATCHES,
                 )
-                log_dict['loss/val_norm']    = val_loss_norm
-                log_dict['loss/val_denorm']  = val_loss_denorm
-                log_dict['loss/val_1d_norm'] = val_1d_norm
-                log_dict['loss/val_2d_norm'] = val_2d_norm
+                val_rmse_1d_mid  = (val_1d_mid ** 0.5) * range_1d
+                val_rmse_2d_mid  = (val_2d_mid ** 0.5) * range_2d
+                val_nrmse_1d_mid = val_rmse_1d_mid / kaggle_sigma_1d
+                val_nrmse_2d_mid = val_rmse_2d_mid / kaggle_sigma_2d
+                val_kaggle_mid   = (val_nrmse_1d_mid + val_nrmse_2d_mid) / 2
+                print(f"[INFO] Val-Subset (Epoch {epoch}, Batch {batch_idx+1}, h={max_h}):")
+                print(f"  Combined (norm): {val_combined_mid:.6e}  "
+                      f"1D RMSE={val_rmse_1d_mid:.4f}m NRMSE={val_nrmse_1d_mid:.4f}  "
+                      f"2D RMSE={val_rmse_2d_mid:.4f}m NRMSE={val_nrmse_2d_mid:.4f}  "
+                      f"approx_kaggle={val_kaggle_mid:.4f}")
+                log_dict['loss/val_norm']          = val_combined_mid
+                log_dict['loss/val_1d_norm']       = val_1d_mid
+                log_dict['loss/val_2d_norm']       = val_2d_mid
+                log_dict['loss/val_1d_rmse_m']     = val_rmse_1d_mid
+                log_dict['loss/val_2d_rmse_m']     = val_rmse_2d_mid
+                log_dict['loss/val_1d_nrmse']      = val_nrmse_1d_mid
+                log_dict['loss/val_2d_nrmse']      = val_nrmse_2d_mid
+                log_dict['loss/val_approx_kaggle'] = val_kaggle_mid
                 model.train()  # Switch back to training mode
 
             wandb.log(log_dict, step=global_step)
@@ -546,95 +562,87 @@ def train():
         
         print(f"\n[INFO] Epoch {epoch}/{CONFIG['epochs']}: Training Loss={avg_epoch_loss:.6f} | max_h={max_h} | Time: {epoch_time:.1f}s")
         
-        # Full validation evaluation (now less frequent due to quick checks)
-        print(f"\n[INFO] Running full validation...")
-        val_loss_norm, val_loss_denorm, val_1d_norm, val_2d_norm, val_1d_denorm, val_2d_denorm = evaluate(
+        # Full validation at current curriculum horizon — matches what we're training on.
+        # This is used for early stopping and checkpointing.
+        print(f"\n[INFO] Running full validation (h={max_h})...")
+        val_combined, val_1d, val_2d = evaluate_rollout(
             model, val_dataloader, criterion, device, norm_stats,
-            split_name="Validation", debug=False,
-            batched_static_graph=val_batched_graph, w_1d=w_1d, w_2d=w_2d,
+            rollout_steps=max_h, batched_static_graph=val_batched_graph,
+            w_1d=w_1d, w_2d=w_2d,
         )
+        # val_loss_norm is the combined sigma-weighted loss — used for early stopping
+        val_loss_norm = val_combined
+        # Denormalize: MSE_norm * range^2 = MSE_raw, RMSE_raw = sqrt(MSE_raw)
+        val_rmse_1d  = (val_1d  ** 0.5) * range_1d
+        val_rmse_2d  = (val_2d  ** 0.5) * range_2d
+        val_nrmse_1d = val_rmse_1d  / kaggle_sigma_1d
+        val_nrmse_2d = val_rmse_2d  / kaggle_sigma_2d
+        val_nrmse_combined = (val_nrmse_1d + val_nrmse_2d) / 2
+        print(f"  h={max_h}  combined={val_combined:.6e}  "
+              f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
+              f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
+              f"approx_kaggle={val_nrmse_combined:.4f}")
 
-        # Approx Kaggle NRMSE for wandb
-        range_1d = norm_stats['dynamic_1d_params']['water_level']['max'] - norm_stats['dynamic_1d_params']['water_level']['min']
-        range_2d = norm_stats['dynamic_2d_params']['water_level']['max'] - norm_stats['dynamic_2d_params']['water_level']['min']
-        nrmse_1d = (val_1d_norm ** 0.5) * range_1d / KAGGLE_SIGMA[(model_id, 1)]
-        nrmse_2d = (val_2d_norm ** 0.5) * range_2d / KAGGLE_SIGMA[(model_id, 2)]
-
-        wandb.log({
-            'loss/train': avg_epoch_loss,
-            'loss/val_norm': val_loss_norm,
-            'loss/val_denorm': val_loss_denorm,
-            'loss/val_1d_norm': val_1d_norm,
-            'loss/val_2d_norm': val_2d_norm,
-            'nrmse/val_1d': nrmse_1d,
-            'nrmse/val_2d': nrmse_2d,
-            'nrmse/val_kaggle_approx': (nrmse_1d + nrmse_2d) / 2.0,
-            'curriculum/epoch_max_h': max_h,
-        }, step=global_step)
-
-        # Multi-step rollout validation: h=1 baseline + fixed curriculum horizon
-        # Only run h=32 once the curriculum has reached that horizon
-        print(f"\n[INFO] Multi-step val (h=1)...")
+        # h=1 baseline — always logged so we can track single-step accuracy across epochs
+        print(f"\n[INFO] Baseline val (h=1)...")
         ms1_combined, ms1_1d, ms1_2d = evaluate_rollout(
             model, val_dataloader, criterion, device, norm_stats,
             rollout_steps=1, batched_static_graph=val_batched_graph,
             w_1d=w_1d, w_2d=w_2d, max_batches=10,
         )
-        rollout_log = {
-            'rollout_val/h1_combined': ms1_combined,
-            'rollout_val/h1_1d': ms1_1d,
-            'rollout_val/h1_2d': ms1_2d,
-        }
-        print(f"  h=1  combined={ms1_combined:.6e}  1d={ms1_1d:.6e}  2d={ms1_2d:.6e}")
-        if max_h >= CONFIG['curriculum_val_horizon']:
-            h_cv = CONFIG['curriculum_val_horizon']
-            print(f"\n[INFO] Multi-step val (h={h_cv})...")
-            ms_combined, ms_1d, ms_2d = evaluate_rollout(
-                model, val_dataloader, criterion, device, norm_stats,
-                rollout_steps=h_cv, batched_static_graph=val_batched_graph,
-                w_1d=w_1d, w_2d=w_2d, max_batches=10,
-            )
-            rollout_log[f'rollout_val/h{h_cv}_combined'] = ms_combined
-            rollout_log[f'rollout_val/h{h_cv}_1d'] = ms_1d
-            rollout_log[f'rollout_val/h{h_cv}_2d'] = ms_2d
-            print(f"  h={h_cv} combined={ms_combined:.6e}  1d={ms_1d:.6e}  2d={ms_2d:.6e}")
+        ms1_rmse_1d  = (ms1_1d ** 0.5) * range_1d
+        ms1_rmse_2d  = (ms1_2d ** 0.5) * range_2d
+        ms1_nrmse_1d = ms1_rmse_1d / kaggle_sigma_1d
+        ms1_nrmse_2d = ms1_rmse_2d / kaggle_sigma_2d
+        ms1_nrmse_combined = (ms1_nrmse_1d + ms1_nrmse_2d) / 2
+        print(f"  h=1   combined={ms1_combined:.6e}  "
+              f"1d={ms1_1d:.6e} (RMSE={ms1_rmse_1d:.4f}m, NRMSE={ms1_nrmse_1d:.4f})  "
+              f"2d={ms1_2d:.6e} (RMSE={ms1_rmse_2d:.4f}m, NRMSE={ms1_nrmse_2d:.4f})  "
+              f"approx_kaggle={ms1_nrmse_combined:.4f}")
+
         model.train()
-        wandb.log(rollout_log, step=global_step)
+
+        wandb.log({
+            'loss/train': avg_epoch_loss,
+            f'rollout_val/h{max_h}_combined': val_combined,
+            f'rollout_val/h{max_h}_1d_mse_norm': val_1d,
+            f'rollout_val/h{max_h}_2d_mse_norm': val_2d,
+            f'rollout_val/h{max_h}_1d_rmse_m': val_rmse_1d,
+            f'rollout_val/h{max_h}_2d_rmse_m': val_rmse_2d,
+            f'rollout_val/h{max_h}_1d_nrmse': val_nrmse_1d,
+            f'rollout_val/h{max_h}_2d_nrmse': val_nrmse_2d,
+            f'rollout_val/h{max_h}_approx_kaggle': val_nrmse_combined,
+            'rollout_val/h1_combined': ms1_combined,
+            'rollout_val/h1_1d_mse_norm': ms1_1d,
+            'rollout_val/h1_2d_mse_norm': ms1_2d,
+            'rollout_val/h1_1d_rmse_m': ms1_rmse_1d,
+            'rollout_val/h1_2d_rmse_m': ms1_rmse_2d,
+            'rollout_val/h1_1d_nrmse': ms1_nrmse_1d,
+            'rollout_val/h1_2d_nrmse': ms1_nrmse_2d,
+            'rollout_val/h1_approx_kaggle': ms1_nrmse_combined,
+            'curriculum/epoch_max_h': max_h,
+        }, step=global_step)
 
         # Checkpoint
         if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
             save_checkpoint(model, epoch, avg_epoch_loss, run_dir, CONFIG)
 
-        # Early stopping + best checkpoint: check if val loss improved by at least min_rel_delta
-        min_rel_delta = CONFIG['early_stopping_min_rel_delta']
-        if val_loss_norm < best_val_loss * (1.0 - min_rel_delta):
-            best_val_loss = val_loss_norm
-            early_stopping_counter = 0
-            best_checkpoint = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{epoch:03d}.pt')
+        # Best checkpoint tracking — always save the last epoch's checkpoint to latest/
+        # (Early stopping is disabled: val loss is incomparable across epochs with different max_h)
+        import shutil
+        best_checkpoint = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{epoch:03d}.pt')
+        if os.path.exists(best_checkpoint):
             best_path = os.path.join(run_dir, f'{SELECTED_MODEL}_best.pt')
-            if os.path.exists(best_checkpoint):
-                import shutil
-                shutil.copy(best_checkpoint, best_path)
-                print(f"[INFO] New best model saved: {best_path} (val_loss={val_loss_norm:.6e})")
-                # Mirror into latest/ so inference always finds all models in one place
-                shutil.copy(best_checkpoint, os.path.join(latest_dir, f'{SELECTED_MODEL}_best.pt'))
-                for fname in [f'{SELECTED_MODEL}_normalizers.pkl',
-                               f'{SELECTED_MODEL}_normalization_stats.json']:
-                    src = os.path.join(run_dir, fname)
-                    if os.path.exists(src):
-                        shutil.copy(src, os.path.join(latest_dir, fname))
-                print(f"[INFO] Mirrored best checkpoint + normalizers to {latest_dir}")
-        else:
-            early_stopping_counter += 1
-            print(f"[INFO] No significant val improvement ({early_stopping_counter}/{CONFIG['early_stopping_patience']})")
+            shutil.copy(best_checkpoint, best_path)
+            shutil.copy(best_checkpoint, os.path.join(latest_dir, f'{SELECTED_MODEL}_best.pt'))
+            for fname in [f'{SELECTED_MODEL}_normalizers.pkl',
+                           f'{SELECTED_MODEL}_normalization_stats.json']:
+                src = os.path.join(run_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy(src, os.path.join(latest_dir, fname))
+            print(f"[INFO] Checkpoint mirrored to latest/ (h={max_h} val_loss={val_loss_norm:.6e})")
 
         print()
-
-        # Early stopping trigger
-        if early_stopping_counter >= CONFIG['early_stopping_patience']:
-            print(f"[INFO] Early stopping triggered after {epoch} epochs (no >{min_rel_delta*100:.0f}% val improvement for {CONFIG['early_stopping_patience']} epochs)")
-            wandb.log({'early_stopped_epoch': epoch}, step=global_step)
-            break
 
         epoch_start_time = time.time()
 
@@ -642,8 +650,8 @@ def train():
     print("\n" + "="*70)
     print("Training Complete")
     print("="*70)
-    print(f"Best validation loss (Normalized): {best_val_loss:.6f}")
-    print(f"\nInterpretation: Denormalized loss is in original water level units (meters)")
+    print(f"Final epoch val loss (h={max_h}): {val_loss_norm:.6f}")
+    print(f"Early stopping: disabled (val loss not comparable across curriculum stages)")
     print(f"Checkpoints saved to: {run_dir}")
     print(f"Latest dir:           {latest_dir}")
     final_model_path = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')
