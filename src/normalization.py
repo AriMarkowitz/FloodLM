@@ -131,18 +131,39 @@ class FeatureNormalizer:
                 vals = df[col].astype(float).values
                 self._running_stats[col].update(vals)
     
-    def finalize_dynamic_streaming(self, skew_threshold=2.0):
-        """Finalize dynamic normalization parameters after all updates."""
+    def finalize_dynamic_streaming(self, skew_threshold=2.0, meanstd_overrides=None):
+        """Finalize dynamic normalization parameters after all updates.
+
+        Args:
+            skew_threshold: Skewness threshold for log transform.
+            meanstd_overrides: Optional dict {feature: sigma} — for these features, use
+                mean/std normalization with the data mean and the provided sigma value.
+                This ensures sqrt(MSE_normalized) == NRMSE for Kaggle-aligned metrics.
+        """
+        meanstd_overrides = meanstd_overrides or {}
         for col in self.dynamic_features:
             stats = self._running_stats[col]
+
+            if col in meanstd_overrides:
+                # Mean/std normalization: center on data mean, scale by provided sigma
+                self.dynamic_params[col] = {
+                    'type': 'meanstd',
+                    'mean': float(stats.M1),
+                    'sigma': float(meanstd_overrides[col]),
+                    'log': False,
+                }
+                if self.verbose:
+                    print(f"[INFO] Dynamic {col}: meanstd mean={stats.M1:.3f}, sigma={meanstd_overrides[col]}")
+                continue
+
             skew = stats.get_skewness()
             use_log = abs(skew) > skew_threshold
             if col == "water_level":
                 use_log = False
-            
+
             # Get min/max from raw data
             vmin, vmax = stats.min_val, stats.max_val
-            
+
             # If using log transform, recompute min/max on transformed data
             if use_log:
                 if self.verbose:
@@ -155,20 +176,20 @@ class FeatureNormalizer:
                     vmin_transformed = np.log1p(vmin)
                     vmax_transformed = np.log1p(vmax)
                 vmin, vmax = vmin_transformed, vmax_transformed
-            
+
             self.dynamic_params[col] = {
                 'min': float(vmin),
                 'max': float(vmax),
                 'log': bool(use_log),
             }
-            
+
             # Print normalization range
             if self.verbose:
                 if use_log:
                     print(f"[INFO] Dynamic {col}: transformed range=[{vmin:.4f}, {vmax:.4f}]")
                 else:
                     print(f"[INFO] Dynamic {col}: range=[{vmin:.4f}, {vmax:.4f}]")
-        
+
         # Clear streaming stats to free memory
         self._running_stats = {}
     

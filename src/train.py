@@ -298,8 +298,8 @@ def train(resume_from=None, use_mixed_precision=False):
     wl_1d = norm_stats['dynamic_1d_params']['water_level']
     wl_2d = norm_stats['dynamic_2d_params']['water_level']
     print(f"[INFO] Loss: (loss_1d + loss_2d) / 2  — water_level normalized by kaggle_sigma, so MSE_norm = NRMSE²")
-    print(f"  1D: mean={wl_1d['mean']:.3f}m, kaggle_σ={kaggle_sigma_1d}")
-    print(f"  2D: mean={wl_2d['mean']:.3f}m, kaggle_σ={kaggle_sigma_2d}")
+    print(f"  1D: mean={wl_1d['mean']:.3f}m, sigma={wl_1d['sigma']:.3f}m (kaggle_σ={kaggle_sigma_1d})")
+    print(f"  2D: mean={wl_2d['mean']:.3f}m, sigma={wl_2d['sigma']:.3f}m (kaggle_σ={kaggle_sigma_2d})")
 
     # Pre-build batched static graphs once — reused every forward pass to eliminate
     # per-batch CPU overhead from Batch.from_data_list.

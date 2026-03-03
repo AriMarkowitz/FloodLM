@@ -315,8 +315,19 @@ def initialize_data():
             normalizer_1d.update_dynamic_streaming(n1_dyn, exclude_cols=None)
             normalizer_2d.update_dynamic_streaming(n2_dyn, exclude_cols=None)
     
-    normalizer_1d.finalize_dynamic_streaming(skew_threshold=2.0)
-    normalizer_2d.finalize_dynamic_streaming(skew_threshold=2.0)
+    # Kaggle sigmas: normalize water_level by mean/sigma so sqrt(MSE_norm) == NRMSE
+    _KAGGLE_SIGMA = {
+        'Model_1': {'oneD': 16.878, 'twoD': 14.379},
+        'Model_2': {'oneD':  3.192, 'twoD':  2.727},
+    }
+    normalizer_1d.finalize_dynamic_streaming(
+        skew_threshold=2.0,
+        meanstd_overrides={'water_level': _KAGGLE_SIGMA[SELECTED_MODEL]['oneD']},
+    )
+    normalizer_2d.finalize_dynamic_streaming(
+        skew_threshold=2.0,
+        meanstd_overrides={'water_level': _KAGGLE_SIGMA[SELECTED_MODEL]['twoD']},
+    )
 
     # Derive column names from base dynamic + static features (no engineered cum/mean features)
     node1d_cols = base_1d_dynamic_feats + list(normalizer_1d.static_features)
