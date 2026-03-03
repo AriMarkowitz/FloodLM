@@ -239,6 +239,17 @@ def create_static_hetero_graph(
     data["oneD"].node_idx = torch.tensor(static_1d_norm[node_id_col].values, dtype=torch.long)
     data["twoD"].node_idx = torch.tensor(static_2d_norm[node_id_col].values, dtype=torch.long)
     
+    # Columns whose sign should be flipped for reverse edges (directional features)
+    _ANTISYMMETRIC = {"relative_position_x", "relative_position_y", "slope"}
+
+    def _reverse_edge_attr(feat_tensor, col_names):
+        """Return a copy of feat_tensor with directional columns negated."""
+        t = feat_tensor.clone()
+        for i, col in enumerate(col_names):
+            if col in _ANTISYMMETRIC:
+                t[:, i] = -t[:, i]
+        return t
+
     # Edge connectivity (static spatial graph)
     data["oneD", "oneDedge", "oneD"].edge_index = _extract_edge_index(
         edges1d,
@@ -246,12 +257,26 @@ def create_static_hetero_graph(
         dst_candidates=["to_node", "target", "dst", "to"],
         edge_name="oneD->oneD",
     )
+    # Reverse 1D edges (backwater / upstream influence)
+    data["oneD", "oneDedgeRev", "oneD"].edge_index = _extract_edge_index(
+        edges1d,
+        src_candidates=["to_node", "target", "dst", "to"],
+        dst_candidates=["from_node", "source", "src", "from"],
+        edge_name="oneD->oneD (reverse)",
+    )
 
     data["twoD", "twoDedge", "twoD"].edge_index = _extract_edge_index(
         edges2d,
         src_candidates=["from_node", "source", "src", "from"],
         dst_candidates=["to_node", "target", "dst", "to"],
         edge_name="twoD->twoD",
+    )
+    # Reverse 2D edges (bidirectional floodplain flow)
+    data["twoD", "twoDedgeRev", "twoD"].edge_index = _extract_edge_index(
+        edges2d,
+        src_candidates=["to_node", "target", "dst", "to"],
+        dst_candidates=["from_node", "source", "src", "from"],
+        edge_name="twoD->twoD (reverse)",
     )
 
     data["twoD", "twoDoneD", "oneD"].edge_index = _extract_edge_index(
@@ -261,7 +286,7 @@ def create_static_hetero_graph(
         edge_name="twoD->oneD",
     )
 
-    # 1D→2D direction (channels influence floodplain cells)
+    # 1D→2D direction (channels overflow into floodplain cells)
     data["oneD", "oneDtwoD", "twoD"].edge_index = _extract_edge_index(
         edges1d2d,
         src_candidates=["node_1d", "to_node", "target", "dst", "to"],
@@ -269,16 +294,17 @@ def create_static_hetero_graph(
         edge_name="oneD->twoD",
     )
 
-    # Static edge features
-    data["oneD", "oneDedge", "oneD"].edge_attr_static = torch.tensor(
-        edges1dfeats_norm.loc[:, edge1_cols].values, dtype=torch.float32
-    )
+    # Static edge features (forward)
+    e1_fwd = torch.tensor(edges1dfeats_norm.loc[:, edge1_cols].values, dtype=torch.float32)
+    e2_fwd = torch.tensor(edges2dfeats_norm.loc[:, edge2_cols].values, dtype=torch.float32)
 
-    data["twoD", "twoDedge", "twoD"].edge_attr_static = torch.tensor(
-        edges2dfeats_norm.loc[:, edge2_cols].values, dtype=torch.float32
-    )
+    data["oneD", "oneDedge", "oneD"].edge_attr_static = e1_fwd
+    data["oneD", "oneDedgeRev", "oneD"].edge_attr_static = _reverse_edge_attr(e1_fwd, edge1_cols)
 
-    # Cross-type edges have no additional features
+    data["twoD", "twoDedge", "twoD"].edge_attr_static = e2_fwd
+    data["twoD", "twoDedgeRev", "twoD"].edge_attr_static = _reverse_edge_attr(e2_fwd, edge2_cols)
+
+    # Cross-type edges have no directional features (placeholder dim=1)
     n_cross_edges = len(edges1d2d)
     data["twoD", "twoDoneD", "oneD"].edge_attr_static = torch.zeros(
         (n_cross_edges, 1), dtype=torch.float32
@@ -1134,12 +1160,14 @@ def get_model_config():
     # Define node types
     node_types = ["oneD", "twoD"]
     
-    # Define edge types
+    # Define edge types (forward + reverse homogeneous; both cross-type directions)
     edge_types = [
-        ("oneD", "oneDedge", "oneD"),
-        ("twoD", "twoDedge", "twoD"),
-        ("twoD", "twoDoneD", "oneD"),
-        ("oneD", "oneDtwoD", "twoD"),  # channel -> floodplain (GATv2Conv)
+        ("oneD", "oneDedge",    "oneD"),
+        ("oneD", "oneDedgeRev", "oneD"),  # reverse: backwater / upstream influence
+        ("twoD", "twoDedge",    "twoD"),
+        ("twoD", "twoDedgeRev", "twoD"),  # reverse: bidirectional floodplain flow
+        ("twoD", "twoDoneD",    "oneD"),
+        ("oneD", "oneDtwoD",    "twoD"),  # channel -> floodplain (GATv2Conv)
     ]
     
     # Static feature dimensions
@@ -1158,10 +1186,12 @@ def get_model_config():
     
     # Static edge feature dimensions
     edge_static_dims = {
-        ("oneD", "oneDedge", "oneD"): len(edge1_cols),
-        ("twoD", "twoDedge", "twoD"): len(edge2_cols),
-        ("twoD", "twoDoneD", "oneD"): 1,
-        ("oneD", "oneDtwoD", "twoD"): 1,  # channel->floodplain (GATv2Conv)
+        ("oneD", "oneDedge",    "oneD"): len(edge1_cols),
+        ("oneD", "oneDedgeRev", "oneD"): len(edge1_cols),  # same dim, signs flipped at graph build
+        ("twoD", "twoDedge",    "twoD"): len(edge2_cols),
+        ("twoD", "twoDedgeRev", "twoD"): len(edge2_cols),
+        ("twoD", "twoDoneD",    "oneD"): 1,
+        ("oneD", "oneDtwoD",    "twoD"): 1,
     }
     
     return {
