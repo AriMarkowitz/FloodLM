@@ -34,7 +34,7 @@ CONFIG = {
     'history_len': 10,
     'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
     'batch_size': 16,
-    'epochs': 16,                # 2 epochs per curriculum stage; hits max_h=64 at epoch 13, stays there through 16
+    'epochs': 24,                # Model_2: 3 epochs per stage (24 total); Model_1: 2 per stage (reduce manually if needed)
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
@@ -140,7 +140,7 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
             y_future_1d   = batch['y_future_1d'].to(device)
             y_future_2d   = batch['y_future_2d'].to(device)
             rain_future_2d = batch['rain_future_2d'].to(device)
-            with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+            with torch.amp.autocast('cuda', enabled=use_mixed_precision):
                 predictions = model.forward_unroll(
                     data=static_graph,
                     y_hist_1d=y_hist_1d, y_hist_2d=y_hist_2d,
@@ -254,7 +254,7 @@ def train(resume_from=None, use_mixed_precision=False):
     criterion = nn.MSELoss()
 
     # Mixed precision: GradScaler for stable fp16 backward pass
-    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+    scaler = torch.amp.GradScaler('cuda') if use_mixed_precision else None
 
     # Load checkpoint if resuming
     start_epoch = 1
@@ -328,6 +328,10 @@ def train(resume_from=None, use_mixed_precision=False):
     VAL_CHECK_INTERVAL = None
     VAL_SUBSET_BATCHES = 3
 
+    best_kaggle_at_max_h = float('inf')   # best (NRMSE_1D + NRMSE_2D)/2 seen at full horizon
+    best_kaggle_epoch = None
+    prev_max_h = None  # Track curriculum jumps for LR reduction (Model_2 only)
+
     for epoch in range(start_epoch, CONFIG['epochs'] + 1):
         model.train()
         epoch_loss = 0.0
@@ -337,10 +341,24 @@ def train(resume_from=None, use_mixed_precision=False):
         # Epoch boundary marker — visible as a vertical annotation in wandb
         wandb.log({'epoch': epoch}, step=global_step)
         
-        # Curriculum: max horizon doubles every 2 epochs, starts at 1, caps at forecast_len
-        # epoch 1-2→1, 3-4→2, 5-6→4, 7-8→8, 9-10→16, 11-12→32, 13-14→64
-        max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // 2))
-        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h} (all batches train at h={max_h})")
+        # Curriculum: doubles every 3 epochs for Model_2 (slower convergence), 2 for Model_1
+        # Model_2: epoch 1-3→1, 4-6→2, 7-9→4, 10-12→8, 13-15→16, 16-18→32, 19-24→64
+        # Model_1: epoch 1-2→1, 3-4→2, ..., 13-14→64 (set epochs=16 manually)
+        _stage_len = 3 if SELECTED_MODEL == 'Model_2' else 2
+        max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // _stage_len))
+
+        # Model_2 only: drop LR by 3x at the three problematic curriculum jumps (h=8, 32, 64).
+        # Skipping the early small-horizon jumps preserves learning capacity at h=64.
+        # Model_1 gradients are well-behaved so this is skipped there.
+        if SELECTED_MODEL == 'Model_2' and prev_max_h is not None and max_h != prev_max_h and max_h in {8, 32, 64}:
+            for g in optimizer.param_groups:
+                g['lr'] *= 0.3
+            new_lr = optimizer.param_groups[0]['lr']
+            print(f"[INFO] Model_2 curriculum jump {prev_max_h}→{max_h}: LR reduced to {new_lr:.2e}")
+            wandb.log({'train/lr': new_lr}, step=global_step)
+        prev_max_h = max_h
+
+        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h}, stage_len={_stage_len} (all batches train at h={max_h})")
 
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
@@ -364,7 +382,7 @@ def train(resume_from=None, use_mixed_precision=False):
             # Vectorized forward pass over all B samples at once
             # predictions: {'oneD': [B, rollout_steps, N_1d, 1], 'twoD': [B, rollout_steps, N_2d, 1]}
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+            with torch.amp.autocast('cuda', enabled=use_mixed_precision):
                 predictions = model.forward_unroll(
                     data=static_graph,
                     y_hist_1d=y_hist_1d,
@@ -390,10 +408,13 @@ def train(resume_from=None, use_mixed_precision=False):
             # Backward pass (scaler handles fp16 gradient scaling when enabled)
             if scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)  # must unscale before clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             epoch_loss += loss.item()
@@ -479,6 +500,9 @@ def train(resume_from=None, use_mixed_precision=False):
               f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
               f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
               f"approx_kaggle={val_nrmse_combined:.4f}")
+        if max_h == CONFIG['forecast_len'] and val_nrmse_combined < best_kaggle_at_max_h:
+            best_kaggle_at_max_h = val_nrmse_combined
+            best_kaggle_epoch = epoch
 
         model.train()
 
@@ -523,6 +547,13 @@ def train(resume_from=None, use_mixed_precision=False):
     print("Training Complete")
     print("="*70)
     print(f"Final epoch val loss (h={max_h}): {val_loss_norm:.6f}")
+    print(f"  1D NRMSE={val_nrmse_1d:.4f}  2D NRMSE={val_nrmse_2d:.4f}")
+    print(f"  Last epoch approx Kaggle score = {val_nrmse_combined:.4f}")
+    if best_kaggle_epoch is not None:
+        print(f"  *** {SELECTED_MODEL} best approx Kaggle score (h={CONFIG['forecast_len']}) = {best_kaggle_at_max_h:.4f}  (epoch {best_kaggle_epoch}) ***")
+    else:
+        print(f"  *** {SELECTED_MODEL} best approx Kaggle score: no full-horizon epochs completed ***")
+    print(f"  (Competition score = mean of this over Model_1 and Model_2)")
     print(f"Early stopping: disabled (val loss not comparable across curriculum stages)")
     print(f"Checkpoints saved to: {run_dir}")
     print(f"Latest dir:           {latest_dir}")

@@ -110,38 +110,6 @@ def _process_event_for_dynamic_pass(args):
         print(f"[ERROR] Failed to process event {event_dir}: {e}")
         return (None, None)
 
-def _process_event_for_engineered_pass(args):
-    """Process a single event for engineered feature normalization (Pass 2).
-    Returns engineered features for normalizer updates."""
-    event_dir, NODE_ID_COL, EXCLUDE_1D_DYNAMIC, EXCLUDE_2D_DYNAMIC, normalizer_1d, normalizer_2d, static_1d, static_2d = args
-    
-    import pandas as pd
-    import sys
-    from pathlib import Path
-    
-    # Setup path for imports
-    src_dir = str(Path(__file__).parent)
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
-    
-    from data import preprocess_2d_nodes, add_temporal_features
-    
-    try:
-        n1 = pd.read_csv(event_dir + "/1d_nodes_dynamic_all.csv")
-        n2 = pd.read_csv(event_dir + "/2d_nodes_dynamic_all.csv")
-        n1 = n1.drop(columns=[c for c in EXCLUDE_1D_DYNAMIC if c in n1.columns])
-        n2 = n2.drop(columns=[c for c in EXCLUDE_2D_DYNAMIC if c in n2.columns])
-        n1 = normalizer_1d.transform_dynamic(n1, exclude_cols=None)
-        n2 = normalizer_2d.transform_dynamic(n2, exclude_cols=None)
-        n1 = pd.merge(n1, static_1d, on=NODE_ID_COL, how="left")
-        n2 = pd.merge(n2, static_2d, on=NODE_ID_COL, how="left")
-        n2 = preprocess_2d_nodes(n2)
-        n1 = add_temporal_features(n1, has_rainfall=False)
-        n2 = add_temporal_features(n2, has_rainfall=True)
-        return (n1, n2)
-    except Exception as e:
-        print(f"[ERROR] Failed to process event {event_dir}: {e}")
-        return (None, None)
 
 def _parallel_process_events(event_dirs, worker_func, args_builder, max_workers=None, use_processes=False):
     """
@@ -215,7 +183,7 @@ def initialize_data():
     
     from data_config import TRAIN_PATH, SELECTED_MODEL, validate_data_paths
     from normalization import FeatureNormalizer
-    from data import preprocess_2d_nodes, add_temporal_features, NORMALIZATION_VERBOSE
+    from data import preprocess_2d_nodes, NORMALIZATION_VERBOSE
     
     # Validate paths
     try:
@@ -349,66 +317,14 @@ def initialize_data():
     
     normalizer_1d.finalize_dynamic_streaming(skew_threshold=2.0)
     normalizer_2d.finalize_dynamic_streaming(skew_threshold=2.0)
-    
-    # Get engineered feature names (Pass 2)
-    f0 = train_events[0]  # Use first training event
-    n1_test = pd.read_csv(f0 + "/1d_nodes_dynamic_all.csv")
-    n2_test = pd.read_csv(f0 + "/2d_nodes_dynamic_all.csv")
-    n1_test = n1_test.drop(columns=[c for c in EXCLUDE_1D_DYNAMIC if c in n1_test.columns])
-    n2_test = n2_test.drop(columns=[c for c in EXCLUDE_2D_DYNAMIC if c in n2_test.columns])
-    n1_test = normalizer_1d.transform_dynamic(n1_test, exclude_cols=None)
-    n2_test = normalizer_2d.transform_dynamic(n2_test, exclude_cols=None)
-    n1_test = pd.merge(n1_test, static_1d, on=NODE_ID_COL, how="left")
-    n2_test = pd.merge(n2_test, static_2d, on=NODE_ID_COL, how="left")
-    n2_test = preprocess_2d_nodes(n2_test)
-    n1_test = add_temporal_features(n1_test, has_rainfall=False)
-    n2_test = add_temporal_features(n2_test, has_rainfall=True)
-    
-    engineered_1d = [c for c in n1_test.columns if c.startswith('cum_') or c.startswith('mean_')]
-    engineered_2d = [c for c in n2_test.columns if c.startswith('cum_') or c.startswith('mean_')]
-    
-    print(f"[INFO] Engineered 1D features: {engineered_1d}")
-    print(f"[INFO] Engineered 2D features: {engineered_2d}")
-    print(f"[INFO] Fitting engineered feature normalization (streaming, parallel)...")
-    print(f"[INFO] Using ONLY {len(train_events)} training events for engineered feature normalization")
-    
-    normalizer_1d_eng = FeatureNormalizer(verbose=NORMALIZATION_VERBOSE)
-    normalizer_2d_eng = FeatureNormalizer(verbose=NORMALIZATION_VERBOSE)
-    normalizer_1d_eng.init_dynamic_streaming(engineered_1d, exclude_cols=None)
-    normalizer_2d_eng.init_dynamic_streaming(engineered_2d, exclude_cols=None)
-    
-    # Parallel event processing for Pass 2 (engineered features) - USE ONLY TRAINING EVENTS
-    def build_pass2_args(event_dir, idx):
-        return (event_dir, NODE_ID_COL, EXCLUDE_1D_DYNAMIC, EXCLUDE_2D_DYNAMIC, 
-                normalizer_1d, normalizer_2d, static_1d, static_2d)
-    
-    results_pass2 = _parallel_process_events(
-        train_events,  # CRITICAL: Only use training events for normalization
-        _process_event_for_engineered_pass,
-        build_pass2_args,
-        max_workers=8,
-        use_processes=True  # CPU-bound work - use processes to avoid GIL
-    )
-    
-    # Sequential update (normalizer state is not thread-safe)
-    for n1, n2 in results_pass2:
-        if n1 is not None and n2 is not None:
-            normalizer_1d_eng.update_dynamic_streaming(n1[engineered_1d], exclude_cols=None)
-            normalizer_2d_eng.update_dynamic_streaming(n2[engineered_2d], exclude_cols=None)
-    
-    normalizer_1d_eng.finalize_dynamic_streaming(skew_threshold=2.0)
-    normalizer_2d_eng.finalize_dynamic_streaming(skew_threshold=2.0)
-    
-    # Merge engineered params
-    normalizer_1d.dynamic_params.update(normalizer_1d_eng.dynamic_params)
-    normalizer_2d.dynamic_params.update(normalizer_2d_eng.dynamic_params)
-    normalizer_1d.dynamic_features.extend(engineered_1d)
-    normalizer_2d.dynamic_features.extend(engineered_2d)
-    
-    # Final columns
+
+    # Derive column names from base dynamic + static features (no engineered cum/mean features)
+    node1d_cols = base_1d_dynamic_feats + list(normalizer_1d.static_features)
+    node2d_cols = dynamic_2d_cols + list(normalizer_2d.static_features)
+    # Remove id/timestep cols that sneak in
     exclude_node_cols = {NODE_ID_COL, 'timestep', 'timestep_raw'}
-    node1d_cols = [c for c in n1_test.columns if c not in exclude_node_cols]
-    node2d_cols = [c for c in n2_test.columns if c not in exclude_node_cols]
+    node1d_cols = [c for c in node1d_cols if c not in exclude_node_cols]
+    node2d_cols = [c for c in node2d_cols if c not in exclude_node_cols]
     
     feature_type_1d = {col: ('static' if col in normalizer_1d.static_features else 'dynamic') for col in node1d_cols}
     feature_type_2d = {col: ('static' if col in normalizer_2d.static_features else 'dynamic') for col in node2d_cols}

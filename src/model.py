@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from torch_geometric.data import HeteroData, Batch
-from torch_geometric.nn import MessagePassing, HeteroConv
+from torch_geometric.nn import MessagePassing, HeteroConv, GATv2Conv as _GATv2Conv
 
 
 # ============================================================
@@ -183,6 +183,56 @@ class StaticDynamicEdgeMP(MessagePassing):
 
 
 # ============================================================
+# 1b) GATv2-based cross-type message passing (1D channels -> 2D floodplain cells)
+#
+# Uses GATv2Conv attention to learn which channel hidden states are most
+# relevant to each adjacent floodplain cell at each timestep.
+# Wraps torch_geometric.nn.GATv2Conv in the same _set_context / forward
+# interface as StaticDynamicEdgeMP so HeteroTransportCell can use it uniformly.
+# ============================================================
+class GATv2CrossTypeMP(MessagePassing):
+    """
+    GATv2-based message passing for directed 1D->2D cross-type edges.
+
+    Computes attention-weighted messages from 1D channel hidden states
+    to 2D floodplain cell hidden states.  The GATv2 attention score
+    conditions on both src and dst hidden states, so each 2D cell can
+    selectively attend to the most relevant channels.
+
+    Output shape: [B*N_dst, msg_dim]
+    """
+    def __init__(
+        self,
+        h_dim: int,
+        msg_dim: int,
+        heads: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__(aggr="add")
+        self.h_dim = h_dim
+        self.msg_dim = msg_dim
+        self.heads = heads
+        # GATv2Conv expects in_channels for (src, dst) separately
+        self.gatv2 = _GATv2Conv(
+            in_channels=(h_dim, h_dim),
+            out_channels=msg_dim // heads,
+            heads=heads,
+            dropout=dropout,
+            concat=True,
+            add_self_loops=False,
+        )
+
+    def _set_context(self, h_src, h_dst, **kwargs):
+        self._h_src = h_src
+        self._h_dst = h_dst
+
+    def forward(self, x=None, edge_index=None, **kwargs):
+        # GATv2Conv takes (x_src, x_dst) tuple for bipartite graphs
+        out = self.gatv2((self._h_src, self._h_dst), edge_index)
+        return out  # [B*N_dst, msg_dim]
+
+
+# ============================================================
 # 2) One recurrent step over a hetero graph
 #    This is where:
 #      - dynamic data is injected into the graph
@@ -223,16 +273,25 @@ class HeteroTransportCell(nn.Module):
         # ------------------------------------------------------------
         conv_dict = {}
         for (src, rel, dst) in edge_types:
-            mp = StaticDynamicEdgeMP(
-                h_dim=h_dim,
-                node_static_dim_src=node_static_dims[src],
-                node_static_dim_dst=node_static_dims[dst],
-                edge_static_dim=edge_static_dims[(src, rel, dst)],
-                msg_dim=msg_dim,
-                hidden_dim=hidden_dim,
-                dropout=dropout,
-                aggr="add",
-            )
+            if rel == "oneDtwoD":
+                # GATv2Conv for 1D->2D: attention over channel hidden states
+                mp = GATv2CrossTypeMP(
+                    h_dim=h_dim,
+                    msg_dim=msg_dim,
+                    heads=4,
+                    dropout=dropout,
+                )
+            else:
+                mp = StaticDynamicEdgeMP(
+                    h_dim=h_dim,
+                    node_static_dim_src=node_static_dims[src],
+                    node_static_dim_dst=node_static_dims[dst],
+                    edge_static_dim=edge_static_dims[(src, rel, dst)],
+                    msg_dim=msg_dim,
+                    hidden_dim=hidden_dim,
+                    dropout=dropout,
+                    aggr="add",
+                )
             conv_dict[(src, rel, dst)] = mp
 
         # Store both dict-based and module dict for HeteroConv usage
@@ -293,13 +352,19 @@ class HeteroTransportCell(nn.Module):
         for (src_type, rel, dst_type) in self.edge_types:
             key = f"{src_type}_{rel}_{dst_type}"
             mp = self.mp_modules[key]
-            mp._set_context(
-                h_src=h_t[src_type],
-                h_dst=h_t[dst_type],
-                edge_attr_static=edge_static[(src_type, rel, dst_type)],
-                x_static_src=x_static[src_type],
-                x_static_dst=x_static[dst_type],
-            )
+            if rel == "oneDtwoD":
+                mp._set_context(
+                    h_src=h_t[src_type],
+                    h_dst=h_t[dst_type],
+                )
+            else:
+                mp._set_context(
+                    h_src=h_t[src_type],
+                    h_dst=h_t[dst_type],
+                    edge_attr_static=edge_static[(src_type, rel, dst_type)],
+                    x_static_src=x_static[src_type],
+                    x_static_dst=x_static[dst_type],
+                )
 
         # Build edge_index_dict and x_dict for HeteroConv (standard PyG interface).
         # Pass h_t as x so HeteroConv correctly infers per-type node counts [B*N_nt, *].

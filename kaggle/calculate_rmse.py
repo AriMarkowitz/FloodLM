@@ -172,3 +172,12 @@ if __name__ == "__main__":
     print("=" * 65)
 
     results = calculate_kaggle_nrmse(str(submission_file), str(reference_file))
+
+    score = results['kaggle_score']
+    m1 = results['model_scores'].get(1, float('nan'))
+    m2 = results['model_scores'].get(2, float('nan'))
+    print("=" * 65)
+    print(f"  *** FINAL COMBINED KAGGLE SCORE: {score:.4f} ***")
+    print(f"      Model_1: {m1:.4f}   Model_2: {m2:.4f}")
+    print(f"      score = (Model_1 + Model_2) / 2 = ({m1:.4f} + {m2:.4f}) / 2")
+    print("=" * 65)

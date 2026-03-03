@@ -246,33 +246,44 @@ def create_static_hetero_graph(
         dst_candidates=["to_node", "target", "dst", "to"],
         edge_name="oneD->oneD",
     )
-    
+
     data["twoD", "twoDedge", "twoD"].edge_index = _extract_edge_index(
         edges2d,
         src_candidates=["from_node", "source", "src", "from"],
         dst_candidates=["to_node", "target", "dst", "to"],
         edge_name="twoD->twoD",
     )
-    
+
     data["twoD", "twoDoneD", "oneD"].edge_index = _extract_edge_index(
         edges1d2d,
         src_candidates=["node_2d", "from_node", "source", "src", "from"],
         dst_candidates=["node_1d", "to_node", "target", "dst", "to"],
         edge_name="twoD->oneD",
     )
-    
+
+    # 1D→2D direction (channels influence floodplain cells)
+    data["oneD", "oneDtwoD", "twoD"].edge_index = _extract_edge_index(
+        edges1d2d,
+        src_candidates=["node_1d", "to_node", "target", "dst", "to"],
+        dst_candidates=["node_2d", "from_node", "source", "src", "from"],
+        edge_name="oneD->twoD",
+    )
+
     # Static edge features
     data["oneD", "oneDedge", "oneD"].edge_attr_static = torch.tensor(
         edges1dfeats_norm.loc[:, edge1_cols].values, dtype=torch.float32
     )
-    
+
     data["twoD", "twoDedge", "twoD"].edge_attr_static = torch.tensor(
         edges2dfeats_norm.loc[:, edge2_cols].values, dtype=torch.float32
     )
-    
-    # Cross-type edges have no additional features (could add if needed)
+
+    # Cross-type edges have no additional features
     n_cross_edges = len(edges1d2d)
     data["twoD", "twoDoneD", "oneD"].edge_attr_static = torch.zeros(
+        (n_cross_edges, 1), dtype=torch.float32
+    )
+    data["oneD", "oneDtwoD", "twoD"].edge_attr_static = torch.zeros(
         (n_cross_edges, 1), dtype=torch.float32
     )
     
@@ -767,10 +778,6 @@ class RecurrentFloodDataset(IterableDataset):
             n2 = pd.merge(n2, self.static_2d_norm, on=self.node_id_col, how="left")
             n2 = preprocess_2d_nodes(n2)
 
-            # Add temporal features
-            n1 = add_temporal_features(n1, has_rainfall=False)
-            n2 = add_temporal_features(n2, has_rainfall=True)
-
             # Sort by timestep and node_idx (temporal order preserved)
             tcol = "timestep_raw" if "timestep_raw" in n1.columns else "timestep"
             n1 = n1.sort_values([tcol, self.node_id_col]).reset_index(drop=True)
@@ -879,46 +886,6 @@ class MultiEventGraphStream(IterableDataset):
             nodes2d = pd.merge(nodes2d, self.static_2d, on="node_idx", how="left")
             nodes2d = preprocess_2d_nodes(nodes2d)
 
-            # Add temporal features
-            nodes1d = add_temporal_features(nodes1d, has_rainfall=False)
-            nodes2d = add_temporal_features(nodes2d, has_rainfall=True)
-            
-            # Normalize engineered temporal features
-            engineered_1d = [c for c in nodes1d.columns if c.startswith('cum_') or c.startswith('mean_')]
-            engineered_2d = [c for c in nodes2d.columns if c.startswith('cum_') or c.startswith('mean_')]
-            
-            for col in engineered_1d:
-                if col in normalizer_1d.dynamic_params:
-                    vals = nodes1d[col].astype(float).values
-                    params = normalizer_1d.dynamic_params[col]
-                    
-                    if params['log']:
-                        vals = np.log1p(np.abs(vals)) * np.sign(vals)
-                    
-                    if params['max'] > params['min']:
-                        vals = (vals - params['min']) / (params['max'] - params['min'])
-                    else:
-                        vals = np.zeros_like(vals)
-                    
-                    # Convert column to float to avoid dtype errors
-                    nodes1d[col] = vals.astype(np.float32)
-            
-            for col in engineered_2d:
-                if col in normalizer_2d.dynamic_params:
-                    vals = nodes2d[col].astype(float).values
-                    params = normalizer_2d.dynamic_params[col]
-                    
-                    if params['log']:
-                        vals = np.log1p(np.abs(vals)) * np.sign(vals)
-                    
-                    if params['max'] > params['min']:
-                        vals = (vals - params['min']) / (params['max'] - params['min'])
-                    else:
-                        vals = np.zeros_like(vals)
-                    
-                    # Convert column to float to avoid dtype errors
-                    nodes2d[col] = vals.astype(np.float32)
-           
             windows_iter = list(windows)
             if self.shuffle:
                 random.shuffle(windows_iter)
@@ -1172,6 +1139,7 @@ def get_model_config():
         ("oneD", "oneDedge", "oneD"),
         ("twoD", "twoDedge", "twoD"),
         ("twoD", "twoDoneD", "oneD"),
+        ("oneD", "oneDtwoD", "twoD"),  # channel -> floodplain (GATv2Conv)
     ]
     
     # Static feature dimensions
@@ -1192,7 +1160,8 @@ def get_model_config():
     edge_static_dims = {
         ("oneD", "oneDedge", "oneD"): len(edge1_cols),
         ("twoD", "twoDedge", "twoD"): len(edge2_cols),
-        ("twoD", "twoDoneD", "oneD"): 1,  # Cross-type edges have placeholder features
+        ("twoD", "twoDoneD", "oneD"): 1,
+        ("oneD", "oneDtwoD", "twoD"): 1,  # channel->floodplain (GATv2Conv)
     }
     
     return {
