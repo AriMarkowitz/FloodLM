@@ -273,8 +273,8 @@ class HeteroTransportCell(nn.Module):
         # ------------------------------------------------------------
         conv_dict = {}
         for (src, rel, dst) in edge_types:
-            if rel == "oneDtwoD":
-                # GATv2Conv for 1D->2D: attention over channel hidden states
+            if rel in ("oneDtwoD", "twoDoneD"):
+                # GATv2Conv for cross-type edges (1D↔2D): attention over node hidden states
                 mp = GATv2CrossTypeMP(
                     h_dim=h_dim,
                     msg_dim=msg_dim,
@@ -352,7 +352,7 @@ class HeteroTransportCell(nn.Module):
         for (src_type, rel, dst_type) in self.edge_types:
             key = f"{src_type}_{rel}_{dst_type}"
             mp = self.mp_modules[key]
-            if rel == "oneDtwoD":
+            if rel in ("oneDtwoD", "twoDoneD"):
                 mp._set_context(
                     h_src=h_t[src_type],
                     h_dst=h_t[dst_type],

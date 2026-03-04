@@ -39,7 +39,7 @@ CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
     'checkpoint_interval': 1,   # Save every N epochs
-    'early_stopping_patience': None,  # Disabled: val loss is incomparable across epochs (different max_h each epoch)
+    'early_stopping_patience': 5,  # Only active once max_h == forecast_len; None to disable
     'early_stopping_min_rel_delta': 0.01,
     'curriculum_val_horizon': 32,  # Fixed horizon for multi-step val rollout
 }
@@ -260,12 +260,12 @@ def train(resume_from=None, use_mixed_precision=False):
     start_epoch = 1
     if resume_path:
         try:
-            # Try to find the latest checkpoint in the resume directory
-            checkpoint_files = sorted(resume_path.glob('*.pt'))
+            # Try to find the checkpoint for this specific model
+            checkpoint_files = sorted(resume_path.glob(f'{SELECTED_MODEL}*.pt'))
             if not checkpoint_files:
-                raise FileNotFoundError(f"No checkpoints found in {resume_path}")
-            
-            # Load the latest checkpoint
+                raise FileNotFoundError(f"No checkpoints found for {SELECTED_MODEL} in {resume_path}")
+
+            # Load the latest checkpoint for this model
             checkpoint_path = checkpoint_files[-1]
             print(f"[INFO] Loading checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -331,6 +331,7 @@ def train(resume_from=None, use_mixed_precision=False):
     best_kaggle_at_max_h = float('inf')   # best (NRMSE_1D + NRMSE_2D)/2 seen at full horizon
     best_kaggle_epoch = None
     prev_max_h = None  # Track curriculum jumps for LR reduction (Model_2 only)
+    no_improve_count = 0  # Early stopping counter (only active at full horizon)
 
     for epoch in range(start_epoch, CONFIG['epochs'] + 1):
         model.train()
@@ -500,9 +501,18 @@ def train(resume_from=None, use_mixed_precision=False):
               f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
               f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
               f"approx_kaggle={val_nrmse_combined:.4f}")
-        if max_h == CONFIG['forecast_len'] and val_nrmse_combined < best_kaggle_at_max_h:
-            best_kaggle_at_max_h = val_nrmse_combined
-            best_kaggle_epoch = epoch
+        if max_h == CONFIG['forecast_len']:
+            if val_nrmse_combined < best_kaggle_at_max_h:
+                best_kaggle_at_max_h = val_nrmse_combined
+                best_kaggle_epoch = epoch
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                patience = CONFIG['early_stopping_patience']
+                print(f"[INFO] No improvement at h={max_h}: {no_improve_count}/{patience} epochs without improvement")
+                if patience is not None and no_improve_count >= patience:
+                    print(f"[INFO] Early stopping triggered after {no_improve_count} epochs without improvement at h={max_h}")
+                    break
 
         model.train()
 
@@ -554,7 +564,8 @@ def train(resume_from=None, use_mixed_precision=False):
     else:
         print(f"  *** {SELECTED_MODEL} best approx Kaggle score: no full-horizon epochs completed ***")
     print(f"  (Competition score = mean of this over Model_1 and Model_2)")
-    print(f"Early stopping: disabled (val loss not comparable across curriculum stages)")
+    patience = CONFIG['early_stopping_patience']
+    print(f"Early stopping: {'patience=' + str(patience) + ' (active at h=' + str(CONFIG['forecast_len']) + ')' if patience else 'disabled'}")
     print(f"Checkpoints saved to: {run_dir}")
     print(f"Latest dir:           {latest_dir}")
     final_model_path = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{CONFIG["epochs"]:03d}.pt')
