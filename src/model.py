@@ -220,6 +220,7 @@ class GATv2CrossTypeMP(MessagePassing):
             dropout=dropout,
             concat=True,
             add_self_loops=False,
+            residual=True,
         )
 
     def _set_context(self, h_src, h_dst, **kwargs):
@@ -318,6 +319,10 @@ class HeteroTransportCell(nn.Module):
         self.update = nn.ModuleDict({
             nt: nn.GRUCell(input_size=2 * msg_dim, hidden_size=h_dim) for nt in node_types
         })
+        # LayerNorm on hidden state — prevents magnitude explosion over 64 rollout steps
+        self.h_norm = nn.ModuleDict({
+            nt: nn.LayerNorm(h_dim) for nt in node_types
+        })
 
     def forward(
         self,
@@ -396,7 +401,8 @@ class HeteroTransportCell(nn.Module):
             dyn_emb = self.dyn_proj[nt](x_dyn_t[nt])  # [B*N, msg_dim]
             msg_emb = messages[nt]                      # [B*N, msg_dim]
             upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)  # [B*N, 2*msg_dim]
-            h_next[nt] = self.update[nt](upd_in, h_t[nt])   # [B*N, h_dim]
+            h_raw = self.update[nt](upd_in, h_t[nt])        # [B*N, h_dim]
+            h_next[nt] = self.h_norm[nt](h_raw)             # [B*N, h_dim] — stabilize magnitude
 
         return h_next
 

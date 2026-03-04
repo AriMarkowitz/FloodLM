@@ -584,7 +584,8 @@ def main():
         # Find checkpoint in checkpoint_dir (checkpoints/latest/ contains all models)
         checkpoint_dir = args.checkpoint_dir
         candidates = [
-            os.path.join(checkpoint_dir, f"Model_{model_id}_best.pt"),
+            os.path.join(checkpoint_dir, f"Model_{model_id}_best_h64.pt"),  # best val at full horizon
+            os.path.join(checkpoint_dir, f"Model_{model_id}_best.pt"),       # fallback: last epoch
             os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_003.pt"),
             os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_002.pt"),
             os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_001.pt"),

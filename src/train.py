@@ -163,7 +163,7 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
     return total / n, total_1d / n, total_2d / n
 
 
-def train(resume_from=None, use_mixed_precision=False):
+def train(resume_from=None, use_mixed_precision=False, skip_validation=False):
     """Main training loop.
     
     Args:
@@ -222,13 +222,17 @@ def train(resume_from=None, use_mixed_precision=False):
         split='train',
     )
 
-    val_dataloader = get_recurrent_dataloader(
-        history_len=CONFIG['history_len'],
-        forecast_len=CONFIG['forecast_len'],
-        batch_size=CONFIG['batch_size'],
-        shuffle=False,
-        split='val',
-    )
+    if skip_validation:
+        val_dataloader = None
+        print(f"  Validation: DISABLED (--no-val)")
+    else:
+        val_dataloader = get_recurrent_dataloader(
+            history_len=CONFIG['history_len'],
+            forecast_len=CONFIG['forecast_len'],
+            batch_size=CONFIG['batch_size'],
+            shuffle=False,
+            split='val',
+        )
     
     # Get model config
     print(f"\n[INFO] Getting model configuration...")
@@ -306,7 +310,7 @@ def train(resume_from=None, use_mixed_precision=False):
     print(f"\n[INFO] Pre-building batched static graphs (B={CONFIG['batch_size']})...")
     _static_graph_cpu = next(iter(train_dataloader))['static_graph']
     train_batched_graph = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
-    val_batched_graph   = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
+    val_batched_graph   = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device) if not skip_validation else None
     print(f"[INFO] Batched graphs ready.")
 
     print(f"\n[INFO] Training configuration:")
@@ -332,6 +336,7 @@ def train(resume_from=None, use_mixed_precision=False):
     best_kaggle_epoch = None
     prev_max_h = None  # Track curriculum jumps for LR reduction (Model_2 only)
     no_improve_count = 0  # Early stopping counter (only active at full horizon)
+    best_train_loss_at_max_h = float('inf')  # fallback for early stopping when val disabled
 
     for epoch in range(start_epoch, CONFIG['epochs'] + 1):
         model.train()
@@ -484,50 +489,78 @@ def train(resume_from=None, use_mixed_precision=False):
         
         # Full validation at current curriculum horizon — matches what we're training on.
         # This is used for early stopping and checkpointing.
-        print(f"\n[INFO] Running full validation (h={max_h})...")
-        val_combined, val_1d, val_2d = evaluate_rollout(
-            model, val_dataloader, criterion, device, norm_stats,
-            rollout_steps=max_h, batched_static_graph=val_batched_graph,
-            use_mixed_precision=use_mixed_precision,
-        )
-        val_loss_norm = val_combined
-        # sqrt(MSE_norm) == NRMSE directly; * kaggle_sigma gives RMSE in meters
-        val_nrmse_1d = val_1d ** 0.5
-        val_nrmse_2d = val_2d ** 0.5
-        val_rmse_1d  = val_nrmse_1d * kaggle_sigma_1d
-        val_rmse_2d  = val_nrmse_2d * kaggle_sigma_2d
-        val_nrmse_combined = (val_nrmse_1d + val_nrmse_2d) / 2
-        print(f"  h={max_h}  combined={val_combined:.6e}  "
-              f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
-              f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
-              f"approx_kaggle={val_nrmse_combined:.4f}")
-        if max_h == CONFIG['forecast_len']:
-            if val_nrmse_combined < best_kaggle_at_max_h:
-                best_kaggle_at_max_h = val_nrmse_combined
-                best_kaggle_epoch = epoch
+        val_loss_norm = None
+        val_nrmse_combined = None
+        if not skip_validation:
+            try:
+                print(f"\n[INFO] Running full validation (h={max_h})...")
+                val_combined, val_1d, val_2d = evaluate_rollout(
+                    model, val_dataloader, criterion, device, norm_stats,
+                    rollout_steps=max_h, batched_static_graph=val_batched_graph,
+                    use_mixed_precision=use_mixed_precision,
+                )
+                val_loss_norm = val_combined
+                # sqrt(MSE_norm) == NRMSE directly; * kaggle_sigma gives RMSE in meters
+                val_nrmse_1d = val_1d ** 0.5
+                val_nrmse_2d = val_2d ** 0.5
+                val_rmse_1d  = val_nrmse_1d * kaggle_sigma_1d
+                val_rmse_2d  = val_nrmse_2d * kaggle_sigma_2d
+                val_nrmse_combined = (val_nrmse_1d + val_nrmse_2d) / 2
+                print(f"  h={max_h}  combined={val_combined:.6e}  "
+                      f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
+                      f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
+                      f"approx_kaggle={val_nrmse_combined:.4f}")
+                if max_h == CONFIG['forecast_len']:
+                    if val_nrmse_combined < best_kaggle_at_max_h:
+                        best_kaggle_at_max_h = val_nrmse_combined
+                        best_kaggle_epoch = epoch
+                        no_improve_count = 0
+                        # Save best h=64 checkpoint — used by inference script
+                        best_h64_src = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{epoch:03d}.pt')
+                        if os.path.exists(best_h64_src):
+                            import shutil as _shutil
+                            for _dst in [os.path.join(run_dir, f'{SELECTED_MODEL}_best_h64.pt'),
+                                         os.path.join(latest_dir, f'{SELECTED_MODEL}_best_h64.pt')]:
+                                _shutil.copy(best_h64_src, _dst)
+                            print(f"[INFO] New best h=64 checkpoint saved (approx_kaggle={val_nrmse_combined:.4f})")
+                    else:
+                        no_improve_count += 1
+                        patience = CONFIG['early_stopping_patience']
+                        print(f"[INFO] No improvement at h={max_h}: {no_improve_count}/{patience} epochs without improvement")
+                        if patience is not None and no_improve_count >= patience:
+                            print(f"[INFO] Early stopping triggered after {no_improve_count} epochs without improvement at h={max_h}")
+                            break
+            except Exception as e:
+                print(f"[WARNING] Validation failed (epoch {epoch}): {e} — skipping val this epoch")
+
+        # Fallback early stopping on training loss when validation is disabled
+        if skip_validation and max_h == CONFIG['forecast_len']:
+            patience = CONFIG['early_stopping_patience']
+            if avg_epoch_loss < best_train_loss_at_max_h:
+                best_train_loss_at_max_h = avg_epoch_loss
                 no_improve_count = 0
             else:
                 no_improve_count += 1
-                patience = CONFIG['early_stopping_patience']
-                print(f"[INFO] No improvement at h={max_h}: {no_improve_count}/{patience} epochs without improvement")
+                print(f"[INFO] No train loss improvement at h={max_h}: {no_improve_count}/{patience} epochs")
                 if patience is not None and no_improve_count >= patience:
-                    print(f"[INFO] Early stopping triggered after {no_improve_count} epochs without improvement at h={max_h}")
+                    print(f"[INFO] Early stopping (train loss) triggered after {no_improve_count} epochs without improvement")
                     break
 
         model.train()
 
-        wandb.log({
-            'loss/train': avg_epoch_loss,
-            f'rollout_val/h{max_h}_combined': val_combined,
-            f'rollout_val/h{max_h}_1d_mse_norm': val_1d,
-            f'rollout_val/h{max_h}_2d_mse_norm': val_2d,
-            f'rollout_val/h{max_h}_1d_rmse_m': val_rmse_1d,
-            f'rollout_val/h{max_h}_2d_rmse_m': val_rmse_2d,
-            f'rollout_val/h{max_h}_1d_nrmse': val_nrmse_1d,
-            f'rollout_val/h{max_h}_2d_nrmse': val_nrmse_2d,
-            f'rollout_val/h{max_h}_approx_kaggle': val_nrmse_combined,
-            'curriculum/epoch_max_h': max_h,
-        }, step=global_step)
+        wandb_payload = {'loss/train': avg_epoch_loss, 'curriculum/epoch_max_h': max_h}
+        if val_loss_norm is not None:
+            wandb_payload.update({
+                f'rollout_val/h{max_h}_combined': val_combined,
+                f'rollout_val/h{max_h}_1d_mse_norm': val_1d,
+                f'rollout_val/h{max_h}_2d_mse_norm': val_2d,
+                f'rollout_val/h{max_h}_1d_rmse_m': val_rmse_1d,
+                f'rollout_val/h{max_h}_2d_rmse_m': val_rmse_2d,
+                f'rollout_val/h{max_h}_1d_nrmse': val_nrmse_1d,
+                f'rollout_val/h{max_h}_2d_nrmse': val_nrmse_2d,
+                f'rollout_val/h{max_h}_approx_kaggle': val_nrmse_combined,
+            })
+        wandb.log(wandb_payload, step=global_step)
 
         # Checkpoint
         if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
@@ -556,9 +589,12 @@ def train(resume_from=None, use_mixed_precision=False):
     print("\n" + "="*70)
     print("Training Complete")
     print("="*70)
-    print(f"Final epoch val loss (h={max_h}): {val_loss_norm:.6f}")
-    print(f"  1D NRMSE={val_nrmse_1d:.4f}  2D NRMSE={val_nrmse_2d:.4f}")
-    print(f"  Last epoch approx Kaggle score = {val_nrmse_combined:.4f}")
+    if val_loss_norm is not None:
+        print(f"Final epoch val loss (h={max_h}): {val_loss_norm:.6f}")
+        print(f"  1D NRMSE={val_nrmse_1d:.4f}  2D NRMSE={val_nrmse_2d:.4f}")
+        print(f"  Last epoch approx Kaggle score = {val_nrmse_combined:.4f}")
+    else:
+        print(f"Final epoch val loss: N/A (validation disabled)")
     if best_kaggle_epoch is not None:
         print(f"  *** {SELECTED_MODEL} best approx Kaggle score (h={CONFIG['forecast_len']}) = {best_kaggle_at_max_h:.4f}  (epoch {best_kaggle_epoch}) ***")
     else:
@@ -585,6 +621,8 @@ if __name__ == "__main__":
                         help='Override learning rate for resume training')
     parser.add_argument('--max-h', type=int, default=None,
                         help='Override max curriculum horizon (default: 64)')
+    parser.add_argument('--no-val', action='store_true',
+                        help='Skip validation each epoch (faster, disables early stopping and best-h64 tracking)')
     args = parser.parse_args()
     
     # Apply command-line overrides to CONFIG
@@ -601,4 +639,4 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('medium')  # Speeds up matmuls on L40S/A100
         # Actual fp16 autocast + GradScaler is applied inside train()
     
-    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision)
+    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val)
