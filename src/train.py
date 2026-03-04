@@ -163,7 +163,7 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
     return total / n, total_1d / n, total_2d / n
 
 
-def train(resume_from=None, use_mixed_precision=False, skip_validation=False):
+def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None):
     """Main training loop.
     
     Args:
@@ -293,6 +293,30 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False):
             print(f"[WARNING] Failed to load checkpoint: {e}")
             print(f"[WARNING] Starting fresh from epoch 1")
             start_epoch = 1
+
+    # Transfer learning: load weights from another model (e.g. Model_1 -> Model_2)
+    # Resets epoch + optimizer — fresh training schedule with warm weights.
+    if pretrain_from:
+        pretrain_path = Path(pretrain_from)
+        # Prefer best_h64, fall back to best, then any .pt
+        for candidate in [
+            pretrain_path / 'Model_1_best_h64.pt',
+            pretrain_path / 'Model_1_best.pt',
+            *sorted(pretrain_path.glob('Model_1*.pt')),
+        ]:
+            if candidate.exists():
+                print(f"[INFO] Transfer learning: loading weights from {candidate}")
+                ckpt = torch.load(candidate, map_location=device)
+                if 'model_state' in ckpt:
+                    missing, unexpected = model.load_state_dict(ckpt['model_state'], strict=False)
+                    if missing:
+                        print(f"[INFO]   Missing keys (randomly initialized): {len(missing)}")
+                    if unexpected:
+                        print(f"[INFO]   Unexpected keys (ignored): {len(unexpected)}")
+                    print(f"[INFO] Transfer weights loaded (epoch counter reset to 1, fresh optimizer)")
+                break
+        else:
+            print(f"[WARNING] No Model_1 checkpoint found in {pretrain_from} — training from scratch")
 
     # Water level is normalized by kaggle_sigma (meanstd), so sqrt(MSE_norm) == NRMSE directly.
     # Loss = (loss_1d + loss_2d) / 2 — equal weight, directly Kaggle-aligned.
@@ -623,6 +647,10 @@ if __name__ == "__main__":
                         help='Override max curriculum horizon (default: 64)')
     parser.add_argument('--no-val', action='store_true',
                         help='Skip validation each epoch (faster, disables early stopping and best-h64 tracking)')
+    parser.add_argument('--pretrain', type=str, default=None,
+                        help='Load Model_1 weights as starting point for Model_2 (transfer learning). '
+                             'Pass path to checkpoint dir (e.g. checkpoints/latest). '
+                             'Epoch counter and optimizer are reset — full training schedule runs.')
     args = parser.parse_args()
     
     # Apply command-line overrides to CONFIG
@@ -639,4 +667,4 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('medium')  # Speeds up matmuls on L40S/A100
         # Actual fp16 autocast + GradScaler is applied inside train()
     
-    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val)
+    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain)

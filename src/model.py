@@ -323,6 +323,14 @@ class HeteroTransportCell(nn.Module):
         self.h_norm = nn.ModuleDict({
             nt: nn.LayerNorm(h_dim) for nt in node_types
         })
+        # LayerNorm on GRU inputs — normalizes aggregated messages (sum agg can grow
+        # with node degree) and dynamic projection before they enter the GRU
+        self.msg_norm = nn.ModuleDict({
+            nt: nn.LayerNorm(msg_dim) for nt in node_types
+        })
+        self.dyn_norm = nn.ModuleDict({
+            nt: nn.LayerNorm(msg_dim) for nt in node_types
+        })
 
     def forward(
         self,
@@ -398,9 +406,9 @@ class HeteroTransportCell(nn.Module):
         # ------------------------------------------------------------
         h_next = {}
         for nt in self.node_types:
-            dyn_emb = self.dyn_proj[nt](x_dyn_t[nt])  # [B*N, msg_dim]
-            msg_emb = messages[nt]                      # [B*N, msg_dim]
-            upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)  # [B*N, 2*msg_dim]
+            dyn_emb = self.dyn_norm[nt](self.dyn_proj[nt](x_dyn_t[nt]))  # [B*N, msg_dim]
+            msg_emb = self.msg_norm[nt](messages[nt])                    # [B*N, msg_dim]
+            upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)               # [B*N, 2*msg_dim]
             h_raw = self.update[nt](upd_in, h_t[nt])        # [B*N, h_dim]
             h_next[nt] = self.h_norm[nt](h_raw)             # [B*N, h_dim] — stabilize magnitude
 
@@ -460,6 +468,7 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         # ------------------------------------------------------------
         self.heads = nn.ModuleDict({
             nt: nn.Sequential(
+                nn.LayerNorm(h_dim),
                 nn.Linear(h_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1),
