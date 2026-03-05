@@ -312,53 +312,73 @@ def create_static_hetero_graph(
     data["oneD", "oneDtwoD", "twoD"].edge_attr_static = torch.zeros(
         (n_cross_edges, 1), dtype=torch.float32
     )
-    
+
+    # Build rain_1d_index: [N_1d] LongTensor mapping each 1D node -> its connected 2D node.
+    # Used in make_x_dyn to gather 2D rainfall as a dynamic input for each 1D node.
+    # Stored as a plain Python attribute (not in a node store) so PyG Batch.from_data_list
+    # does not concatenate it across batch copies — make_x_dyn handles batch indexing itself.
+    n_1d = len(static_1d_norm)
+    node_1d_col = next((c for c in ["node_1d", "to_node", "target", "dst", "to"] if c in edges1d2d.columns), None)
+    node_2d_col = next((c for c in ["node_2d", "from_node", "source", "src", "from"] if c in edges1d2d.columns), None)
+    if node_1d_col is not None and node_2d_col is not None:
+        rain_idx = torch.zeros(n_1d, dtype=torch.long)
+        for _, row in edges1d2d.iterrows():
+            rain_idx[int(row[node_1d_col])] = int(row[node_2d_col])
+        data.rain_1d_index = rain_idx  # graph-level attr, not batched by PyG
+
     data.validate()
     return data
 
 
 def make_x_dyn(
-    y_pred_1d: torch.Tensor, 
+    y_pred_1d: torch.Tensor,
     y_pred_2d: torch.Tensor,
-    rain_2d: torch.Tensor, 
+    rain_2d: torch.Tensor,
     data: tg.data.HeteroData,
-    dynamic_1d_feats: torch.Tensor = None,
-    dynamic_2d_feats: torch.Tensor = None,
+    rain_1d_index: torch.Tensor = None,
 ) -> dict[str, torch.Tensor]:
     """
     Construct dynamic input dict for one timestep.
-    
+
     This function is called by the model at each timestep to inject dynamic data.
-    
+
     Args:
-        y_pred_1d: [N_1d, 1] current water level estimate for 1D nodes
-        y_pred_2d: [N_2d, 1] current water level estimate for 2D nodes
-        rain_2d: [N_2d, R] rainfall features for 2D nodes
+        y_pred_1d: [B*N_1d, 1] current water level estimate for 1D nodes
+        y_pred_2d: [B*N_2d, 1] current water level estimate for 2D nodes
+        rain_2d: [B*N_2d, R] rainfall features for 2D nodes
         data: HeteroData graph (contains num_nodes for sizing)
-        dynamic_1d_feats: [N_1d, D1] optional additional dynamic features for 1D
-        dynamic_2d_feats: [N_2d, D2] optional additional dynamic features for 2D
-    
+        rain_1d_index: [N_1d] LongTensor mapping each 1D node to its connected 2D node.
+            If provided, gathers rainfall and water_level from connected 2D nodes as 1D dynamic features.
+
     Returns:
         x_dyn_t: dict[str, torch.Tensor] with dynamic inputs per node type
-          - x_dyn_t["oneD"]: [N_1d, dyn_dim_1d]
-          - x_dyn_t["twoD"]: [N_2d, dyn_dim_2d]
+          - x_dyn_t["oneD"]: [B*N_1d, dyn_dim_1d]  (1 or 3 features depending on rain_1d_index)
+          - x_dyn_t["twoD"]: [B*N_2d, dyn_dim_2d]
     """
     x_dyn = {}
-    
-    device = y_pred_1d.device
-    
-    # 1D nodes: water level + optional additional dynamics
-    if dynamic_1d_feats is not None:
-        x_dyn["oneD"] = torch.cat([y_pred_1d, dynamic_1d_feats], dim=-1)
+
+    # 2D nodes: water level + rainfall
+    x_dyn["twoD"] = torch.cat([y_pred_2d, rain_2d], dim=-1)
+
+    # 1D nodes: water level + (optionally) rainfall and water level gathered from connected 2D nodes.
+    # rain_2d and y_pred_2d are [B*N_2d, *]; rain_1d_index is [N_1d] (per-graph, un-batched).
+    # The batched layout interleaves B graph copies:
+    #   [node0_b0, node1_b0, ..., node0_b1, node1_b1, ...]
+    # So for batch b, 2D node j has global index b*N_2d + j.
+    if rain_1d_index is not None:
+        N_1d = rain_1d_index.size(0)          # per-graph 1D count (un-batched index)
+        N_2d = rain_2d.size(0) // (y_pred_1d.size(0) // N_1d)   # per-graph 2D count
+        B = y_pred_1d.size(0) // N_1d
+        # Build global 2D indices for each (batch, 1D node) pair
+        batch_offsets = torch.arange(B, device=rain_2d.device) * N_2d   # [B]
+        idx_batched = rain_1d_index.unsqueeze(0) + batch_offsets.unsqueeze(1)  # [B, N_1d]
+        idx_flat = idx_batched.reshape(B * N_1d)                               # [B*N_1d]
+        rain_1d = rain_2d[idx_flat]                                            # [B*N_1d, R]
+        wl_2d_for_1d = y_pred_2d[idx_flat]                                     # [B*N_1d, 1]
+        x_dyn["oneD"] = torch.cat([y_pred_1d, rain_1d, wl_2d_for_1d], dim=-1)
     else:
         x_dyn["oneD"] = y_pred_1d
-    
-    # 2D nodes: water level + rainfall + optional additional dynamics
-    components_2d = [y_pred_2d, rain_2d]
-    if dynamic_2d_feats is not None:
-        components_2d.append(dynamic_2d_feats)
-    x_dyn["twoD"] = torch.cat(components_2d, dim=-1)
-    
+
     return x_dyn
 
 
@@ -1182,10 +1202,10 @@ def get_model_config():
     }
     
     # Dynamic input dimensions (what make_x_dyn will provide)
-    # 1D: water_level only (1 feature)
+    # 1D: water_level + rainfall + water_level of connected 2D node (3 features)
     # 2D: water_level + rainfall (2 features)
     node_dyn_input_dims = {
-        "oneD": 1,  # water_level
+        "oneD": 3,  # water_level + rain from connected 2D node + water_level of connected 2D node
         "twoD": 2,  # water_level + rainfall
     }
     

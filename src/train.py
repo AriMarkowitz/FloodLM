@@ -24,7 +24,7 @@ if str(THIS_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from data import get_recurrent_dataloader, get_model_config
+from data import get_recurrent_dataloader, get_model_config, make_x_dyn
 from model import FloodAutoregressiveHeteroModel
 from data_lazy import initialize_data
 from data_config import SELECTED_MODEL
@@ -98,20 +98,22 @@ def save_normalization_stats(norm_stats, save_dir, model_id=None):
     print(f"[INFO] Saved normalization statistics to {stats_path}")
     print(f"[INFO] Saved normalizer objects to {normalizer_path}")
 
-def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
+def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_step=None):
     """Save model checkpoint and related information."""
     os.makedirs(save_dir, exist_ok=True)
-    
+
     # Use model ID from SELECTED_MODEL if not provided
     if model_id is None:
         model_id = SELECTED_MODEL
-    
+
     checkpoint = {
         'epoch': epoch,
         'model_state': model.state_dict(),
         'config': config,
         'loss': loss,
         'model_id': model_id,
+        'global_step': global_step,
+        'wandb_run_id': wandb.run.id if wandb.run is not None else None,
     }
     
     checkpoint_path = os.path.join(save_dir, f'{model_id}_epoch_{epoch:03d}.pt')
@@ -120,10 +122,16 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None):
     
     return checkpoint_path
 
-def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_steps, batched_static_graph=None, max_batches=None, use_mixed_precision=False):
-    """Evaluate at a fixed multi-step rollout horizon. Returns (combined_norm, 1d_norm, 2d_norm)."""
+def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_steps, batched_static_graph=None, max_batches=None, use_mixed_precision=False, rain_1d_index=None):
+    """Evaluate at a fixed multi-step rollout horizon.
+
+    Returns (combined_norm, 1d_norm, 2d_norm, per_node_1d_mse) where
+    per_node_1d_mse is a 1-D numpy array of shape [N_1d] with per-node
+    mean MSE (normalized) averaged across all batches and timesteps.
+    """
     model.eval()
     total, total_1d, total_2d = 0.0, 0.0, 0.0
+    per_node_1d_accum = None  # [N_1d] accumulated MSE sum
     n = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -140,27 +148,37 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
             y_future_1d   = batch['y_future_1d'].to(device)
             y_future_2d   = batch['y_future_2d'].to(device)
             rain_future_2d = batch['rain_future_2d'].to(device)
+            _r1d = rain_1d_index if rain_1d_index is not None else getattr(static_graph, 'rain_1d_index', None)
             with torch.amp.autocast('cuda', enabled=use_mixed_precision):
                 predictions = model.forward_unroll(
                     data=static_graph,
                     y_hist_1d=y_hist_1d, y_hist_2d=y_hist_2d,
                     rain_hist=rain_hist_2d, rain_future=rain_future_2d,
-                    make_x_dyn=lambda y, r, data: {
-                        'oneD': y['oneD'],
-                        'twoD': torch.cat([y['twoD'], r], dim=-1),
-                    },
+                    make_x_dyn=lambda y, r, d, _r=_r1d: make_x_dyn(
+                        y['oneD'], y['twoD'], r, d,
+                        rain_1d_index=_r,
+                    ),
                     rollout_steps=h, device=device,
                     batched_data=batched_static_graph,
                 )
                 loss_1d = criterion(predictions['oneD'], y_future_1d[:, :h])
                 loss_2d = criterion(predictions['twoD'], y_future_2d[:, :h])
+                # Per-node 1D MSE: mean over batch (B) and time (h), keep node dim
+                # predictions['oneD']: [B, h, N_1d, 1], y_future_1d: [B, h, N_1d, 1]
+                node_mse_1d = ((predictions['oneD'] - y_future_1d[:, :h]) ** 2).mean(dim=(0, 1, 3))  # [N_1d]
             total_1d += loss_1d.item()
             total_2d += loss_2d.item()
             total += ((loss_1d + loss_2d) / 2).item()
+            node_mse_cpu = node_mse_1d.float().cpu()
+            if per_node_1d_accum is None:
+                per_node_1d_accum = node_mse_cpu
+            else:
+                per_node_1d_accum += node_mse_cpu
             n += 1
     if n == 0:
-        return float('nan'), float('nan'), float('nan')
-    return total / n, total_1d / n, total_2d / n
+        return float('nan'), float('nan'), float('nan'), None
+    per_node_1d_mse = (per_node_1d_accum / n).numpy()
+    return total / n, total_1d / n, total_2d / n, per_node_1d_mse
 
 
 def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None):
@@ -182,8 +200,25 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     print("FloodLM Training Script")
     print("="*70)
     
+    # Peek at checkpoint to recover wandb run ID and global_step before init
+    _wandb_resume_id = None
+    _global_step_resume = 0
+    if resume_path:
+        try:
+            _ckpt_files = sorted(resume_path.glob(f'{SELECTED_MODEL}*.pt'))
+            if _ckpt_files:
+                _peek = torch.load(_ckpt_files[-1], map_location='cpu')
+                _wandb_resume_id = _peek.get('wandb_run_id', None)
+                _global_step_resume = _peek.get('global_step', 0) or 0
+        except Exception:
+            pass
+
     run_name = f"{SELECTED_MODEL}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    wandb.init(project="floodlm", name=run_name, config=CONFIG)
+    if _wandb_resume_id:
+        wandb.init(project="floodlm", id=_wandb_resume_id, resume="must", config=CONFIG)
+        print(f"[INFO] Resuming wandb run: {_wandb_resume_id} (global_step offset: {_global_step_resume})")
+    else:
+        wandb.init(project="floodlm", name=run_name, config=CONFIG)
 
     # Create a dated run subdirectory so each training run is isolated.
     # Also maintain a shared checkpoints/latest/ directory that always contains
@@ -244,6 +279,21 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     
     # Initialize model
     print(f"\n[INFO] Building model...")
+    model_config.update({
+        'h_dim': 96,
+        'msg_dim': 96,
+        # Edge-type-specific hidden dims:
+        #   1D homogeneous + cross-type: smaller (1D graph ~16 nodes; cross-type ~17-168 edges)
+        #   2D homogeneous: full 192 (thousands of 2D edges)
+        'hidden_dim': {
+            'oneDedge':    96,
+            'oneDedgeRev': 96,
+            'twoDedge':    192,
+            'twoDedgeRev': 192,
+            'twoDoneD':    96,
+            'oneDtwoD':    96,
+        },
+    })
     model = FloodAutoregressiveHeteroModel(**model_config)
     model = model.to(device)
     
@@ -344,6 +394,9 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     _static_graph_cpu = next(iter(train_dataloader))['static_graph']
     train_batched_graph = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
     val_batched_graph   = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device) if not skip_validation else None
+    # Capture rain_1d_index on device for use in make_x_dyn closures (graph-level attr
+    # may not survive Batch.from_data_list so we pin it to a closure variable instead).
+    _rain_1d_index = _static_graph_cpu.rain_1d_index.to(device) if hasattr(_static_graph_cpu, 'rain_1d_index') else None
     print(f"[INFO] Batched graphs ready.")
 
     print(f"\n[INFO] Training configuration:")
@@ -357,7 +410,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     print(f"{'='*70}\n")
 
     epoch_start_time = time.time()
-    global_step = 0  # Single monotonic step counter for wandb
+    global_step = _global_step_resume  # Restored from checkpoint on resume; 0 for fresh runs
 
     # Mid-epoch validation disabled — at h=64 even 3-batch rollouts are expensive.
     # Full validation runs at end of each epoch instead.
@@ -378,14 +431,14 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         num_batches = 0
         batch_start_time = time.time()
 
-        # Epoch boundary marker — visible as a vertical annotation in wandb
-        wandb.log({'epoch': epoch}, step=global_step)
-        
         # Curriculum: doubles every 3 epochs for Model_2 (slower convergence), 2 for Model_1
         # Model_2: epoch 1-3→1, 4-6→2, 7-9→4, 10-12→8, 13-15→16, 16-18→32, 19-24→64
         # Model_1: epoch 1-2→1, 3-4→2, ..., 13-14→64 (set epochs=16 manually)
         _stage_len = 3 if SELECTED_MODEL == 'Model_2' else 2
         max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // _stage_len))
+
+        # Epoch boundary marker — visible as a vertical annotation in wandb
+        wandb.log({'epoch': epoch, 'curriculum/max_h': max_h}, step=global_step)
 
         # Model_2 only: drop LR by 3x at the three problematic curriculum jumps (h=8, 32, 64).
         # Skipping the early small-horizon jumps preserves learning capacity at h=64.
@@ -429,10 +482,10 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                     y_hist_2d=y_hist_2d,
                     rain_hist=rain_hist_2d,
                     rain_future=rain_future_2d,
-                    make_x_dyn=lambda y, r, data: {
-                        'oneD': y['oneD'],
-                        'twoD': torch.cat([y['twoD'], r], dim=-1),
-                    },
+                    make_x_dyn=lambda y, r, d: make_x_dyn(
+                        y['oneD'], y['twoD'], r, d,
+                        rain_1d_index=_rain_1d_index,
+                    ),
                     rollout_steps=rollout_steps,
                     device=device,
                     batched_data=train_batched_graph,
@@ -472,6 +525,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 f'loss/train_h{rollout_steps}': loss.item(),
                 'curriculum/rollout_steps': rollout_steps,
                 'curriculum/max_h': max_h,
+                'epoch': epoch,
             }
 
             # Mid-epoch validation (disabled when VAL_CHECK_INTERVAL is None)
@@ -482,6 +536,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                     batched_static_graph=val_batched_graph,
                     max_batches=VAL_SUBSET_BATCHES,
                     use_mixed_precision=use_mixed_precision,
+                    rain_1d_index=_rain_1d_index,
                 )
                 # sqrt(MSE_norm) == NRMSE directly (water_level normalized by kaggle_sigma)
                 val_nrmse_1d_mid = val_1d_mid ** 0.5
@@ -528,10 +583,11 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         if not skip_validation:
             try:
                 print(f"\n[INFO] Running full validation (h={max_h})...")
-                val_combined, val_1d, val_2d = evaluate_rollout(
+                val_combined, val_1d, val_2d, val_per_node_1d = evaluate_rollout(
                     model, val_dataloader, criterion, device, norm_stats,
                     rollout_steps=max_h, batched_static_graph=val_batched_graph,
                     use_mixed_precision=use_mixed_precision,
+                    rain_1d_index=_rain_1d_index,
                 )
                 val_loss_norm = val_combined
                 # sqrt(MSE_norm) == NRMSE directly; * kaggle_sigma gives RMSE in meters
@@ -582,7 +638,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
         model.train()
 
-        wandb_payload = {'loss/train': avg_epoch_loss, 'curriculum/epoch_max_h': max_h}
+        wandb_payload = {'loss/train': avg_epoch_loss, 'curriculum/epoch_max_h': max_h, 'epoch': epoch, 'curriculum/max_h': max_h}
         if val_loss_norm is not None:
             wandb_payload.update({
                 f'rollout_val/h{max_h}_combined': val_combined,
@@ -594,11 +650,18 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 f'rollout_val/h{max_h}_2d_nrmse': val_nrmse_2d,
                 f'rollout_val/h{max_h}_approx_kaggle': val_nrmse_combined,
             })
+            # Per-node 1D MSE table — sortable in wandb UI to identify hard nodes
+            if val_per_node_1d is not None:
+                table = wandb.Table(columns=['node_id', 'mse_norm', 'nrmse', 'rmse_m'])
+                for node_i, mse in enumerate(val_per_node_1d):
+                    nrmse = float(mse) ** 0.5
+                    table.add_data(node_i, float(mse), nrmse, nrmse * kaggle_sigma_1d)
+                wandb_payload[f'rollout_val/h{max_h}_1d_per_node'] = table
         wandb.log(wandb_payload, step=global_step)
 
         # Checkpoint
         if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
-            save_checkpoint(model, epoch, avg_epoch_loss, run_dir, CONFIG)
+            save_checkpoint(model, epoch, avg_epoch_loss, run_dir, CONFIG, global_step=global_step)
 
         # Best checkpoint tracking — always save the last epoch's checkpoint to latest/
         # (Early stopping is disabled: val loss is incomparable across epochs with different max_h)

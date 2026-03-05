@@ -142,6 +142,23 @@ predictions = model.forward_unroll(
 loss = criterion(predictions, ground_truth)
 ```
 
+### Curriculum Learning
+
+Rather than training directly on the full 64-step autoregressive rollout from epoch 1 (which causes gradient explosion and unstable early training), we use an **exponential horizon curriculum**: the rollout length doubles every few epochs, starting at 1 step and reaching 64 by the final training stage.
+
+This was a deliberate design choice — autoregressive models are notoriously hard to train end-to-end at long horizons because errors compound and gradients vanish or explode through many unrolled steps. The curriculum lets the model first learn short-range hydraulic dynamics well, then gradually extend its temporal reach.
+
+```
+Model_1: h=1 (ep 1-2) → h=2 (3-4) → h=4 (5-6) → h=8 (7-8) → h=16 (9-10) → h=32 (11-12) → h=64 (13-24)
+Model_2: h=1 (ep 1-3) → h=2 (4-6) → h=4 (7-9) → h=8 (10-12) → h=16 (13-15) → h=32 (16-18) → h=64 (19-24)
+```
+
+Model_2 uses a longer stage length (3 epochs per stage vs 2) because its domain is harder (smaller Kaggle sigmas = tighter tolerances). See `ARCHITECTURE.md` for full details.
+
+### Training Order
+
+When running both models (`pipeline.sh all`), **Model_2 trains first**. This is intentional — Model_2 is harder (higher-resolution domain, stricter Kaggle metric) and we want early visibility into its performance during a run.
+
 ## Usage
 
 See `example_usage.py` for a complete example showing:

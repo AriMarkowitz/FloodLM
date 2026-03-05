@@ -83,7 +83,7 @@ For each timestep the cell performs:
    pred[nt] = head[nt]( h_next[nt] )                        [N_nt, 1]
 ```
 
-**Hidden state dimensions:** `h_dim=64`, `msg_dim=64`, MLP hidden `=128`.
+**Hidden state dimensions:** `h_dim=96`, `msg_dim=96`, MLP hidden `=96–192` (edge-type-specific).
 **Normalization:** LayerNorm on hidden state, messages, and dynamic inputs (prevents magnitude explosion across 64 rollout steps).
 
 ### Message Passing Modules
@@ -105,19 +105,21 @@ The `softplus` ensures positive coupling; the `sigmoid` gate lets the model supp
 
 #### `GATv2CrossTypeMP` (1D → 2D edge)
 
-Wraps `torch_geometric.nn.GATv2Conv` with 4 attention heads:
+Wraps `torch_geometric.nn.GATv2Conv` with 4 attention heads, followed by a two-layer feed-forward network (FFN) for nonlinear capacity:
 
 ```
-message[dst] = GATv2Conv(
-    (h_src, h_dst),
-    in_channels = (h_dim, h_dim),
-    out_channels = msg_dim // heads,
-    heads = 4,
-    concat = True,
-)
+attn_out     = GATv2Conv(
+                   (h_src, h_dst),
+                   in_channels  = (h_dim, h_dim),
+                   out_channels = msg_dim // heads,
+                   heads        = 4,
+                   concat       = True,
+               )                                   # [N_dst, msg_dim]
+
+message[dst] = FFN( attn_out )                     # Linear(msg_dim→96)→ReLU→Linear(96→msg_dim)
 ```
 
-Attention is computed jointly over source and destination hidden states, allowing the model to learn which channel nodes most influence each floodplain cell.
+Attention is computed jointly over source and destination hidden states, allowing the model to learn which channel nodes most influence each floodplain cell. The FFN adds nonlinear expressivity that a single GATv2Conv layer lacks (GATv2Conv has no internal hidden dimension).
 
 ---
 
@@ -203,11 +205,14 @@ This prevents gradient explosion from backpropagating through 64 steps from epoc
 | `batch_size` | 16 |
 | `epochs` | 24 |
 | `lr` | 1e-3 |
-| `h_dim` | 64 |
-| `msg_dim` | 64 |
-| `hidden_dim` | 128 |
+| `h_dim` | 96 |
+| `msg_dim` | 96 |
+| `hidden_dim` (1D homogeneous + cross-type edges) | 96 |
+| `hidden_dim` (2D homogeneous edges) | 192 |
 | `dropout` | 0.0 |
-| Total parameters | 361,612 |
+| Total parameters | ~628K |
+
+Note: `hidden_dim` is edge-type-specific. 1D homogeneous edges (`oneDedge`, `oneDedgeRev`) and cross-type edges (`twoDoneD`, `oneDtwoD`) use 96 because those graphs are sparse (≤200 edges). 2D homogeneous edges use 192 because the 2D mesh has thousands of edges.
 
 ---
 

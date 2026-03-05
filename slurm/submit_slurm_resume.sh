@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --time=12:00:00
 #SBATCH --output=/users/admarkowitz/FloodLM/logs/slurm_%j.out
@@ -115,7 +115,7 @@ train_model() {
 # Main training loop
 overall_success=0
 
-for model in Model_1 Model_2; do
+for model in Model_2 Model_1; do
     log_info ""
     
     # Get latest checkpoint for this model

@@ -23,11 +23,11 @@ MODEL_SELECTION="${2:-Model_1}"
 
 # Validate model selection
 case "${MODEL_SELECTION}" in
-    Model_1|Model_2)
+    Model_2|Model_1)
         MODELS=("${MODEL_SELECTION}")
         ;;
     all)
-        MODELS=("Model_1" "Model_2")
+        MODELS=("Model_2" "Model_1")
         ;;
     *)
         echo "Invalid model selection: ${MODEL_SELECTION}"
@@ -185,9 +185,9 @@ header "FloodLM Full Pipeline: Train → Inference → Evaluate"
 # ============================================================================
 # Stage 1: Training
 # ============================================================================
-
 header "Stage 1: Training Models"
 
+# Model_2 trains first (harder model; want early visibility into its performance)
 for MODEL in "${MODELS[@]}"; do
     LOG_FILE="${LOG_DIR}/train_${MODEL}_${TIMESTAMP}.log"
 

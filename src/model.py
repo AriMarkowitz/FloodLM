@@ -192,12 +192,11 @@ class StaticDynamicEdgeMP(MessagePassing):
 # ============================================================
 class GATv2CrossTypeMP(MessagePassing):
     """
-    GATv2-based message passing for directed 1D->2D cross-type edges.
+    GATv2-based message passing for directed cross-type edges.
 
-    Computes attention-weighted messages from 1D channel hidden states
-    to 2D floodplain cell hidden states.  The GATv2 attention score
-    conditions on both src and dst hidden states, so each 2D cell can
-    selectively attend to the most relevant channels.
+    Computes attention-weighted messages from src hidden states to dst hidden states.
+    A post-attention MLP (transformer-style FFN) adds nonlinear hidden capacity,
+    since GATv2Conv itself has no internal hidden dimension.
 
     Output shape: [B*N_dst, msg_dim]
     """
@@ -205,6 +204,7 @@ class GATv2CrossTypeMP(MessagePassing):
         self,
         h_dim: int,
         msg_dim: int,
+        hidden_dim: int,
         heads: int = 4,
         dropout: float = 0.0,
     ):
@@ -222,6 +222,8 @@ class GATv2CrossTypeMP(MessagePassing):
             add_self_loops=False,
             residual=True,
         )
+        # Post-attention MLP: adds hidden capacity (GATv2 has no internal hidden dim)
+        self.ffn = MLP(in_dim=msg_dim, hidden_dim=hidden_dim, out_dim=msg_dim, dropout=dropout)
 
     def _set_context(self, h_src, h_dst, **kwargs):
         self._h_src = h_src
@@ -229,8 +231,8 @@ class GATv2CrossTypeMP(MessagePassing):
 
     def forward(self, x=None, edge_index=None, **kwargs):
         # GATv2Conv takes (x_src, x_dst) tuple for bipartite graphs
-        out = self.gatv2((self._h_src, self._h_dst), edge_index)
-        return out  # [B*N_dst, msg_dim]
+        out = self.gatv2((self._h_src, self._h_dst), edge_index)  # [B*N_dst, msg_dim]
+        return self.ffn(out)  # [B*N_dst, msg_dim]
 
 
 # ============================================================
@@ -260,14 +262,26 @@ class HeteroTransportCell(nn.Module):
         edge_static_dims: dict[tuple[str, str, str], int],
         h_dim: int = 64,
         msg_dim: int = 64,
-        hidden_dim: int = 128,
+        hidden_dim: int | dict = 128,
         dropout: float = 0.0,
     ):
+        """
+        hidden_dim: either a single int (shared across all edge types) or a dict mapping
+            edge relation name -> int, e.g. {'oneDedge': 64, 'twoDedge': 192, 'oneDtwoD': 192}.
+            Missing keys fall back to the default (first int value or 128).
+        """
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
         self.h_dim = h_dim
         self.msg_dim = msg_dim
+
+        # Resolve hidden_dim per edge relation
+        if isinstance(hidden_dim, dict):
+            _hid_default = next(iter(hidden_dim.values()), 128)
+            def _hid(rel): return hidden_dim.get(rel, _hid_default)
+        else:
+            def _hid(rel): return hidden_dim
 
         # ------------------------------------------------------------
         # A) Hetero message passing blocks (one per relation)
@@ -279,6 +293,7 @@ class HeteroTransportCell(nn.Module):
                 mp = GATv2CrossTypeMP(
                     h_dim=h_dim,
                     msg_dim=msg_dim,
+                    hidden_dim=_hid(rel),
                     heads=4,
                     dropout=dropout,
                 )
@@ -289,7 +304,7 @@ class HeteroTransportCell(nn.Module):
                     node_static_dim_dst=node_static_dims[dst],
                     edge_static_dim=edge_static_dims[(src, rel, dst)],
                     msg_dim=msg_dim,
-                    hidden_dim=hidden_dim,
+                    hidden_dim=_hid(rel),
                     dropout=dropout,
                     aggr="add",
                 )
@@ -465,13 +480,15 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         # Prediction heads (one per node type):
         # Each head maps hidden state -> predicted water level.
         # Operates on [B*N, h_dim] -> [B*N, 1].
+        # hidden_dim may be a dict (edge-specific); heads use max value as their MLP width.
         # ------------------------------------------------------------
+        _head_hidden = max(hidden_dim.values()) if isinstance(hidden_dim, dict) else hidden_dim
         self.heads = nn.ModuleDict({
             nt: nn.Sequential(
                 nn.LayerNorm(h_dim),
-                nn.Linear(h_dim, hidden_dim),
+                nn.Linear(h_dim, _head_hidden),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, 1),
+                nn.Linear(_head_hidden, 1),
             )
             for nt in node_types
         })

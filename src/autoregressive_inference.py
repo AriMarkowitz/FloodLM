@@ -281,12 +281,28 @@ def autoregressive_rollout_both(
     N1 = y1_hist.size(1)
     N2 = y2_hist.size(1)
 
+    # rain_1d_index: [N1] LongTensor mapping each 1D node to its connected 2D node.
+    # Used to gather 2D rainfall as a dynamic input for 1D nodes.
+    rain_1d_index = getattr(static_graph, 'rain_1d_index', None)
+    if rain_1d_index is not None:
+        rain_1d_index = rain_1d_index.to(device)
+
+    def _build_x_dyn(y1, y2, rain2_t):
+        """Build x_dyn dict for one timestep. y1: [N1,1], y2: [N2,1], rain2_t: [N2,1]"""
+        if rain_1d_index is not None:
+            rain_1d_t = rain2_t[rain_1d_index]   # [N1, 1]
+            wl_2d_for_1d = y2[rain_1d_index]     # [N1, 1] water level of connected 2D node
+            dyn_1d = torch.cat([y1, rain_1d_t, wl_2d_for_1d], dim=-1)  # [N1, 3]
+        else:
+            dyn_1d = y1
+        return {
+            'oneD': dyn_1d.reshape(B * N1, -1),
+            'twoD': torch.cat([y2, rain2_t], dim=-1).reshape(B * N2, -1),
+        }
+
     # Warm start with true history — inputs are [N, F], reshape to [B*N, F] = [N, F]
     for t in range(history_len):
-        x_dyn_t = {
-            'oneD': y1_hist[t].reshape(B * N1, 1),
-            'twoD': torch.cat([y2_hist[t], rain2_all[t]], dim=-1).reshape(B * N2, -1),
-        }
+        x_dyn_t = _build_x_dyn(y1_hist[t], y2_hist[t], rain2_all[t])
         h = model.cell(batched_graph, h, x_dyn_t)
 
     preds_1d = []
@@ -305,10 +321,7 @@ def autoregressive_rollout_both(
             preds_1d.append(y1_next)
             preds_2d.append(y2_next)
 
-            x_dyn_next = {
-                'oneD': y1_next.reshape(B * N1, 1),
-                'twoD': torch.cat([y2_next, rain2_all[t]], dim=-1).reshape(B * N2, -1),
-            }
+            x_dyn_next = _build_x_dyn(y1_next, y2_next, rain2_all[t])
             h = model.cell(batched_graph, h, x_dyn_next)
 
     return torch.stack(preds_1d, dim=0), torch.stack(preds_2d, dim=0)
