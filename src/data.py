@@ -1064,7 +1064,12 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
     elif split == 'test':
         event_file_list = data['test_event_file_list']
     elif split == 'all':
-        event_file_list = data['event_file_list']
+        # Combine all splits: train + val + test
+        event_file_list = (
+            data['train_event_file_list'] +
+            data['val_event_file_list'] +
+            data['test_event_file_list']
+        )
     else:
         raise ValueError(f"Invalid split '{split}'. Must be 'train', 'val', 'test', or 'all'.")
     

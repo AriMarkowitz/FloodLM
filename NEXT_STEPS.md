@@ -118,6 +118,22 @@ GRU compresses all history into a fixed hidden state. Alternatives:
 - **Linear attention**: approximates full softmax attention via kernel trick; O(1) memory, faster, less expressive.
 - **Full self-attention over rollout history**: richest but O(T²) memory. Most suitable if memory is not a bottleneck.
 
+### Transfer learning: Model_1 → Model_2 weight initialization
+Use Model_1 weights to warm-start Model_2 training, giving it a strong prior on general hydraulic message-passing before it encounters Model_2's trickier 150-node 1D regime.
+
+**Which checkpoint to use — h=4, NOT h=64:**
+- Use the Model_1 checkpoint at the *end of the h=4 stage* (e.g. `Model_1_epoch_006.pt` from the dated run directory, or whichever epoch corresponds to the last h=4 epoch in the curriculum).
+- **Do NOT use the h=64 best checkpoint.** By h=64, Model_1's weights are heavily specialized for 17-node, σ≈17m, ~300m-elevation dynamics. Transferring those to Model_2 (150 nodes, σ≈3m, different slope regime) means the GRU hidden state encoding and output head scaling are all miscalibrated — the model would need to unlearn them before it can start learning Model_2's regime, likely causing instability at early curriculum stages.
+- At h=4, the shared message-passing primitives (flood wave propagation, edge convolution, GRU gating) are well-learned, but long-horizon specialization has not yet accumulated. This is the sweet spot for transfer.
+
+**Implementation:**
+- Load `Model_1_epoch_006.pt` (or equivalent) via `--resume`, then immediately switch to `SELECTED_MODEL=Model_2`.
+- Heads and `dyn_proj` input dimensions differ between models if 1D input dim changes — either: (a) skip loading mismatched layers (`strict=False` + manual key filtering), or (b) keep dims identical for the initial transfer experiment.
+- Use a **compressed curriculum** (`_stage_len=2` instead of 3) since mechanical GNN priors are pre-learned; the model only needs to adapt to Model_2's hydraulic scale and node count.
+- Start at a reduced LR (e.g. 3e-4 instead of 1e-3) to avoid catastrophic forgetting of the shared primitives.
+
+---
+
 ### Joint model training — shared trunk + model_id conditioning
 Train a single model on both Model_1 and Model_2 data simultaneously.
 - *Shared trunk* learns general hydro-transport primitives; 2x data → better generalization.

@@ -284,10 +284,24 @@ fi
 echo ""
 
 # ============================================================================
-# Stage 4: Kaggle Submission
+# Stage 4: Architecture Snapshot
 # ============================================================================
 
-header "Stage 4: Submitting to Kaggle"
+header "Stage 4: Architecture Snapshot"
+
+SUBMISSION_BASE="${SUBMISSION_FILE%.csv}"
+log_info "Snapshotting code + checkpoints → snapshots/${SUBMISSION_BASE}/"
+bash "${SCRIPT_DIR}/snapshot_arch.sh" "${SUBMISSION_BASE}" "${PROJECT_DIR}" \
+    && log_info "✓ Snapshot saved" \
+    || log_warn "✗ Snapshot failed (non-fatal)"
+
+echo ""
+
+# ============================================================================
+# Stage 5: Kaggle Submission
+# ============================================================================
+
+header "Stage 5: Submitting to Kaggle"
 
 LOG_FILE="${LOG_DIR}/kaggle_${TIMESTAMP}.log"
 

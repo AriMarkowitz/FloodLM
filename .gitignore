@@ -5,3 +5,5 @@ logs/*
 src/__pycache__/*
 wandb/*
 submission_*.csv
+plots/*
+.claude/*

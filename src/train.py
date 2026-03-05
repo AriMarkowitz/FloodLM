@@ -163,7 +163,7 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
     return total / n, total_1d / n, total_2d / n
 
 
-def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None):
+def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None):
     """Main training loop.
     
     Args:
@@ -219,8 +219,9 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         forecast_len=CONFIG['forecast_len'],
         batch_size=CONFIG['batch_size'],
         shuffle=True,
-        split='train',
+        split=train_split,
     )
+    print(f"  Training split: {train_split}")
 
     if skip_validation:
         val_dataloader = None
@@ -294,6 +295,14 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             print(f"[WARNING] Starting fresh from epoch 1")
             start_epoch = 1
 
+    # If extra_epochs is set (used by fine-tune pipeline), override CONFIG['epochs'] so that
+    # exactly extra_epochs epochs run starting from start_epoch, regardless of what was
+    # stored in CONFIG. This prevents the common mistake of --epochs 4 meaning "stop at epoch 4"
+    # when start_epoch is already 25.
+    if extra_epochs is not None:
+        CONFIG['epochs'] = start_epoch - 1 + extra_epochs
+        print(f"[INFO] extra_epochs={extra_epochs}: running epochs {start_epoch}..{CONFIG['epochs']}")
+
     # Transfer learning: load weights from another model (e.g. Model_1 -> Model_2)
     # Resets epoch + optimizer — fresh training schedule with warm weights.
     if pretrain_from:
@@ -361,6 +370,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     prev_max_h = None  # Track curriculum jumps for LR reduction (Model_2 only)
     no_improve_count = 0  # Early stopping counter (only active at full horizon)
     best_train_loss_at_max_h = float('inf')  # fallback for early stopping when val disabled
+    val_loss_norm = None  # Set in epoch loop; initialized here to avoid UnboundLocalError if loop is empty
 
     for epoch in range(start_epoch, CONFIG['epochs'] + 1):
         model.train()
@@ -603,7 +613,8 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 src = os.path.join(run_dir, fname)
                 if os.path.exists(src):
                     shutil.copy(src, os.path.join(latest_dir, fname))
-            print(f"[INFO] Checkpoint mirrored to latest/ (h={max_h} val_loss={val_loss_norm:.6e})")
+            _val_str = f"{val_loss_norm:.6e}" if val_loss_norm is not None else "N/A"
+            print(f"[INFO] Checkpoint mirrored to latest/ (h={max_h} val_loss={_val_str})")
 
         print()
 
@@ -639,6 +650,8 @@ if __name__ == "__main__":
                         help='Path to checkpoint directory to resume from (e.g., checkpoints/latest/ or checkpoints/Model_2_20260303_003721/)')
     parser.add_argument('--mixed-precision', action='store_true', 
                         help='Use mixed precision (float16) training to reduce GPU memory usage')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override number of training epochs')
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Override batch size for resume training')
     parser.add_argument('--learning-rate', '--lr', type=float, default=None,
@@ -651,9 +664,19 @@ if __name__ == "__main__":
                         help='Load Model_1 weights as starting point for Model_2 (transfer learning). '
                              'Pass path to checkpoint dir (e.g. checkpoints/latest). '
                              'Epoch counter and optimizer are reset — full training schedule runs.')
+    parser.add_argument('--train-split', type=str, default='train', choices=['train', 'all'],
+                        help='Which data split to use for training. "all" = train+val+test (use only for final submission fine-tuning).')
     args = parser.parse_args()
     
     # Apply command-line overrides to CONFIG
+    # Note: --epochs when combined with --resume is treated as *additional* epochs to run
+    # (resolved inside train() after start_epoch is known). Without --resume it's absolute.
+    extra_epochs = None
+    if args.epochs is not None:
+        if args.resume is not None:
+            extra_epochs = args.epochs
+        else:
+            CONFIG['epochs'] = args.epochs
     if args.batch_size is not None:
         CONFIG['batch_size'] = args.batch_size
     if args.learning_rate is not None:
@@ -667,4 +690,4 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('medium')  # Speeds up matmuls on L40S/A100
         # Actual fp16 autocast + GradScaler is applied inside train()
     
-    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain)
+    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain, train_split=args.train_split, extra_epochs=extra_epochs)
