@@ -33,7 +33,7 @@ from data_config import SELECTED_MODEL
 CONFIG = {
     'history_len': 10,
     'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
-    'batch_size': 16,
+    'batch_size': 24,
     'epochs': 24,                # Model_2: 3 epochs per stage (24 total); Model_1: 2 per stage (reduce manually if needed)
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
@@ -280,18 +280,16 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     # Initialize model
     print(f"\n[INFO] Building model...")
     model_config.update({
-        'h_dim': 96,
-        'msg_dim': 96,
-        # Edge-type-specific hidden dims:
-        #   1D homogeneous + cross-type: smaller (1D graph ~16 nodes; cross-type ~17-168 edges)
-        #   2D homogeneous: full 192 (thousands of 2D edges)
+        'h_dim': 96,     # GRU hidden size — kept large for temporal memory
+        'msg_dim': 64,
+        # Edge-type-specific hidden dims (reduced from 96/192 to 64/128)
         'hidden_dim': {
-            'oneDedge':    96,
-            'oneDedgeRev': 96,
-            'twoDedge':    192,
-            'twoDedgeRev': 192,
-            'twoDoneD':    96,
-            'oneDtwoD':    96,
+            'oneDedge':    64,
+            'oneDedgeRev': 64,
+            'twoDedge':    128,
+            'twoDedgeRev': 128,
+            'twoDoneD':    64,
+            'oneDtwoD':    64,
         },
     })
     model = FloodAutoregressiveHeteroModel(**model_config)

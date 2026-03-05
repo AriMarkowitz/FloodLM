@@ -183,7 +183,7 @@ def initialize_data():
     
     from data_config import TRAIN_PATH, SELECTED_MODEL, validate_data_paths
     from normalization import FeatureNormalizer
-    from data import preprocess_2d_nodes, NORMALIZATION_VERBOSE
+    from data import preprocess_2d_nodes, preprocess_1d_nodes, NORMALIZATION_VERBOSE
     
     # Validate paths
     try:
@@ -273,6 +273,8 @@ def initialize_data():
     # Preprocess and fit static
     print("[INFO] Preprocessing static 2D nodes...")
     static_2d = preprocess_2d_nodes(static_2d)
+    print("[INFO] Preprocessing static 1D nodes...")
+    static_1d = preprocess_1d_nodes(static_1d, static_2d, edges1d2d)
     print("[INFO] Fitting static feature normalization...")
     normalizer_1d.fit_static(static_1d.copy(), NODE_ID_COL, skew_threshold=2.0)
     normalizer_2d.fit_static(static_2d.copy(), NODE_ID_COL, skew_threshold=2.0)
