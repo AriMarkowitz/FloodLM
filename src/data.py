@@ -196,6 +196,9 @@ def preprocess_1d_nodes(nodes1d_df, nodes2d_df, connections_df):
                    .merge(nodes2d_df[["node_idx", "elevation"]], left_on="node_2d", right_on="node_idx", how="left")
                    .set_index("node_1d")["elevation"])
         df["channel_2d_elev_diff"] = df["node_idx"].map(elev_2d) - df["invert_elevation"]
+        # Fill unmatched nodes with median (1 node has no 1d2d connection)
+        median_val = df["channel_2d_elev_diff"].median()
+        df["channel_2d_elev_diff"] = df["channel_2d_elev_diff"].fillna(median_val)
 
     return df
 

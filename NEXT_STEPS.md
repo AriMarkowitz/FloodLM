@@ -44,8 +44,34 @@ Items are ordered roughly by expected impact-to-effort ratio (highest first).
 
 ---
 
+### Mask node 197 from Model_2 training loss
+Node 197 is a confirmed data artifact: `depth=-1`, `base_area=0`, `surface_elevation < invert_elevation` (physically impossible), no 1d2d connection, and water level capped at a fixed boundary (~32m). It is permanently the worst-predicted node (mean RMSE=0.64m, present in top-20 worst in 12/15 evals) and its error is irreducible from the available features. Including it in the loss introduces misleading gradients that may harm the other 197 nodes.
+- **Implementation**: create a `loss_mask_1d` boolean tensor of shape `[N_1d]` with node 197 set to False; apply before averaging the per-node MSE in the loss computation. Predictions are still generated for node 197 at inference (required for submission) — masking only affects gradient flow during training.
+- **Caveat**: if node 197's boundary forcing occasionally provides useful signal to neighboring nodes via message passing, masking its loss could slightly hurt those neighbors. Monitor neighbor node RMSE before/after.
+
+---
+
 ### Scheduled sampling — closes the teacher-forcing gap
 Highest-leverage fix for val→Kaggle gap. During rollout, replace teacher-forced inputs with model predictions with probability `p_sample`, ramped from 0→~0.5 over the h=64 epochs. Trains the model to be robust to its own errors rather than always seeing ground truth. Implement in `forward_unroll` by mixing `y_true_t` and `y_pred_t` at each step based on a `sample_prob` argument passed from the train loop.
+
+---
+
+### Multi-step rollout loss — train on full autoregressive trajectory
+Instead of computing loss only at the final predicted timestep (or uniformly across steps with teacher forcing), unroll the model autoregressively for the full horizon and compute loss at *every* step of the rollout using the model's own predictions as inputs. This directly trains the model on the distribution it will face at inference — the compounding error distribution — rather than the teacher-forced distribution.
+
+**Why it helps**: teacher-forced training sees ground truth at every step, so the model never learns to recover from its own errors. Multi-step rollout loss closes the train/test mismatch caused by recursive prediction — empirically shown to yield 20–30% improvement in long-range R² on noisy benchmarks (Benechehab et al., 2024) and 3× reduction in max relative error in PDE-based reduced-order models (Stephany et al., 2025).
+
+**Formal objective**: `L(θ) = Σⱼ αⱼ · E[‖s_{t+j} − f_θʲ(s_t)‖²]` where `f_θʲ` is the j-step rollout using model predictions as intermediate inputs and `αⱼ` are horizon weights. Setting `αⱼ ∝ βʲ` with `β > 1` upweights tail errors (pairs with timestep-weighted loss); `β < 1` emphasizes near-term errors. Normalization: `Σαⱼ = 1`.
+
+**Bias–variance tradeoff**: one-step loss (α₁=1) is unbiased but high-variance at long horizons; multi-step loss introduces bias into one-step predictions but significantly reduces variance across the rollout. The optimal α depends on system noise — intermediate weighting provides the best overall tradeoff, especially as noise increases.
+
+**Interaction with curriculum**: already partially addressed by the horizon curriculum (h=1→64), but within each curriculum stage all steps still use teacher forcing. True multi-step rollout loss removes teacher forcing *within* each stage. Consider annealing rollout horizon during early curriculum stages for stability (start short, extend as training stabilizes).
+
+**Adaptive horizon scheduling**: rather than fixed αⱼ, sample rollout horizons randomly each batch (uniform or curriculum-guided). This encourages robustness across arbitrary prediction lengths, not just the fixed max_h.
+
+**Cost**: BPTT through all rollout steps — pairs with gradient checkpointing (memory) and truncated BPTT / detach-every-K (gradient explosion). Overhead is training-only; inference is unchanged.
+
+**Combine with scheduled sampling**: scheduled sampling is a softer version (mix true/predicted inputs with probability p); full rollout loss is the hard version. Recommended path: implement scheduled sampling first (lower risk), graduate to full rollout loss at h=64 once training is stable.
 
 ---
 
@@ -55,6 +81,7 @@ Instead of uniform MSE over all rollout steps, weight later timesteps more heavi
 - Exponential: `w_t = exp(α·t/T)` with α~1-2 → stronger tail emphasis
 - Implementation: compute per-step MSE (keep `reduction='none'`), apply weights, sum/mean. Weights tensor of shape `[1, T, 1, 1]` broadcasts against `[B, T, N, 1]`. One-line change in the loss computation.
 - Note: changes loss scale so may need lr adjustment; log both weighted and unweighted loss to wandb to track.
+- **Combine with multi-step rollout loss**: tail-weighting is most meaningful when the tail steps are computed autoregressively (compounding error), not teacher-forced.
 
 ---
 
@@ -94,8 +121,26 @@ Once the model is fully trained and evaluated, re-run a few final epochs with th
 
 ## Architecture
 
+### ⭐ Replace GATv2CrossTypeMP with StaticDynamicEdgeMP + richer edge features for cross-type edges — TOP ARCHITECTURE PRIORITY
+**Finding**: The best-performing submission (`Model_2_20260303_121200`, epoch 16, loss=0.028) used plain `StaticDynamicEdgeMP` for both `twoDoneD` and `oneDtwoD` edges. All subsequent runs that introduced `GATv2CrossTypeMP` (attention-based) have shown degrading validation performance at h=32+. The GATv2 attention is likely failing because the 2D→1D signal is structurally misleading for deeply incised channels (nodes 99, 85, 84, 132) where the connected 2D node sits 15–34m above the channel invert — the attention mechanism cannot overcome this with hidden states alone.
+
+**Root cause of hard nodes (99, 85, 84, 132)**: These are deeply incised channels that fill from near-dry to near-full during flood events (15–34m dynamic range). Their connected 2D nodes sit 15–34m *above* the channel invert — the 2D hidden state encodes floodplain dynamics at 42–58m elevation while the channel fills from 23–27m. The 2D→1D messages are structurally irrelevant for these nodes; the GATv2 attention mechanism cannot overcome this because it only sees hidden states, not the physical elevation gap.
+
+**Fix**: Revert both cross-type edge directions to `StaticDynamicEdgeMP`, but enrich the edge feature set so the MLP can learn to gate messages appropriately:
+- **Inter-node distance** (Euclidean distance between 1D and 2D node positions) — encodes physical proximity of the connection
+- **`channel_2d_elev_diff`** (connected 2D elevation − 1D invert elevation) — the strongest RMSE predictor found (r=0.58); this is the critical feature that lets the `base_weight` scalar and `dynamic_gate` MLP in `StaticDynamicEdgeMP` learn to suppress 2D→1D messages when the elevation gap is large
+
+**Learned per-node suppression**: The `StaticDynamicEdgeMP` architecture is well-suited for this — its `base_weight = softplus(w^T u_e)` is a learned static coupling strength computed from edge+node static features. With `elev_diff` in the edge features, `base_weight` can learn to approach zero for large-gap connections, effectively silencing the 2D→1D message for deeply incised channels without any architectural changes beyond the edge feature. This is cleaner than a separate gating module because it's already end-to-end differentiable and tied to the physical feature.
+
+**Implementation**:
+- `src/model.py`: remove `GATv2CrossTypeMP` class; use `StaticDynamicEdgeMP` for `oneDtwoD` and `twoDoneD` in `HeteroTransportCell`
+- `src/data.py` `create_static_hetero_graph()`: add `distance` and `elev_diff` as edge features to the 1d2d edge store (both directions; negate `elev_diff` for `oneDtwoD`)
+- Update `edge_static_dims` accordingly in `get_model_config()`
+- **Requires cache invalidation and training from scratch**
+
 ### GATv2Conv for 1D→2D connections
 - [x] Added `GATv2CrossTypeMP` (4 heads) for `oneD→twoD` edges. Old `StaticDynamicEdgeMP` kept for all other edge types.
+- [ ] **Revert** — see above priority item.
 
 ### Investigate attention-based MP for 1D→1D and 2D→2D edges
 Replace `StaticDynamicEdgeMP` with GAT-style attention for the within-type edges.

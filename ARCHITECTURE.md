@@ -9,9 +9,15 @@ FloodLM is a heterogeneous graph neural network that autoregressively predicts w
 Given 10 timesteps of history (water levels + rainfall), predict the next 64 timesteps of water level at every node in the graph. This is done autoregressively: each predicted timestep becomes the input for the next.
 
 **Inputs per timestep:**
-- 1D nodes (channels): `[water_level]` — shape `[N_1d, 1]`
+- 1D nodes (channels): `[water_level, rainfall_2d, water_level_2d]` — shape `[N_1d, 3]` (rainfall and water level of each channel's connected 2D node)
 - 2D nodes (floodplain cells): `[water_level, rainfall]` — shape `[N_2d, 2]`
 - Static node/edge features: precomputed at graph construction, fixed across time
+
+**Static node features:**
+- 1D nodes (7): `position_x, position_y, depth, invert_elevation, surface_elevation, base_area, channel_2d_elev_diff`
+  - `channel_2d_elev_diff` = connected 2D cell elevation − channel invert elevation; captures how deeply incised the channel is relative to its floodplain (strong RMSE predictor, r=0.58)
+- 2D nodes (10): `position_x, position_y, area, roughness, min_elevation, elevation, curvature, flow_accumulation, aspect_sin, aspect_cos`
+  - Aspect encoded as (sin, cos) to handle circularity; aspect=-1 sentinel (flat/undefined) → (0, 0)
 
 **Outputs per timestep:**
 - `Δwater_level` at every node (1D and 2D separately), denormalized to meters
@@ -83,7 +89,7 @@ For each timestep the cell performs:
    pred[nt] = head[nt]( h_next[nt] )                        [N_nt, 1]
 ```
 
-**Hidden state dimensions:** `h_dim=96`, `msg_dim=96`, MLP hidden `=96–192` (edge-type-specific).
+**Hidden state dimensions:** `h_dim=96` (GRU hidden, kept large for temporal memory), `msg_dim=64`, MLP hidden `=64–128` (edge-type-specific).
 **Normalization:** LayerNorm on hidden state, messages, and dynamic inputs (prevents magnitude explosion across 64 rollout steps).
 
 ### Message Passing Modules
@@ -116,7 +122,7 @@ attn_out     = GATv2Conv(
                    concat       = True,
                )                                   # [N_dst, msg_dim]
 
-message[dst] = FFN( attn_out )                     # Linear(msg_dim→96)→ReLU→Linear(96→msg_dim)
+message[dst] = FFN( attn_out )                     # Linear(msg_dim→64)→ReLU→Linear(64→msg_dim)
 ```
 
 Attention is computed jointly over source and destination hidden states, allowing the model to learn which channel nodes most influence each floodplain cell. The FFN adds nonlinear expressivity that a single GATv2Conv layer lacks (GATv2Conv has no internal hidden dimension).
@@ -202,17 +208,17 @@ This prevents gradient explosion from backpropagating through 64 steps from epoc
 |-----------|-------|
 | `history_len` | 10 |
 | `forecast_len` | 64 |
-| `batch_size` | 16 |
+| `batch_size` | 24 |
 | `epochs` | 24 |
 | `lr` | 1e-3 |
 | `h_dim` | 96 |
-| `msg_dim` | 96 |
-| `hidden_dim` (1D homogeneous + cross-type edges) | 96 |
-| `hidden_dim` (2D homogeneous edges) | 192 |
+| `msg_dim` | 64 |
+| `hidden_dim` (1D homogeneous + cross-type edges) | 64 |
+| `hidden_dim` (2D homogeneous edges) | 128 |
 | `dropout` | 0.0 |
-| Total parameters | ~628K |
+| Total parameters | ~397K |
 
-Note: `hidden_dim` is edge-type-specific. 1D homogeneous edges (`oneDedge`, `oneDedgeRev`) and cross-type edges (`twoDoneD`, `oneDtwoD`) use 96 because those graphs are sparse (≤200 edges). 2D homogeneous edges use 192 because the 2D mesh has thousands of edges.
+Note: `hidden_dim` is edge-type-specific. 1D homogeneous edges (`oneDedge`, `oneDedgeRev`) and cross-type edges (`twoDoneD`, `oneDtwoD`) use 64 because those graphs are sparse (≤200 edges). 2D homogeneous edges use 128 because the 2D mesh has thousands of edges. `h_dim` is kept at 96 (larger than `msg_dim`) because the GRU hidden state is the primary temporal memory — it needs more capacity than the per-step message aggregation.
 
 ---
 

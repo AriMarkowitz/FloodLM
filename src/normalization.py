@@ -94,10 +94,11 @@ class FeatureNormalizer:
             vals = df[col].astype(float).values
             skew = pd.Series(vals).skew()
             use_log = abs(skew) > skew_threshold
-            
-            if use_log and self.verbose:
+
+            if use_log:
+                if self.verbose:
+                    print(f"[INFO] Static {col}: skew={skew:.2f} → log transform")
                 vals_transformed = np.log1p(np.abs(vals)) * np.sign(vals)
-                print(f"[INFO] Static {col}: skew={skew:.2f} → log transform")
             else:
                 vals_transformed = vals
             
