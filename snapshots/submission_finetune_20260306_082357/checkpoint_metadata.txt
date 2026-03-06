@@ -1,0 +1,3 @@
+Model_1_best_h64.pt: epoch=28, loss=0.000055, model_id=Model_1
+Model_1_best.pt: epoch=28, loss=0.000055, model_id=Model_1
+Model_2_best.pt: epoch=24, loss=0.024602, model_id=Model_2
