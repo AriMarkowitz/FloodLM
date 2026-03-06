@@ -11,9 +11,10 @@
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
 # Usage:
-#   sbatch slurm/submit_slurm_model2.sh
+#   sbatch slurm/submit_slurm_model2.sh            # train from scratch (new architecture)
+#   sbatch slurm/submit_slurm_model2.sh resume     # resume from checkpoints/latest
 #
-# Trains Model_2 only, resuming from checkpoints/latest if available.
+# Trains Model_2 only. Defaults to from-scratch (required after architecture changes).
 # Applies stability fixes: gradient clipping + LR reduction at curriculum jumps.
 #
 
@@ -45,10 +46,17 @@ log_info() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO]  $1"; }
 log_error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2; }
 
 log_info "═════════════════════════════════════════════════════════════════"
-log_info "Training Model_2 — resuming from latest checkpoint"
+RESUME_ARG="${1:-}"
+if [ "${RESUME_ARG}" = "resume" ]; then
+    RESUME_FLAG="--resume checkpoints/latest"
+    log_info "Training Model_2 — resuming from latest checkpoint"
+else
+    RESUME_FLAG=""
+    log_info "Training Model_2 — from scratch (no resume)"
+fi
 log_info "═════════════════════════════════════════════════════════════════"
 
-CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py --resume checkpoints/latest --mixed-precision"
+CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py ${RESUME_FLAG} --mixed-precision"
 
 log_info "Command: $CMD"
 log_info ""

@@ -289,8 +289,10 @@ class HeteroTransportCell(nn.Module):
         # ------------------------------------------------------------
         conv_dict = {}
         for (src, rel, dst) in edge_types:
-            if rel in ("oneDtwoD", "twoDoneD"):
-                # GATv2Conv for cross-type edges (1D↔2D): attention over node hidden states
+            e_dim = edge_static_dims[(src, rel, dst)]
+            if rel in ("oneDtwoD", "twoDoneD") and e_dim == 1:
+                # GATv2Conv for cross-type edges when no rich edge features are available
+                # (Model_1: placeholder dim=1). Attention over node hidden states only.
                 mp = GATv2CrossTypeMP(
                     h_dim=h_dim,
                     msg_dim=msg_dim,
@@ -299,11 +301,15 @@ class HeteroTransportCell(nn.Module):
                     dropout=dropout,
                 )
             else:
+                # StaticDynamicEdgeMP for all homogeneous edges, and for cross-type edges
+                # when richer edge features are present (Model_2: [distance, elev_diff]).
+                # base_weight can learn to suppress deeply-incised-channel connections
+                # from the elev_diff feature alone.
                 mp = StaticDynamicEdgeMP(
                     h_dim=h_dim,
                     node_static_dim_src=node_static_dims[src],
                     node_static_dim_dst=node_static_dims[dst],
-                    edge_static_dim=edge_static_dims[(src, rel, dst)],
+                    edge_static_dim=e_dim,
                     msg_dim=msg_dim,
                     hidden_dim=_hid(rel),
                     dropout=dropout,
@@ -381,7 +387,8 @@ class HeteroTransportCell(nn.Module):
         for (src_type, rel, dst_type) in self.edge_types:
             key = f"{src_type}_{rel}_{dst_type}"
             mp = self.mp_modules[key]
-            if rel in ("oneDtwoD", "twoDoneD"):
+            if isinstance(mp, GATv2CrossTypeMP):
+                # GATv2CrossTypeMP only uses hidden states, not edge/node static features
                 mp._set_context(
                     h_src=h_t[src_type],
                     h_dst=h_t[dst_type],

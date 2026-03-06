@@ -293,8 +293,11 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             'oneDedgeRev': 64,
             'twoDedge':    128,
             'twoDedgeRev': 128,
-            'twoDoneD':    64,
-            'oneDtwoD':    64,
+            # Cross-type edges: Model_2 uses StaticDynamicEdgeMP with only ~170 edges
+            # and 2 edge features — hidden_dim=32 is sufficient.
+            # Model_1 uses GATv2CrossTypeMP which ignores hidden_dim entirely.
+            'twoDoneD':    32,
+            'oneDtwoD':    32,
         },
     })
     model = FloodAutoregressiveHeteroModel(**model_config)
@@ -402,6 +405,18 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     _rain_1d_index = _static_graph_cpu.rain_1d_index.to(device) if hasattr(_static_graph_cpu, 'rain_1d_index') else None
     print(f"[INFO] Batched graphs ready.")
 
+    # Node 197 loss mask (Model_2 only): node 197 is a confirmed data artifact
+    # (depth=-1, base_area=0, physically impossible geometry). Its error is irreducible
+    # from available features and injects misleading gradients. Masking only affects
+    # training loss; predictions are still generated at inference.
+    N_1d = _static_graph_cpu["oneD"].num_nodes
+    if SELECTED_MODEL == "Model_2":
+        _loss_mask_1d = torch.ones(N_1d, device=device)
+        _loss_mask_1d[197] = 0.0
+        print(f"[INFO] Model_2: node 197 masked from 1D training loss.")
+    else:
+        _loss_mask_1d = None
+
     print(f"\n[INFO] Training configuration:")
     print(f"  Learning rate: {CONFIG['lr']}")
     print(f"  Epochs: {CONFIG['epochs']}")
@@ -497,7 +512,13 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
                 # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
                 # Slice targets to match the sampled rollout_steps
-                loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
+                if _loss_mask_1d is not None:
+                    # Per-node MSE for 1D, mask out node 197, then average over valid nodes
+                    # predictions['oneD']: [B, T, N_1d, 1]; y_future_1d: [B, T, N_1d, 1]
+                    sq_err_1d = (predictions['oneD'] - y_future_1d[:, :rollout_steps]) ** 2
+                    loss_1d = (sq_err_1d.mean(dim=(0, 1, 3)) * _loss_mask_1d).sum() / _loss_mask_1d.sum()
+                else:
+                    loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
                 loss_2d = criterion(predictions['twoD'], y_future_2d[:, :rollout_steps])
                 loss = (loss_1d + loss_2d) / 2
 

@@ -331,14 +331,62 @@ def create_static_hetero_graph(
     data["twoD", "twoDedge", "twoD"].edge_attr_static = e2_fwd
     data["twoD", "twoDedgeRev", "twoD"].edge_attr_static = _reverse_edge_attr(e2_fwd, edge2_cols)
 
-    # Cross-type edges have no directional features (placeholder dim=1)
+    # Cross-type edge features.
+    # For Model_2: compute [distance, elev_diff] where
+    #   distance  = Euclidean distance between 1D and 2D node positions (z-scored)
+    #   elev_diff = 2D_elevation - 1D_invert_elevation (z-scored)
+    #               positive -> 2D node sits above channel invert (deeply incised)
+    #               StaticDynamicEdgeMP can learn to suppress these via base_weight
+    # For twoD->oneD: [distance,  elev_diff]
+    # For oneD->twoD: [distance, -elev_diff]  (sign flip -- directional)
+    # For Model_1 (no richer features needed): single zero placeholder (dim=1)
     n_cross_edges = len(edges1d2d)
-    data["twoD", "twoDoneD", "oneD"].edge_attr_static = torch.zeros(
-        (n_cross_edges, 1), dtype=torch.float32
+    node_1d_col_c = next((c for c in ["node_1d", "to_node", "target", "dst", "to"] if c in edges1d2d.columns), None)
+    node_2d_col_c = next((c for c in ["node_2d", "from_node", "source", "src", "from"] if c in edges1d2d.columns), None)
+
+    from data_config import SELECTED_MODEL as _SEL_MODEL
+    use_rich_cross_feats = (
+        _SEL_MODEL == "Model_2"
+        and node_1d_col_c is not None and node_2d_col_c is not None
+        and "invert_elevation" in static_1d_norm.columns
+        and "elevation" in static_2d_norm.columns
     )
-    data["oneD", "oneDtwoD", "twoD"].edge_attr_static = torch.zeros(
-        (n_cross_edges, 1), dtype=torch.float32
-    )
+
+    if use_rich_cross_feats:
+        import numpy as np
+        idx_1d = static_1d_norm["node_idx"].values
+        idx_2d = static_2d_norm["node_idx"].values
+        x1d = static_1d_norm["position_x"].values
+        y1d = static_1d_norm["position_y"].values
+        inv_elev_1d = static_1d_norm["invert_elevation"].values
+        x2d = static_2d_norm["position_x"].values
+        y2d = static_2d_norm["position_y"].values
+        elev_2d = static_2d_norm["elevation"].values
+
+        map_1d = {int(v): i for i, v in enumerate(idx_1d)}
+        map_2d = {int(v): i for i, v in enumerate(idx_2d)}
+
+        distances, elev_diffs = [], []
+        for _, row in edges1d2d.iterrows():
+            i1 = map_1d[int(row[node_1d_col_c])]
+            i2 = map_2d[int(row[node_2d_col_c])]
+            dist = float(((x1d[i1] - x2d[i2])**2 + (y1d[i1] - y2d[i2])**2) ** 0.5)
+            distances.append(dist)
+            elev_diffs.append(float(elev_2d[i2]) - float(inv_elev_1d[i1]))
+
+        dist_arr = np.array(distances, dtype=np.float32)
+        diff_arr = np.array(elev_diffs, dtype=np.float32)
+        dist_arr = (dist_arr - dist_arr.mean()) / (dist_arr.std() + 1e-8)
+        diff_arr = (diff_arr - diff_arr.mean()) / (diff_arr.std() + 1e-8)
+
+        cross_fwd = torch.stack([torch.from_numpy(dist_arr), torch.from_numpy(diff_arr)], dim=1)
+        cross_rev = torch.stack([torch.from_numpy(dist_arr), -torch.from_numpy(diff_arr)], dim=1)
+    else:
+        cross_fwd = torch.zeros((n_cross_edges, 1), dtype=torch.float32)
+        cross_rev = torch.zeros((n_cross_edges, 1), dtype=torch.float32)
+
+    data["twoD", "twoDoneD", "oneD"].edge_attr_static = cross_fwd
+    data["oneD", "oneDtwoD", "twoD"].edge_attr_static = cross_rev
 
     # Build rain_1d_index: [N_1d] LongTensor mapping each 1D node -> its connected 2D node.
     # Used in make_x_dyn to gather 2D rainfall as a dynamic input for each 1D node.
@@ -1237,13 +1285,17 @@ def get_model_config():
     }
     
     # Static edge feature dimensions
+    # Cross-type edges: Model_2 uses [distance, elev_diff] (dim=2);
+    # Model_1 uses a single zero placeholder (dim=1).
+    from data_config import SELECTED_MODEL as _SEL_MODEL
+    _cross_dim = 2 if _SEL_MODEL == "Model_2" else 1
     edge_static_dims = {
         ("oneD", "oneDedge",    "oneD"): len(edge1_cols),
         ("oneD", "oneDedgeRev", "oneD"): len(edge1_cols),  # same dim, signs flipped at graph build
         ("twoD", "twoDedge",    "twoD"): len(edge2_cols),
         ("twoD", "twoDedgeRev", "twoD"): len(edge2_cols),
-        ("twoD", "twoDoneD",    "oneD"): 1,
-        ("oneD", "oneDtwoD",    "twoD"): 1,
+        ("twoD", "twoDoneD",    "oneD"): _cross_dim,
+        ("oneD", "oneDtwoD",    "twoD"): _cross_dim,
     }
     
     return {
