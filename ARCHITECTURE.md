@@ -39,14 +39,18 @@ The computational graph is a static `HeteroData` object with two node types and 
 
 ### Edge Types
 
-| Edge | Direction | Module | Purpose |
-|------|-----------|--------|---------|
-| `oneDedge` | 1D → 1D | `StaticDynamicEdgeMP` | Downstream channel flow |
-| `oneDedgeRev` | 1D ← 1D | `StaticDynamicEdgeMP` | Backwater / reverse flow |
-| `twoDedge` | 2D → 2D | `StaticDynamicEdgeMP` | Floodplain propagation |
-| `twoDedgeRev` | 2D ← 2D | `StaticDynamicEdgeMP` | Bidirectional inundation |
-| `twoDoneD` | 2D → 1D | `StaticDynamicEdgeMP` | Drainage into channels |
-| `oneDtwoD` | 1D → 2D | `GATv2CrossTypeMP` | Channel overflow onto floodplain |
+| Edge | Direction | Module (Model_1) | Module (Model_2) | Purpose |
+|------|-----------|-----------------|-----------------|---------|
+| `oneDedge` | 1D → 1D | `StaticDynamicEdgeMP` | `StaticDynamicEdgeMP` | Downstream channel flow |
+| `oneDedgeRev` | 1D ← 1D | `StaticDynamicEdgeMP` | `StaticDynamicEdgeMP` | Backwater / reverse flow |
+| `twoDedge` | 2D → 2D | `StaticDynamicEdgeMP` | `StaticDynamicEdgeMP` | Floodplain propagation |
+| `twoDedgeRev` | 2D ← 2D | `StaticDynamicEdgeMP` | `StaticDynamicEdgeMP` | Bidirectional inundation |
+| `twoDoneD` | 2D → 1D | `GATv2CrossTypeMP` | `StaticDynamicEdgeMP` | Drainage into channels |
+| `oneDtwoD` | 1D → 2D | `GATv2CrossTypeMP` | `StaticDynamicEdgeMP` | Channel overflow onto floodplain |
+
+**Cross-type edge features:**
+- **Model_1**: zero placeholder (dim=1) — GATv2 attention learns purely from hidden states
+- **Model_2**: `[distance, elev_diff]` (dim=2, z-scored) — `elev_diff = 2D_elevation − 1D_invert_elevation`; positive = deeply incised channel. For `oneDtwoD` the sign is flipped (directional). Allows `StaticDynamicEdgeMP.base_weight` to learn static suppression of deeply incised connections.
 
 Directional edge features (`relative_position_x`, `relative_position_y`, `slope`) are negated for reverse edges at graph construction time, encoding physical asymmetry.
 
@@ -109,7 +113,7 @@ message   = (base_wt × dyn_gate) × payload
 
 The `softplus` ensures positive coupling; the `sigmoid` gate lets the model suppress messages when the hydraulic system is inactive.
 
-#### `GATv2CrossTypeMP` (1D → 2D edge)
+#### `GATv2CrossTypeMP` (cross-type edges, Model_1 only)
 
 Wraps `torch_geometric.nn.GATv2Conv` with 4 attention heads, followed by a two-layer feed-forward network (FFN) for nonlinear capacity:
 
@@ -125,7 +129,9 @@ attn_out     = GATv2Conv(
 message[dst] = FFN( attn_out )                     # Linear(msg_dim→64)→ReLU→Linear(64→msg_dim)
 ```
 
-Attention is computed jointly over source and destination hidden states, allowing the model to learn which channel nodes most influence each floodplain cell. The FFN adds nonlinear expressivity that a single GATv2Conv layer lacks (GATv2Conv has no internal hidden dimension).
+Attention is computed jointly over source and destination hidden states, allowing the model to learn which channel nodes most influence each floodplain cell. The FFN adds nonlinear expressivity that a single GATv2Conv layer lacks.
+
+**Model_2 uses `StaticDynamicEdgeMP` for cross-type edges instead**, because GATv2 cannot suppress deeply incised channels (15–34m elevation gap) using only hidden states. The `[distance, elev_diff]` edge features allow `base_weight` to learn static suppression directly from geometry.
 
 ---
 
@@ -167,37 +173,39 @@ This down-weights node types whose predictions are naturally high-variance relat
 
 ### Curriculum Learning
 
-Training uses an exponential horizon curriculum. `max_h` doubles every `_stage_len` epochs:
+Training gradually increases the rollout horizon to prevent gradient explosion from backpropagating through 64 steps from epoch 1.
 
-```python
-_stage_len = 3 if Model_2 else 2
-max_h = min(64, 2 ** ((epoch - 1) // _stage_len))
-```
+**Model_1** uses a power-of-2 schedule (2 epochs per stage):
 
-| Epochs | Model_1 max_h | Model_2 max_h |
-|--------|--------------|--------------|
-| 1–2 | 1 | — |
-| 1–3 | — | 1 |
-| 3–4 | 2 | — |
-| 4–6 | — | 2 |
-| 5–6 | 4 | — |
-| 7–9 | — | 4 |
-| 7–8 | 8 | — |
-| 10–12 | — | 8 |
-| 9–10 | 16 | — |
-| 13–15 | — | 16 |
-| 11–12 | 32 | — |
-| 16–18 | — | 32 |
-| 13–24 | 64 | — |
-| 19–24 | — | 64 |
+| Epochs | max_h |
+|--------|-------|
+| 1–2 | 1 |
+| 3–4 | 2 |
+| 5–6 | 4 |
+| 7–8 | 8 |
+| 9–10 | 16 |
+| 11–12 | 32 |
+| 13+ | 64 |
 
-This prevents gradient explosion from backpropagating through 64 steps from epoch 1.
+**Model_2** uses a custom schedule with intermediary steps at h=24 and h=48 to smooth the large h=16→32→64 jumps. Earlier stages get 4 epochs; later stages get 3; h=64 gets 6:
+
+| Epochs | max_h |
+|--------|-------|
+| 1–4 | 1 |
+| 5–8 | 2 |
+| 9–12 | 4 |
+| 13–16 | 8 |
+| 17–19 | 16 |
+| 20–22 | 24 |
+| 23–25 | 32 |
+| 26–28 | 48 |
+| 29–34 | 64 |
 
 ### Stability Measures
 
 - **Gradient clipping**: `clip_grad_norm_(params, max_norm=1.0)` every step
-- **LR reduction at curriculum jumps (Model_2 only)**: LR × 0.3 at h=8, 32, 64
-  - Schedule: `1e-3 → 3e-4 → 9e-5 → 2.7e-5`
+- **LR reduction at curriculum jumps (Model_2 only)**: LR × 0.3 at h=8, 24, 32, 48, 64
+  - Schedule: `1e-3 → 3e-4 → 9e-5 → 2.7e-5 → 8.1e-6 → 2.4e-6`
 - **Mixed precision**: `torch.amp.autocast` + `GradScaler` (via `--mixed-precision` flag)
 - **Gradient checkpointing**: auto-enabled with `--mixed-precision`; recomputes activations during backward to avoid storing the full 64-step rollout graph in memory
 - **Early stopping**: patience=5 epochs, active only at `max_h=64`
@@ -209,16 +217,16 @@ This prevents gradient explosion from backpropagating through 64 steps from epoc
 | `history_len` | 10 |
 | `forecast_len` | 64 |
 | `batch_size` | 24 |
-| `epochs` | 24 |
+| `epochs` | Model_1: ~16+; Model_2: 34 |
 | `lr` | 1e-3 |
 | `h_dim` | 96 |
 | `msg_dim` | 64 |
-| `hidden_dim` (1D homogeneous + cross-type edges) | 64 |
+| `hidden_dim` (1D homogeneous edges) | 64 |
 | `hidden_dim` (2D homogeneous edges) | 128 |
+| `hidden_dim` (cross-type edges) | 32 |
 | `dropout` | 0.0 |
-| Total parameters | ~397K |
 
-Note: `hidden_dim` is edge-type-specific. 1D homogeneous edges (`oneDedge`, `oneDedgeRev`) and cross-type edges (`twoDoneD`, `oneDtwoD`) use 64 because those graphs are sparse (≤200 edges). 2D homogeneous edges use 128 because the 2D mesh has thousands of edges. `h_dim` is kept at 96 (larger than `msg_dim`) because the GRU hidden state is the primary temporal memory — it needs more capacity than the per-step message aggregation.
+Note: `hidden_dim` is edge-type-specific. Cross-type edges (`twoDoneD`, `oneDtwoD`) use 32 because there are only ~170 connections — a smaller MLP is sufficient and avoids overfitting. 1D homogeneous edges use 64; 2D homogeneous edges use 128 because the 2D mesh has thousands of edges. `h_dim` is kept at 96 (larger than `msg_dim`) because the GRU hidden state is the primary temporal memory.
 
 ---
 
