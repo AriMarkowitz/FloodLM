@@ -44,9 +44,25 @@ def load_checkpoint(checkpoint_path, device):
     print(f"[INFO] Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Get model config
+    # Get model config (graph topology)
     model_config = get_model_config()
-    
+
+    # Merge architecture hyperparams from checkpoint (h_dim, msg_dim, hidden_dim).
+    # Fallback for old checkpoints that predate model_arch_config serialization.
+    arch_config = checkpoint.get('model_arch_config', {
+        'h_dim': 96,
+        'msg_dim': 64,
+        'hidden_dim': {
+            'oneDedge':    64,
+            'oneDedgeRev': 64,
+            'twoDedge':    128,
+            'twoDedgeRev': 128,
+            'twoDoneD':    64,
+            'oneDtwoD':    64,
+        },
+    })
+    model_config.update(arch_config)
+
     # Initialize model
     model = FloodAutoregressiveHeteroModel(**model_config)
     model.load_state_dict(checkpoint['model_state'])

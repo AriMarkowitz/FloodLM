@@ -275,7 +275,6 @@ class HeteroTransportCell(nn.Module):
         self.edge_types = edge_types
         self.h_dim = h_dim
         self.msg_dim = msg_dim
-        self._hidden_dim = hidden_dim  # stored for checkpoint serialization
 
         # Resolve hidden_dim per edge relation
         if isinstance(hidden_dim, dict):

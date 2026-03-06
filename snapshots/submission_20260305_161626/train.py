@@ -110,11 +110,6 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_
         'epoch': epoch,
         'model_state': model.state_dict(),
         'config': config,
-        'model_arch_config': {
-            'h_dim': model.h_dim,
-            'msg_dim': model.cell.msg_dim,
-            'hidden_dim': model.cell._hidden_dim,
-        },
         'loss': loss,
         'model_id': model_id,
         'global_step': global_step,

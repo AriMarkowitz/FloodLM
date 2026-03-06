@@ -10,10 +10,10 @@
 #SBATCH --output=/users/admarkowitz/FloodLM/logs/slurm_%j.out
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
-# Fine-tune both models on train+val data at h=64, then infer and submit to Kaggle.
+# Fine-tune models on train+val data at h=64, then infer and submit to Kaggle.
 #
 # Usage:
-#   sbatch slurm/submit_finetune_submit.sh
+#   sbatch slurm/submit_finetune_submit.sh [Model_1|Model_2|all]
 #
 # Tune these env vars before submitting if desired:
 #   FINETUNE_EPOCHS (default: 4)  — number of h=64 fine-tune epochs per model
@@ -43,7 +43,8 @@ echo "FINETUNE_LR:     ${FINETUNE_LR}"
 echo "KAGGLE_MESSAGE:  ${KAGGLE_MESSAGE}"
 echo ""
 
-bash run/pipeline_finetune_submit.sh auto all
+MODEL_SELECTION="${1:-all}"
+bash run/pipeline_finetune_submit.sh auto "${MODEL_SELECTION}"
 
 echo ""
 echo "Finished: $(date)"

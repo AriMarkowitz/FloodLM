@@ -1,0 +1,2 @@
+Model_1_best.pt: epoch=24, loss=0.000139, model_id=Model_1
+Model_2_best.pt: epoch=24, loss=0.024602, model_id=Model_2
