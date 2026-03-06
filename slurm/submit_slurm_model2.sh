@@ -11,10 +11,10 @@
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
 # Usage:
-#   sbatch slurm/submit_slurm_model2.sh            # train from scratch (new architecture)
-#   sbatch slurm/submit_slurm_model2.sh resume     # resume from checkpoints/latest
+#   sbatch slurm/submit_slurm_model2.sh            # resume from checkpoints/latest (default)
+#   sbatch slurm/submit_slurm_model2.sh scratch    # train from scratch (use after arch changes)
 #
-# Trains Model_2 only. Defaults to from-scratch (required after architecture changes).
+# Trains Model_2 only. Defaults to resume.
 # Applies stability fixes: gradient clipping + LR reduction at curriculum jumps.
 #
 
@@ -47,12 +47,12 @@ log_error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2; }
 
 log_info "═════════════════════════════════════════════════════════════════"
 RESUME_ARG="${1:-}"
-if [ "${RESUME_ARG}" = "resume" ]; then
-    RESUME_FLAG="--resume checkpoints/latest"
-    log_info "Training Model_2 — resuming from latest checkpoint"
-else
+if [ "${RESUME_ARG}" = "scratch" ]; then
     RESUME_FLAG=""
     log_info "Training Model_2 — from scratch (no resume)"
+else
+    RESUME_FLAG="--resume checkpoints/latest"
+    log_info "Training Model_2 — resuming from latest checkpoint"
 fi
 log_info "═════════════════════════════════════════════════════════════════"
 

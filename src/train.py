@@ -34,7 +34,7 @@ CONFIG = {
     'history_len': 10,
     'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
     'batch_size': 24,
-    'epochs': 24,                # Model_2: 3 epochs per stage (24 total); Model_1: 2 per stage (reduce manually if needed)
+    'epochs': 34,                # Model_2: 4 epochs for h=1-8, 3 for h=16-48, 6 for h=64 (34 total); Model_1: 2 per stage
     'lr': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'save_dir': 'checkpoints',
@@ -405,17 +405,9 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     _rain_1d_index = _static_graph_cpu.rain_1d_index.to(device) if hasattr(_static_graph_cpu, 'rain_1d_index') else None
     print(f"[INFO] Batched graphs ready.")
 
-    # Node 197 loss mask (Model_2 only): node 197 is a confirmed data artifact
-    # (depth=-1, base_area=0, physically impossible geometry). Its error is irreducible
-    # from available features and injects misleading gradients. Masking only affects
-    # training loss; predictions are still generated at inference.
-    N_1d = _static_graph_cpu["oneD"].num_nodes
-    if SELECTED_MODEL == "Model_2":
-        _loss_mask_1d = torch.ones(N_1d, device=device)
-        _loss_mask_1d[197] = 0.0
-        print(f"[INFO] Model_2: node 197 masked from 1D training loss.")
-    else:
-        _loss_mask_1d = None
+    # No per-node loss mask: masking node 197 from training loss left it undertrained
+    # at inference → outlier prediction that hurts Kaggle RMSE more than noisy gradients.
+    _loss_mask_1d = None
 
     print(f"\n[INFO] Training configuration:")
     print(f"  Learning rate: {CONFIG['lr']}")
@@ -449,19 +441,27 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         num_batches = 0
         batch_start_time = time.time()
 
-        # Curriculum: doubles every 3 epochs for Model_2 (slower convergence), 2 for Model_1
-        # Model_2: epoch 1-3→1, 4-6→2, 7-9→4, 10-12→8, 13-15→16, 16-18→32, 19-24→64
-        # Model_1: epoch 1-2→1, 3-4→2, ..., 13-14→64 (set epochs=16 manually)
-        _stage_len = 3 if SELECTED_MODEL == 'Model_2' else 2
-        max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // _stage_len))
+        # Curriculum schedule
+        # Model_1: doubles every 2 epochs (power-of-2); epoch 1-2→1, 3-4→2, ..., 13+→64
+        # Model_2: variable stage lengths — 4 epochs for early small horizons (h=1-8),
+        #   3 epochs for the harder intermediary steps (h=16-48), 6 epochs at h=64:
+        #   1-4→1, 5-8→2, 9-12→4, 13-16→8, 17-19→16, 20-22→24, 23-25→32, 26-28→48, 29-34→64
+        if SELECTED_MODEL == 'Model_2':
+            _m2_boundaries = [4, 8, 12, 16, 19, 22, 25, 28, 34]  # last epoch of each stage
+            _m2_horizons   = [1, 2,  4,  8, 16, 24, 32, 48, 64]
+            _stage_idx = next(i for i, b in enumerate(_m2_boundaries) if epoch <= b)
+            max_h = _m2_horizons[_stage_idx]
+        else:
+            _stage_len = 2
+            max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // _stage_len))
 
         # Epoch boundary marker — visible as a vertical annotation in wandb
         wandb.log({'epoch': epoch, 'curriculum/max_h': max_h}, step=global_step)
 
-        # Model_2 only: drop LR by 3x at the three problematic curriculum jumps (h=8, 32, 64).
+        # Model_2 only: drop LR by 3x at the larger curriculum jumps.
         # Skipping the early small-horizon jumps preserves learning capacity at h=64.
         # Model_1 gradients are well-behaved so this is skipped there.
-        if SELECTED_MODEL == 'Model_2' and prev_max_h is not None and max_h != prev_max_h and max_h in {8, 32, 64}:
+        if SELECTED_MODEL == 'Model_2' and prev_max_h is not None and max_h != prev_max_h and max_h in {8, 24, 32, 48, 64}:
             for g in optimizer.param_groups:
                 g['lr'] *= 0.3
             new_lr = optimizer.param_groups[0]['lr']
@@ -469,7 +469,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             wandb.log({'train/lr': new_lr}, step=global_step)
         prev_max_h = max_h
 
-        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h}, stage_len={_stage_len} (all batches train at h={max_h})")
+        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h} (all batches train at h={max_h})")
 
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
