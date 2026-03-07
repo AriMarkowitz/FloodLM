@@ -358,6 +358,11 @@ class HeteroTransportCell(nn.Module):
         self.dyn_norm = nn.ModuleDict({
             nt: nn.LayerNorm(msg_dim) for nt in node_types
         })
+        # Residual refinement projection for rounds 1+ (msg_dim -> h_dim).
+        # Used instead of GRU on extra MP rounds — pure spatial refinement, no temporal gate.
+        self.refine_proj = nn.ModuleDict({
+            nt: nn.Linear(msg_dim, h_dim) for nt in node_types
+        })
 
     def forward(
         self,
@@ -395,9 +400,8 @@ class HeteroTransportCell(nn.Module):
         edge_index_dict = {et: data[et].edge_index for et in self.edge_types}
         h = {nt: h_t[nt] for nt in self.node_types}  # mutable hidden states across rounds
 
-        # Pre-compute dynamic embeddings (same value every round, only used on round 0)
+        # Pre-compute dynamic embeddings (injected on round 0 only)
         dyn_emb = {nt: self.dyn_norm[nt](self.dyn_proj[nt](x_dyn_t[nt])) for nt in self.node_types}
-        zero_dyn = {nt: torch.zeros_like(dyn_emb[nt]) for nt in self.node_types}
 
         for round_idx in range(self.n_mp_rounds):
             # Set context for all MP modules using current hidden states
@@ -424,13 +428,16 @@ class HeteroTransportCell(nn.Module):
                 out = mp(h[src_type], edge_index_dict[(src_type, rel, dst_type)])
                 msgs[dst_type] = msgs[dst_type] + out
 
-            # GRU update for all node types; dynamics only on round 0
-            _dyn = dyn_emb if round_idx == 0 else zero_dyn
             h_next = {}
             for nt in self.node_types:
                 msg_emb = self.msg_norm[nt](msgs[nt])
-                upd_in = torch.cat([_dyn[nt], msg_emb], dim=-1)
-                h_next[nt] = self.h_norm[nt](self.update[nt](upd_in, h[nt]))
+                if round_idx == 0:
+                    # Round 0: temporal GRU update — gates dynamics + messages
+                    upd_in = torch.cat([dyn_emb[nt], msg_emb], dim=-1)
+                    h_next[nt] = self.h_norm[nt](self.update[nt](upd_in, h[nt]))
+                else:
+                    # Rounds 1+: pure spatial refinement — residual add, no temporal gate
+                    h_next[nt] = self.h_norm[nt](h[nt] + self.refine_proj[nt](msg_emb))
             h = h_next
 
             # Safety check on first round only

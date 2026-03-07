@@ -6,12 +6,12 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/users/admarkowitz/FloodLM/logs/slurm_%j.out
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
-# Quick h=2 probe for Model_2 architecture iteration.
-# Always trains from scratch. Runs 4 epochs at max-h=2.
+# Quick probe for Model_2 architecture iteration.
+# Always trains from scratch. Runs 8 epochs (epochs 1-4 at h=1, epochs 5-8 at h=2 per curriculum).
 # Does NOT touch checkpoints/latest/ — safe to run without clobbering the best model.
 # Compare val loss after 4 epochs vs baseline to decide if arch is worth full training.
 #
@@ -29,7 +29,7 @@ cd /users/admarkowitz/FloodLM
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║          FloodLM Model_2 Architecture Probe (h=2, 4 epochs)       ║"
+echo "║       FloodLM Model_2 Architecture Probe (h=1x4 + h=2x4 epochs)  ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Job ID:        $SLURM_JOB_ID"
@@ -45,9 +45,9 @@ PYTHON="python3"
 log_info()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO]  $1"; }
 log_error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2; }
 
-log_info "Training Model_2 from scratch — h=2, 4 epochs, no-mirror-latest"
+log_info "Training Model_2 from scratch — 8 epochs (h=1 x4, h=2 x4 per curriculum), no-mirror-latest"
 
-CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py --mixed-precision --epochs 4 --max-h 2 --learning-rate 1e-3 --no-mirror-latest"
+CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py --mixed-precision --epochs 8 --learning-rate 1e-3 --no-mirror-latest"
 
 log_info "Command: $CMD"
 log_info ""
