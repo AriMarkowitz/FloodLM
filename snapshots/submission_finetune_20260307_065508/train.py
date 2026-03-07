@@ -116,7 +116,6 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_
             'h_dim': model.h_dim,
             'msg_dim': model.cell.msg_dim,
             'hidden_dim': model.cell._hidden_dim,
-            'n_mp_rounds': model.cell.n_mp_rounds,
         },
         'loss': loss,
         'model_id': model_id,
@@ -303,7 +302,6 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             'twoDoneD':    32,
             'oneDtwoD':    32,
         },
-        'n_mp_rounds': 3,
     })
     model = FloodAutoregressiveHeteroModel(**model_config)
     model = model.to(device)
@@ -468,7 +466,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         if SELECTED_MODEL == 'Model_2':
             _m2_boundaries = [4, 8, 12, 16, 19, 22, 25, 28, 34]  # last epoch of each stage
             _m2_horizons   = [1, 2,  4,  8, 16, 24, 32, 48, 64]
-            _stage_idx = next((i for i, b in enumerate(_m2_boundaries) if epoch <= b), len(_m2_boundaries) - 1)
+            _stage_idx = next(i for i, b in enumerate(_m2_boundaries) if epoch <= b)
             max_h = _m2_horizons[_stage_idx]
         else:
             _stage_len = 2

@@ -75,6 +75,26 @@ Instead of computing loss only at the final predicted timestep (or uniformly acr
 
 ---
 
+### Annealed timestep-weighted loss as horizon curriculum replacement
+Instead of advancing `max_h` epoch-by-epoch, train at h=64 from epoch 1 but front-load the loss onto early timesteps and anneal toward uniform weighting over training. This eliminates gradient shocks from horizon jumps while still giving the model a structured learning signal.
+
+**Schedule**: exponential decay weights `w_t = exp(-λ · t/T)`, annealed linearly to uniform (`λ=0`) over `anneal_epochs`:
+```python
+lam = lam_max * max(0.0, 1.0 - (epoch - 1) / anneal_epochs)
+t_idx = torch.arange(T, device=device).float()
+w_t = torch.exp(-lam * t_idx / T)          # [T]
+w_t = w_t / w_t.sum()                       # normalize to sum=1
+# Apply: sq_err [B,T,N,1] → weighted mean
+loss = (sq_err.mean(dim=(0,2,3)) * w_t).sum()
+```
+- **`lam_max=3`**: at epoch 1, t=1 gets ~e^0=1 vs t=64 gets ~e^{-3}≈0.05 (20× front-loaded)
+- **`anneal_epochs=15`**: fully uniform by epoch 16; remaining epochs see full h=64 loss
+- **Advantages over horizon curriculum**: no gradient shock from horizon jumps; model always sees h=64 signal and learns global structure from epoch 1; smoother optimization landscape
+- **Suggested total epochs**: ~20 (15 anneal + 5 uniform at h=64 with early stopping)
+- **LR**: no need for LR reductions at curriculum jumps — single LR schedule (e.g. cosine decay or fixed 1e-3)
+- Log `curriculum/lambda` and both weighted + unweighted loss to wandb to track annealing progress
+- **Cost**: every epoch runs the full h=64 rollout (vs h=1 in early curriculum stages) — ~10-15× more compute per early epoch. Mitigate with truncated BPTT (detach every K=8 steps) or accept the cost if total epoch count is lower (20 vs 34)
+
 ### Timestep-weighted loss — penalize tail drift
 Instead of uniform MSE over all rollout steps, weight later timesteps more heavily so the model prioritizes not drifting at the end of the rollout.
 - Simple linear: `w_t = t / T` → tail gets T× more weight than step 1

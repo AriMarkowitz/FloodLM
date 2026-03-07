@@ -204,8 +204,8 @@ Training gradually increases the rollout horizon to prevent gradient explosion f
 ### Stability Measures
 
 - **Gradient clipping**: `clip_grad_norm_(params, max_norm=1.0)` every step
-- **LR reduction at curriculum jumps (Model_2 only)**: LR × 0.3 at h=8, 24, 32, 48, 64
-  - Schedule: `1e-3 → 3e-4 → 9e-5 → 2.7e-5 → 8.1e-6 → 2.4e-6`
+- **LR reduction at curriculum jumps (Model_2 only)**: LR × 0.3 at h=16 and h=64 only
+  - Schedule: `1e-3 → 3e-4 (h=16) → 9e-5 (h=64)`
 - **Mixed precision**: `torch.amp.autocast` + `GradScaler` (via `--mixed-precision` flag)
 - **Gradient checkpointing**: auto-enabled with `--mixed-precision`; recomputes activations during backward to avoid storing the full 64-step rollout graph in memory
 - **Early stopping**: patience=5 epochs, active only at `max_h=64`

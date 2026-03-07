@@ -60,6 +60,7 @@ def load_checkpoint(checkpoint_path, device):
             'twoDoneD':    64,
             'oneDtwoD':    64,
         },
+        'n_mp_rounds': 1,
     })
     model_config.update(arch_config)
 

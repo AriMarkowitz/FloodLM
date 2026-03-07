@@ -1,21 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=floodlm-model2
+#SBATCH --job-name=floodlm-m2-probe
 #SBATCH --partition=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=1:00:00
 #SBATCH --output=/users/admarkowitz/FloodLM/logs/slurm_%j.out
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
+# Quick h=2 probe for Model_2 architecture iteration.
+# Always trains from scratch. Runs 4 epochs at max-h=2.
+# Does NOT touch checkpoints/latest/ — safe to run without clobbering the best model.
+# Compare val loss after 4 epochs vs baseline to decide if arch is worth full training.
+#
 # Usage:
-#   sbatch slurm/submit_slurm_model2.sh            # resume from checkpoints/latest (default)
-#   sbatch slurm/submit_slurm_model2.sh scratch    # train from scratch (use after arch changes)
-#
-# Trains Model_2 only. Defaults to resume.
-#
+#   sbatch slurm/submit_slurm_model2_probe.sh
 
 mkdir -p /users/admarkowitz/FloodLM/logs
 
@@ -28,52 +29,43 @@ cd /users/admarkowitz/FloodLM
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║              FloodLM Model_2 Training (Mixed Precision)            ║"
+echo "║          FloodLM Model_2 Architecture Probe (h=2, 4 epochs)       ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Job ID:        $SLURM_JOB_ID"
 echo "Node:          $SLURMD_NODENAME"
 echo "GPUs:          $CUDA_VISIBLE_DEVICES"
 echo "Started:       $(date)"
-echo "Memory config: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+echo "NOTE: checkpoints/latest/ will NOT be touched (--no-mirror-latest)"
 echo ""
 
 PROJECT_DIR="/users/admarkowitz/FloodLM"
 PYTHON="python3"
 
-log_info() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO]  $1"; }
+log_info()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO]  $1"; }
 log_error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2; }
 
-log_info "═════════════════════════════════════════════════════════════════"
-RESUME_ARG="${1:-}"
-if [ "${RESUME_ARG}" = "scratch" ]; then
-    RESUME_FLAG=""
-    log_info "Training Model_2 — from scratch (no resume)"
-else
-    RESUME_FLAG="--resume checkpoints/latest"
-    log_info "Training Model_2 — resuming from latest checkpoint"
-fi
-log_info "═════════════════════════════════════════════════════════════════"
+log_info "Training Model_2 from scratch — h=2, 4 epochs, no-mirror-latest"
 
-CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py ${RESUME_FLAG} --mixed-precision"
+CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py --mixed-precision --epochs 4 --max-h 2 --learning-rate 1e-3 --no-mirror-latest"
 
 log_info "Command: $CMD"
 log_info ""
 
 if eval "$CMD"; then
-    log_info "✓ Model_2 training completed successfully"
+    log_info "Probe complete. Check wandb val loss vs baseline to decide if arch is worth full training."
     EXIT_CODE=0
 else
     EXIT_CODE=$?
-    log_error "✗ Model_2 training failed with exit code $EXIT_CODE"
+    log_error "Probe failed with exit code $EXIT_CODE"
 fi
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════════╗"
 if [ $EXIT_CODE -eq 0 ]; then
-    echo "║                    ✓ Model_2 trained successfully                 ║"
+    echo "║                    Probe finished successfully                     ║"
 else
-    echo "║                    ✗ Model_2 training failed                      ║"
+    echo "║                    Probe failed                                    ║"
 fi
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
