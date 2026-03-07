@@ -264,15 +264,11 @@ class HeteroTransportCell(nn.Module):
         msg_dim: int = 64,
         hidden_dim: int | dict = 128,
         dropout: float = 0.0,
-        n_mp_rounds: int = 1,
     ):
         """
         hidden_dim: either a single int (shared across all edge types) or a dict mapping
             edge relation name -> int, e.g. {'oneDedge': 64, 'twoDedge': 192, 'oneDtwoD': 192}.
             Missing keys fall back to the default (first int value or 128).
-        n_mp_rounds: number of MP rounds for 1D-destination relations (oneDedge, oneDedgeRev,
-            twoDoneD) per timestep. 2D-destination relations (twoDedge, twoDedgeRev, oneDtwoD)
-            always run once after. Shared weights across rounds — extra cost is negligible vs 2D.
         """
         super().__init__()
         self.node_types = node_types
@@ -280,7 +276,6 @@ class HeteroTransportCell(nn.Module):
         self.h_dim = h_dim
         self.msg_dim = msg_dim
         self._hidden_dim = hidden_dim  # stored for checkpoint serialization
-        self.n_mp_rounds = n_mp_rounds
 
         # Resolve hidden_dim per edge relation
         if isinstance(hidden_dim, dict):
@@ -358,11 +353,6 @@ class HeteroTransportCell(nn.Module):
         self.dyn_norm = nn.ModuleDict({
             nt: nn.LayerNorm(msg_dim) for nt in node_types
         })
-        # Residual refinement projection for rounds 1+ (msg_dim -> h_dim).
-        # Used instead of GRU on extra MP rounds — pure spatial refinement, no temporal gate.
-        self.refine_proj = nn.ModuleDict({
-            nt: nn.Linear(msg_dim, h_dim) for nt in node_types
-        })
 
     def forward(
         self,
@@ -391,65 +381,60 @@ class HeteroTransportCell(nn.Module):
         edge_static = {et: data[et].edge_attr_static for et in self.edge_types}
 
         # ------------------------------------------------------------
-        # 1) n_mp_rounds of full hetero MP (all edge types, all node types).
-        #    Shared weights across rounds — each round sees the previous round's
-        #    hidden states, giving K-hop receptive field per timestep.
-        #    Dynamic input injected only on round 0 (one temporal observation per step).
-        #    Rounds 1+ are pure MP refinement with zeros for dyn.
+        # 1) Inject context into each MP module, then call HeteroConv.
+        #    All tensors are already in [B*N, *] / [B*E, *] space.
         # ------------------------------------------------------------
+        for (src_type, rel, dst_type) in self.edge_types:
+            key = f"{src_type}_{rel}_{dst_type}"
+            mp = self.mp_modules[key]
+            if isinstance(mp, GATv2CrossTypeMP):
+                mp._set_context(
+                    h_src=h_t[src_type],
+                    h_dst=h_t[dst_type],
+                )
+            else:
+                mp._set_context(
+                    h_src=h_t[src_type],
+                    h_dst=h_t[dst_type],
+                    edge_attr_static=edge_static[(src_type, rel, dst_type)],
+                    x_static_src=x_static[src_type],
+                    x_static_dst=x_static[dst_type],
+                )
+
+        # Build edge_index_dict and x_dict for HeteroConv (standard PyG interface).
+        # Pass h_t as x so HeteroConv correctly infers per-type node counts [B*N_nt, *].
         edge_index_dict = {et: data[et].edge_index for et in self.edge_types}
-        h = {nt: h_t[nt] for nt in self.node_types}  # mutable hidden states across rounds
+        x_dict = {nt: h_t[nt] for nt in self.node_types}
 
-        # Pre-compute dynamic embeddings (injected on round 0 only)
-        dyn_emb = {nt: self.dyn_norm[nt](self.dyn_proj[nt](x_dyn_t[nt])) for nt in self.node_types}
+        # Call HeteroConv — returns messages[node_type] = [B*N_dst, msg_dim]
+        messages = self.hetero_conv(x_dict, edge_index_dict)
 
-        for round_idx in range(self.n_mp_rounds):
-            # Set context for all MP modules using current hidden states
-            for (src_type, rel, dst_type) in self.edge_types:
-                key = f"{src_type}_{rel}_{dst_type}"
-                mp = self.mp_modules[key]
-                if isinstance(mp, GATv2CrossTypeMP):
-                    mp._set_context(h_src=h[src_type], h_dst=h[dst_type])
-                else:
-                    mp._set_context(
-                        h_src=h[src_type],
-                        h_dst=h[dst_type],
-                        edge_attr_static=edge_static[(src_type, rel, dst_type)],
-                        x_static_src=x_static[src_type],
-                        x_static_dst=x_static[dst_type],
-                    )
+        # Ensure all destination node types have messages
+        for nt in self.node_types:
+            if nt not in messages:
+                messages[nt] = torch.zeros((data[nt].num_nodes, self.msg_dim), device=h_t[nt].device)
 
-            # Aggregate messages per destination node type
-            msgs = {nt: torch.zeros(h[nt].size(0), self.msg_dim, device=h[nt].device, dtype=h[nt].dtype)
-                    for nt in self.node_types}
-            for (src_type, rel, dst_type) in self.edge_types:
-                key = f"{src_type}_{rel}_{dst_type}"
-                mp = self.mp_modules[key]
-                out = mp(h[src_type], edge_index_dict[(src_type, rel, dst_type)])
-                msgs[dst_type] = msgs[dst_type] + out
+            expected_n_dst = h_t[nt].size(0)
+            if messages[nt].size(0) != expected_n_dst:
+                raise RuntimeError(
+                    f"Message shape mismatch for node type '{nt}': "
+                    f"expected {expected_n_dst} nodes but got {messages[nt].size(0)} "
+                    f"(msg shape: {messages[nt].shape})"
+                )
 
-            h_next = {}
-            for nt in self.node_types:
-                msg_emb = self.msg_norm[nt](msgs[nt])
-                if round_idx == 0:
-                    # Round 0: temporal GRU update — gates dynamics + messages
-                    upd_in = torch.cat([dyn_emb[nt], msg_emb], dim=-1)
-                    h_next[nt] = self.h_norm[nt](self.update[nt](upd_in, h[nt]))
-                else:
-                    # Rounds 1+: pure spatial refinement — residual add, no temporal gate
-                    h_next[nt] = self.h_norm[nt](h[nt] + self.refine_proj[nt](msg_emb))
-            h = h_next
+        # ------------------------------------------------------------
+        # 2) Inject DYNAMIC inputs and run GRU update.
+        #    All in [B*N, *] space — GRUCell handles this natively.
+        # ------------------------------------------------------------
+        h_next = {}
+        for nt in self.node_types:
+            dyn_emb = self.dyn_norm[nt](self.dyn_proj[nt](x_dyn_t[nt]))  # [B*N, msg_dim]
+            msg_emb = self.msg_norm[nt](messages[nt])                    # [B*N, msg_dim]
+            upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)               # [B*N, 2*msg_dim]
+            h_raw = self.update[nt](upd_in, h_t[nt])        # [B*N, h_dim]
+            h_next[nt] = self.h_norm[nt](h_raw)             # [B*N, h_dim] — stabilize magnitude
 
-            # Safety check on first round only
-            if round_idx == 0:
-                for nt in self.node_types:
-                    if h[nt].size(0) != h_t[nt].size(0):
-                        raise RuntimeError(
-                            f"Message shape mismatch for node type '{nt}': "
-                            f"expected {h_t[nt].size(0)} nodes but got {h[nt].size(0)}"
-                        )
-
-        return h
+        return h_next
 
 
 # ============================================================
@@ -479,7 +464,6 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         msg_dim: int = 64,
         hidden_dim: int = 128,
         dropout: float = 0.0,
-        n_mp_rounds: int = 1,
     ):
         super().__init__()
         self.node_types = node_types
@@ -497,7 +481,6 @@ class FloodAutoregressiveHeteroModel(nn.Module):
             msg_dim=msg_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
-            n_mp_rounds=n_mp_rounds,
         )
 
         # ------------------------------------------------------------

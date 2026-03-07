@@ -116,7 +116,6 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_
             'h_dim': model.h_dim,
             'msg_dim': model.cell.msg_dim,
             'hidden_dim': model.cell._hidden_dim,
-            'n_mp_rounds': model.cell.n_mp_rounds,
         },
         'loss': loss,
         'model_id': model_id,
@@ -303,7 +302,6 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             'twoDoneD':    32,
             'oneDtwoD':    32,
         },
-        'n_mp_rounds': 3,
     })
     model = FloodAutoregressiveHeteroModel(**model_config)
     model = model.to(device)
