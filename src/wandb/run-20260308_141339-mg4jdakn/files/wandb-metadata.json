@@ -1,0 +1,78 @@
+{
+  "os":  "Linux-5.14.0-503.40.1.el9_5.x86_64-x86_64-with-glibc2.34",
+  "python":  "CPython 3.10.19",
+  "startedAt":  "2026-03-08T20:13:39.194901Z",
+  "args":  [
+    "--mixed-precision"
+  ],
+  "program":  "-m fullevent.train",
+  "email":  "aridmarkowitz@gmail.com",
+  "root":  "/users/admarkowitz/FloodLM/src",
+  "host":  "easley056",
+  "executable":  "/users/admarkowitz/.conda/envs/floodlm/bin/python",
+  "cpu_count":  64,
+  "cpu_count_logical":  64,
+  "gpu":  "NVIDIA L40S",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "132449923072",
+      "used":  "9503514624"
+    }
+  },
+  "memory":  {
+    "total":  "269940166656"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA L40S",
+      "memoryTotal":  "48305799168",
+      "cudaCores":  18176,
+      "architecture":  "Ada",
+      "uuid":  "GPU-6d9fdf3d-1f06-4ca4-ee19-d3bf00ad1eb0"
+    }
+  ],
+  "cudaVersion":  "12.8",
+  "slurm":  {
+    "cluster_name":  "easley",
+    "conf":  "/var/spool/slurmd/conf-cache/slurm.conf",
+    "cpus_on_node":  "8",
+    "cpus_per_task":  "8",
+    "gpus_on_node":  "1",
+    "gtids":  "0",
+    "job_account":  "2016522",
+    "job_cpus_per_node":  "8",
+    "job_end_time":  "1773044007",
+    "job_gid":  "549200534",
+    "job_gpus":  "0",
+    "job_id":  "286141",
+    "job_name":  "floodlm-fullevent",
+    "job_nodelist":  "easley056",
+    "job_num_nodes":  "1",
+    "job_partition":  "l40s",
+    "job_qos":  "easley",
+    "job_start_time":  "1773000807",
+    "job_uid":  "549200534",
+    "job_user":  "admarkowitz",
+    "jobid":  "286141",
+    "localid":  "0",
+    "mem_per_node":  "65536",
+    "nnodes":  "1",
+    "nodeid":  "0",
+    "nodelist":  "easley056",
+    "nprocs":  "1",
+    "ntasks":  "1",
+    "oom_kill_step":  "0",
+    "prio_process":  "0",
+    "procid":  "0",
+    "script_context":  "prolog_task",
+    "submit_dir":  "/users/admarkowitz/FloodLM",
+    "submit_host":  "easley",
+    "task_pid":  "1389276",
+    "tasks_per_node":  "1",
+    "topology_addr":  "easley056",
+    "topology_addr_pattern":  "node",
+    "tres_per_task":  "cpu=8"
+  },
+  "writerId":  "f4ixftp4aqoyvub5o33bsleypwvbmfse"
+}

@@ -1,0 +1,131 @@
+_wandb:
+    value:
+        cli_version: 0.25.0
+        e:
+            f4ixftp4aqoyvub5o33bsleypwvbmfse:
+                args:
+                    - --mixed-precision
+                cpu_count: 64
+                cpu_count_logical: 64
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "132449923072"
+                        used: "9503514624"
+                email: aridmarkowitz@gmail.com
+                executable: /users/admarkowitz/.conda/envs/floodlm/bin/python
+                gpu: NVIDIA L40S
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "48305799168"
+                      name: NVIDIA L40S
+                      uuid: GPU-6d9fdf3d-1f06-4ca4-ee19-d3bf00ad1eb0
+                host: easley056
+                memory:
+                    total: "269940166656"
+                os: Linux-5.14.0-503.40.1.el9_5.x86_64-x86_64-with-glibc2.34
+                program: -m fullevent.train
+                python: CPython 3.10.19
+                root: /users/admarkowitz/FloodLM/src
+                slurm:
+                    cluster_name: easley
+                    conf: /var/spool/slurmd/conf-cache/slurm.conf
+                    cpus_on_node: "8"
+                    cpus_per_task: "8"
+                    gpus_on_node: "1"
+                    gtids: "0"
+                    job_account: "2016522"
+                    job_cpus_per_node: "8"
+                    job_end_time: "1773044007"
+                    job_gid: "549200534"
+                    job_gpus: "0"
+                    job_id: "286141"
+                    job_name: floodlm-fullevent
+                    job_nodelist: easley056
+                    job_num_nodes: "1"
+                    job_partition: l40s
+                    job_qos: easley
+                    job_start_time: "1773000807"
+                    job_uid: "549200534"
+                    job_user: admarkowitz
+                    jobid: "286141"
+                    localid: "0"
+                    mem_per_node: "65536"
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: easley056
+                    nprocs: "1"
+                    ntasks: "1"
+                    oom_kill_step: "0"
+                    prio_process: "0"
+                    procid: "0"
+                    script_context: prolog_task
+                    submit_dir: /users/admarkowitz/FloodLM
+                    submit_host: easley
+                    task_pid: "1389276"
+                    tasks_per_node: "1"
+                    topology_addr: easley056
+                    topology_addr_pattern: node
+                    tres_per_task: cpu=8
+                startedAt: "2026-03-08T20:13:39.194901Z"
+                writerId: f4ixftp4aqoyvub5o33bsleypwvbmfse
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 1
+                - 77
+            "2":
+                - 1
+                - 77
+            "3":
+                - 13
+                - 16
+            "4": 3.10.19
+            "5": 0.25.0
+            "8":
+                - 2
+            "12": 0.25.0
+            "13": linux-x86_64
+batch_size:
+    value: 1
+checkpoint_interval:
+    value: 1
+early_stopping_patience:
+    value: 15
+epochs:
+    value: 100
+grad_accum_steps:
+    value: 4
+grad_clip:
+    value: 1
+h_dim:
+    value: 96
+hidden_dim:
+    value:
+        globaloneD: 32
+        globaltwoD: 32
+        oneDedge: 64
+        oneDedgeRev: 64
+        oneDglobal: 32
+        oneDtwoD: 32
+        twoDedge: 128
+        twoDedgeRev: 128
+        twoDglobal: 32
+        twoDoneD: 32
+history_len:
+    value: 10
+lr:
+    value: 0.0005
+lr_final:
+    value: 1e-05
+mixed_precision:
+    value: true
+msg_dim:
+    value: 64
+time_embed_dim:
+    value: 8
+time_embed_max_period:
+    value: 512

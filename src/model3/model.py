@@ -223,13 +223,15 @@ class NodeTransformerDecoder(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.out_proj = nn.Linear(d_model, 1)
 
-    def forward(self, h_enc_nt, rain_t, anchor):
+    def forward(self, h_enc_nt, rain_t, anchor, node_chunk_size=512):
         """
         h_enc_nt: [N, h_dim]
         rain_t:   [T, N, 1]
         anchor:   [N, 1]
 
         Returns delta: [T, N, 1]  (caller adds anchor for absolute wl)
+
+        Nodes are independent so we chunk them to avoid OOM on large N.
         """
         T, N, _ = rain_t.shape
         device = rain_t.device
@@ -240,47 +242,52 @@ class NodeTransformerDecoder(nn.Module):
             torch.cos(t_idx / self.T_max),
         ], dim=-1)  # [T, 2]
 
-        # Build per-timestep input: [T, N, h_dim+4]
-        h_exp   = h_enc_nt.unsqueeze(0).expand(T, -1, -1)          # [T, N, h_dim]
-        anc_exp = anchor.unsqueeze(0).expand(T, -1, -1)            # [T, N, 1]
-        te_exp  = t_emb.unsqueeze(1).expand(-1, N, -1)             # [T, N, 2]
-        inp = torch.cat([h_exp, anc_exp, rain_t, te_exp], dim=-1)  # [T, N, h_dim+4]
+        te_exp = t_emb.unsqueeze(1)  # [T, 1, 2] — will broadcast over node dim
 
-        # Project to d_model: [T, N, d_model]
-        x = self.input_proj(inp)  # [T, N, d_model]
+        out_chunks = []
+        for start in range(0, N, node_chunk_size):
+            end = min(start + node_chunk_size, N)
+            h_c   = h_enc_nt[start:end]                         # [C, h_dim]
+            r_c   = rain_t[:, start:end, :]                     # [T, C, 1]
+            anc_c = anchor[start:end]                           # [C, 1]
+            C = end - start
 
-        # Transformer expects [B, T, d_model] with batch_first=True
-        # Treat N nodes as batch (each node's T-length sequence is independent)
-        x = x.permute(1, 0, 2)              # [N, T, d_model]
-        x = self.transformer(x)             # [N, T, d_model]
-        x = x.permute(1, 0, 2)              # [T, N, d_model]
+            h_exp   = h_c.unsqueeze(0).expand(T, -1, -1)       # [T, C, h_dim]
+            anc_exp = anc_c.unsqueeze(0).expand(T, -1, -1)     # [T, C, 1]
+            te_c    = te_exp.expand(-1, C, -1)                  # [T, C, 2]
+            inp = torch.cat([h_exp, anc_exp, r_c, te_c], dim=-1)  # [T, C, h_dim+4]
 
-        return self.out_proj(x)             # [T, N, 1]  (delta)
+            x = self.input_proj(inp)        # [T, C, d_model]
+            x = x.permute(1, 0, 2)         # [C, T, d_model]
+            x = self.transformer(x)         # [C, T, d_model]
+            x = x.permute(1, 0, 2)         # [T, C, d_model]
+            out_chunks.append(self.out_proj(x))  # [T, C, 1]
+
+        return torch.cat(out_chunks, dim=1)  # [T, N, 1]
 
 
 class HeteroEncoderDecoderModel(nn.Module):
     """
     Encoder-decoder flood model.
 
-    Encoder: HeteroTransportCell × history_len steps (teacher-forced, B=1)
-             h_dim=192, history_len=20 — richer basin state encoding
+    Encoder : HeteroTransportCell × history_len GRU steps → h_enc per node
+    Decoder : NodeTransformerDecoder — Transformer over the time axis, applied
+              independently per node type (nodes chunked for memory efficiency).
 
-    Decoder: NodeTransformerDecoder — Transformer over time axis per node type.
-             Each future timestep attends to all others → captures temporal dynamics,
-             autocorrelation, lag effects. Predicts delta from last-known water level.
-
-    Complexity: ~10× previous MLP decoder. Encoder also 2× wider/deeper.
+    Scale via config.py ENC_SCALE / DEC_SCALE / EDGE_SCALE knobs.
     """
 
     def __init__(self, node_types, edge_types, node_static_dims, node_dyn_input_dims,
-                 edge_static_dims, h_dim=192, msg_dim=128, hidden_dim=256,
-                 decoder_hidden_dim=256, T_max=512,
-                 dec_d_model=256, dec_nhead=8, dec_num_layers=4,
-                 dec_ffn_dim=512, dec_dropout=0.1, dropout=0.0):
+                 edge_static_dims, h_dim=96, msg_dim=64, hidden_dim=64,
+                 T_max=512,
+                 dec_d_model=64, dec_nhead=2, dec_num_layers=2,
+                 dec_ffn_dim=128, dec_dropout=0.1,
+                 dec_node_chunk=512, dropout=0.0):
         super().__init__()
         self.node_types = node_types
         self.h_dim = h_dim
         self.T_max = T_max
+        self.dec_node_chunk = dec_node_chunk
 
         # Encoder GRU cell
         self.cell = HeteroTransportCell(
@@ -330,7 +337,8 @@ class HeteroEncoderDecoderModel(nn.Module):
         # 2D nodes
         N_2d = h_enc["twoD"].shape[0]
         anc_2d = wl_anchor_2d if wl_anchor_2d is not None else torch.zeros(N_2d, 1, device=device)
-        delta_2d = self.decoders["twoD"](h_enc["twoD"], rain_future_2d, anc_2d)  # [T, N_2d, 1]
+        delta_2d = self.decoders["twoD"](h_enc["twoD"], rain_future_2d, anc_2d,
+                                         node_chunk_size=self.dec_node_chunk)
         preds["twoD"] = anc_2d.unsqueeze(0) + delta_2d
 
         # 1D nodes
@@ -340,7 +348,8 @@ class HeteroEncoderDecoderModel(nn.Module):
             r_1d = rain_future_2d[:, rain_1d_index, :]                          # [T, N_1d, 1]
         else:
             r_1d = torch.zeros(T_future, N_1d, 1, device=device)
-        delta_1d = self.decoders["oneD"](h_enc["oneD"], r_1d, anc_1d)           # [T, N_1d, 1]
+        delta_1d = self.decoders["oneD"](h_enc["oneD"], r_1d, anc_1d,
+                                         node_chunk_size=self.dec_node_chunk)
         preds["oneD"] = anc_1d.unsqueeze(0) + delta_1d
 
         return preds

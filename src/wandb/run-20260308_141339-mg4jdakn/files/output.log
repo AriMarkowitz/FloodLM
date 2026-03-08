@@ -1,0 +1,48 @@
+[INFO] Device: cuda
+[INFO] GPU: NVIDIA L40S
+[INFO] cudnn.benchmark=True, TF32 matmul=True
+[INFO] Initializing data...
+
+[INFO] ========== INITIALIZING DATA FROM DISK ==========
+[INFO] Computing preprocessing (this may take a minute)...
+
+[ERROR] Missing required data files:
+  - data/Model_2/train/1d_nodes_static.csv
+  - data/Model_2/train/2d_nodes_static.csv
+  - data/Model_2/train/1d_edges_static.csv
+  - data/Model_2/train/2d_edges_static.csv
+  - data/Model_2/train/1d_edge_index.csv
+  - data/Model_2/train/2d_edge_index.csv
+  - data/Model_2/train/1d2d_connections.csv
+
+Expected structure:
+  FloodLM/data/Model_2/train/
+[ERROR] Data validation failed for Model_2. See paths above and ensure data is in the correct location.
+Traceback (most recent call last):
+  File "/users/admarkowitz/.conda/envs/floodlm/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/users/admarkowitz/.conda/envs/floodlm/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/users/admarkowitz/FloodLM/src/fullevent/train.py", line 758, in <module>
+    train(
+  File "/users/admarkowitz/FloodLM/src/fullevent/train.py", line 452, in train
+    data = initialize_data()
+  File "/users/admarkowitz/FloodLM/src/data_lazy.py", line 190, in initialize_data
+    validate_data_paths()
+  File "/users/admarkowitz/FloodLM/src/data_config.py", line 77, in validate_data_paths
+    raise FileNotFoundError(
+FileNotFoundError: Data validation failed for Model_2. See paths above and ensure data is in the correct location.
+Traceback (most recent call last):
+  File "/users/admarkowitz/.conda/envs/floodlm/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/users/admarkowitz/.conda/envs/floodlm/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/users/admarkowitz/FloodLM/src/fullevent/train.py", line 758, in <module>
+    train(
+  File "/users/admarkowitz/FloodLM/src/fullevent/train.py", line 452, in train
+    data = initialize_data()
+  File "/users/admarkowitz/FloodLM/src/data_lazy.py", line 190, in initialize_data
+    validate_data_paths()
+  File "/users/admarkowitz/FloodLM/src/data_config.py", line 77, in validate_data_paths
+    raise FileNotFoundError(
+FileNotFoundError: Data validation failed for Model_2. See paths above and ensure data is in the correct location.

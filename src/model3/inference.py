@@ -49,13 +49,13 @@ def load_checkpoint(checkpoint_path, device):
         'h_dim':              arch.get('h_dim',              CONFIG['h_dim']),
         'msg_dim':            arch.get('msg_dim',            CONFIG['msg_dim']),
         'hidden_dim':         arch.get('hidden_dim',         HIDDEN_DIMS),
-        'decoder_hidden_dim': arch.get('decoder_hidden_dim', CONFIG['decoder_hidden_dim']),
         'T_max':              arch.get('T_max',              CONFIG['T_max']),
         'dec_d_model':        arch.get('dec_d_model',        CONFIG['dec_d_model']),
         'dec_nhead':          arch.get('dec_nhead',          CONFIG['dec_nhead']),
         'dec_num_layers':     arch.get('dec_num_layers',     CONFIG['dec_num_layers']),
         'dec_ffn_dim':        arch.get('dec_ffn_dim',        CONFIG['dec_ffn_dim']),
         'dec_dropout':        arch.get('dec_dropout',        CONFIG['dec_dropout']),
+        'dec_node_chunk':     arch.get('dec_node_chunk',     CONFIG['dec_node_chunk']),
     }
 
 

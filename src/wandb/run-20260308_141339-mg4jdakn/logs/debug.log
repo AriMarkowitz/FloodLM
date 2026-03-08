@@ -1,0 +1,21 @@
+2026-03-08 14:13:39,520 INFO    MainThread:1389288 [wandb_setup.py:_flush():81] Current SDK version is 0.25.0
+2026-03-08 14:13:39,520 INFO    MainThread:1389288 [wandb_setup.py:_flush():81] Configure stats pid to 1389288
+2026-03-08 14:13:39,520 INFO    MainThread:1389288 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-03-08 14:13:39,521 INFO    MainThread:1389288 [wandb_init.py:setup_run_log_directory():717] Logging user logs to /users/admarkowitz/FloodLM/src/wandb/run-20260308_141339-mg4jdakn/logs/debug.log
+2026-03-08 14:13:39,521 INFO    MainThread:1389288 [wandb_init.py:setup_run_log_directory():718] Logging internal logs to /users/admarkowitz/FloodLM/src/wandb/run-20260308_141339-mg4jdakn/logs/debug-internal.log
+2026-03-08 14:13:39,521 INFO    MainThread:1389288 [wandb_init.py:init():844] calling init triggers
+2026-03-08 14:13:39,521 INFO    MainThread:1389288 [wandb_init.py:init():849] wandb.init called with sweep_config: {}
+config: {'history_len': 10, 'batch_size': 1, 'grad_accum_steps': 4, 'epochs': 100, 'lr': 0.0005, 'lr_final': 1e-05, 'grad_clip': 1.0, 'early_stopping_patience': 15, 'checkpoint_interval': 1, 'mixed_precision': True, 'time_embed_dim': 8, 'time_embed_max_period': 512, 'h_dim': 96, 'msg_dim': 64, 'hidden_dim': {'oneDedge': 64, 'oneDedgeRev': 64, 'twoDedge': 128, 'twoDedgeRev': 128, 'twoDoneD': 32, 'oneDtwoD': 32, 'oneDglobal': 32, 'globaloneD': 32, 'twoDglobal': 32, 'globaltwoD': 32}, '_wandb': {}}
+2026-03-08 14:13:39,521 INFO    MainThread:1389288 [wandb_init.py:init():892] starting backend
+2026-03-08 14:13:39,965 INFO    MainThread:1389288 [wandb_init.py:init():895] sending inform_init request
+2026-03-08 14:13:39,971 INFO    MainThread:1389288 [wandb_init.py:init():903] backend started and connected
+2026-03-08 14:13:40,002 INFO    MainThread:1389288 [wandb_init.py:init():973] updated telemetry
+2026-03-08 14:13:40,005 INFO    MainThread:1389288 [wandb_init.py:init():997] communicating run to backend with 90.0 second timeout
+2026-03-08 14:13:40,447 INFO    MainThread:1389288 [wandb_init.py:init():1042] starting run threads in backend
+2026-03-08 14:13:40,814 INFO    MainThread:1389288 [wandb_run.py:_console_start():2524] atexit reg
+2026-03-08 14:13:40,814 INFO    MainThread:1389288 [wandb_run.py:_redirect():2373] redirect: wrap_raw
+2026-03-08 14:13:40,814 INFO    MainThread:1389288 [wandb_run.py:_redirect():2442] Wrapping output streams.
+2026-03-08 14:13:40,814 INFO    MainThread:1389288 [wandb_run.py:_redirect():2465] Redirects installed.
+2026-03-08 14:13:40,821 INFO    MainThread:1389288 [wandb_init.py:init():1082] run started, returning control to user process
+2026-03-08 14:13:40,933 INFO    wandb-AsyncioManager-main:1389288 [service_client.py:_forward_responses():134] Reached EOF.
+2026-03-08 14:13:40,933 INFO    wandb-AsyncioManager-main:1389288 [mailbox.py:close():155] Closing mailbox, abandoning 1 handles.
