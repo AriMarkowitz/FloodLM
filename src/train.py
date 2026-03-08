@@ -35,7 +35,7 @@ CONFIG = {
     'history_len': 10,
     'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
     'batch_size': 24,
-    'epochs': 34,                # Model_2: 4 epochs for h=1-8, 3 for h=16-48, 6 for h=64 (34 total); Model_1: 2 per stage
+    'epochs': 36,                # Model_2: 6 epochs for h=1, 4 for h=2-8, 3 for h=16-48, 6 for h=64 (36 total); Model_1: 2 per stage
     'lr': 1e-3,
     'lr_final': 10**-4.5,          # ~3.16e-5; log-linear decay over all epochs (1.5 decades)
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
@@ -199,23 +199,32 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     
     # Determine if resuming
     resume_path = None
+    resume_specific_file = None  # Set when --resume points to a .pt file directly
     if resume_from:
         resume_path = Path(resume_from)
         if not resume_path.exists():
             raise ValueError(f"Resume checkpoint not found: {resume_path}")
-        print(f"\n[INFO] Resuming training from: {resume_path}")
+        if resume_path.suffix == '.pt':
+            # Specific file provided — use it directly
+            resume_specific_file = resume_path
+            resume_path = resume_path.parent
+        print(f"\n[INFO] Resuming training from: {resume_specific_file or resume_path}")
     print("\n" + "="*70)
     print("FloodLM Training Script")
     print("="*70)
-    
+
     # Peek at checkpoint to recover wandb run ID and global_step before init
     _wandb_resume_id = None
     _global_step_resume = 0
     if resume_path:
         try:
-            _ckpt_files = sorted(resume_path.glob(f'{SELECTED_MODEL}*.pt'))
-            if _ckpt_files:
-                _peek = torch.load(_ckpt_files[-1], map_location='cpu')
+            if resume_specific_file:
+                _peek_file = resume_specific_file
+            else:
+                _ckpt_files = sorted(resume_path.glob(f'{SELECTED_MODEL}*.pt'))
+                _peek_file = _ckpt_files[-1] if _ckpt_files else None
+            if _peek_file:
+                _peek = torch.load(_peek_file, map_location='cpu')
                 _wandb_resume_id = _peek.get('wandb_run_id', None)
                 _global_step_resume = _peek.get('global_step', 0) or 0
         except Exception:
@@ -334,13 +343,14 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     start_epoch = 1
     if resume_path:
         try:
-            # Try to find the checkpoint for this specific model
-            checkpoint_files = sorted(resume_path.glob(f'{SELECTED_MODEL}*.pt'))
-            if not checkpoint_files:
-                raise FileNotFoundError(f"No checkpoints found for {SELECTED_MODEL} in {resume_path}")
-
-            # Load the latest checkpoint for this model
-            checkpoint_path = checkpoint_files[-1]
+            # Use specific file if provided, otherwise pick latest in directory
+            if resume_specific_file:
+                checkpoint_path = resume_specific_file
+            else:
+                checkpoint_files = sorted(resume_path.glob(f'{SELECTED_MODEL}*.pt'))
+                if not checkpoint_files:
+                    raise FileNotFoundError(f"No checkpoints found for {SELECTED_MODEL} in {resume_path}")
+                checkpoint_path = checkpoint_files[-1]
             print(f"[INFO] Loading checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device)
             
@@ -460,12 +470,12 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
         # Curriculum schedule
         # Model_1: doubles every 2 epochs (power-of-2); epoch 1-2→1, 3-4→2, ..., 13+→64
-        # Model_2: variable stage lengths — 4 epochs for early small horizons (h=1-8),
-        #   3 epochs for the harder intermediary steps (h=16-48), 6 epochs at h=64:
-        #   1-4→1, 5-8→2, 9-12→4, 13-16→8, 17-19→16, 20-22→24, 23-25→32, 26-28→48, 29-34→64
+        # Model_2: variable stage lengths — 6 epochs for h=1, 4 for h=2-8,
+        #   3 epochs for h=16-48, 6 epochs at h=64:
+        #   1-6→1, 7-10→2, 11-14→4, 15-18→8, 19-21→16, 22-24→24, 25-27→32, 28-30→48, 31-36→64
         if SELECTED_MODEL == 'Model_2':
-            _m2_boundaries = [4, 8, 12, 16, 19, 22, 25, 28, 34]  # last epoch of each stage
-            _m2_horizons   = [1, 2,  4,  8, 16, 24, 32, 48, 64]
+            _m2_boundaries = [6, 10, 14, 18, 21, 24, 27, 30, 36]  # last epoch of each stage; h=1 runs 6 epochs
+            _m2_horizons   = [1,  2,  4,  8, 16, 24, 32, 48, 64]
             _stage_idx = next((i for i, b in enumerate(_m2_boundaries) if epoch <= b), len(_m2_boundaries) - 1)
             max_h = _m2_horizons[_stage_idx]
         else:

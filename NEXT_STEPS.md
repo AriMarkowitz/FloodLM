@@ -236,6 +236,7 @@ Train a single model on both Model_1 and Model_2 data simultaneously.
 
 ## Model Evaluation
 - [x] **Multi-step autoregressive rollout evaluation**: Added `evaluate_rollout()` — runs fixed-horizon val at h=1 and h=32. Logged as `rollout_val/h1_*` and `rollout_val/h32_*`.
+- [ ] **Per-event, per-timestep error analysis for Model_2**: Identify which specific events and timesteps within each event Model_2 struggles most on. Run inference over the val set, compute per-timestep RMSE for each event (both 1D and 2D nodes), and plot error vs. timestep-within-event curves per event. The goal is to identify whether errors are concentrated at event onset (rising limb), peak, or recession — this would directly inform whether the curriculum/history_len/warm-start is the bottleneck, or whether certain event types (e.g. sharp multi-peak events) are fundamentally harder. Also log the worst N events by mean 1D RMSE — if 2-3 events dominate the aggregate loss, understanding those events may be more valuable than any architecture change.
 
 ---
 

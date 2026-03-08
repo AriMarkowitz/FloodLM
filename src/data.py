@@ -401,38 +401,30 @@ def create_static_hetero_graph(
             rain_idx[int(row[node_1d_col])] = int(row[node_2d_col])
         data.rain_1d_index = rain_idx  # graph-level attr, not batched by PyG
 
-    # Model_2 only: dual domain context nodes (ctx1d + ctx2d) with cross-context edges.
+    # Model_2 only: single global context node with bidirectional edges to all real nodes.
+    # The global node accumulates basin-wide temporal state via its own GRU hidden state.
     from data_config import SELECTED_MODEL as _SEL_MODEL_graph
     if _SEL_MODEL_graph == "Model_2":
         n_2d = len(static_2d_norm)
-        # ctx1d: 1 virtual node summarising all 1D channels
-        data["ctx1d"].x_static = torch.zeros(1, 1, dtype=torch.float32)
-        data["ctx1d"].num_nodes = 1
-        # ctx2d: 1 virtual node summarising all 2D floodplain cells
-        data["ctx2d"].x_static = torch.zeros(1, 1, dtype=torch.float32)
-        data["ctx2d"].num_nodes = 1
+        data["global"].x_static = torch.zeros(1, 1, dtype=torch.float32)
+        data["global"].num_nodes = 1
 
         def _star_edge(n, src_to_ctx=True):
-            """Return edge_index for n real nodes <-> 1 context node."""
+            """Return edge_index for n real nodes <-> 1 global node."""
             real = torch.arange(n, dtype=torch.long)
             ctx  = torch.zeros(n, dtype=torch.long)
             return torch.stack([real, ctx] if src_to_ctx else [ctx, real], dim=0)
 
-        # 1D ↔ ctx1d
-        data["oneD",  "oneDctx1d",  "ctx1d"].edge_index      = _star_edge(n_1d, src_to_ctx=True)
-        data["oneD",  "oneDctx1d",  "ctx1d"].edge_attr_static = torch.zeros(n_1d, 1)
-        data["ctx1d", "ctx1doneD",  "oneD"].edge_index        = _star_edge(n_1d, src_to_ctx=False)
-        data["ctx1d", "ctx1doneD",  "oneD"].edge_attr_static  = torch.zeros(n_1d, 1)
-        # 2D ↔ ctx2d
-        data["twoD",  "twoDctx2d",  "ctx2d"].edge_index       = _star_edge(n_2d, src_to_ctx=True)
-        data["twoD",  "twoDctx2d",  "ctx2d"].edge_attr_static = torch.zeros(n_2d, 1)
-        data["ctx2d", "ctx2dtwoD",  "twoD"].edge_index        = _star_edge(n_2d, src_to_ctx=False)
-        data["ctx2d", "ctx2dtwoD",  "twoD"].edge_attr_static  = torch.zeros(n_2d, 1)
-        # ctx1d ↔ ctx2d (single edge each direction)
-        data["ctx1d", "ctx1dctx2d", "ctx2d"].edge_index       = torch.zeros(2, 1, dtype=torch.long)
-        data["ctx1d", "ctx1dctx2d", "ctx2d"].edge_attr_static = torch.zeros(1, 1)
-        data["ctx2d", "ctx2dctx1d", "ctx1d"].edge_index       = torch.zeros(2, 1, dtype=torch.long)
-        data["ctx2d", "ctx2dctx1d", "ctx1d"].edge_attr_static = torch.zeros(1, 1)
+        # 1D ↔ global
+        data["oneD",   "oneDglobal",  "global"].edge_index      = _star_edge(n_1d, src_to_ctx=True)
+        data["oneD",   "oneDglobal",  "global"].edge_attr_static = torch.zeros(n_1d, 1)
+        data["global", "globaloneD",  "oneD"].edge_index         = _star_edge(n_1d, src_to_ctx=False)
+        data["global", "globaloneD",  "oneD"].edge_attr_static   = torch.zeros(n_1d, 1)
+        # 2D ↔ global
+        data["twoD",   "twoDglobal",  "global"].edge_index       = _star_edge(n_2d, src_to_ctx=True)
+        data["twoD",   "twoDglobal",  "global"].edge_attr_static = torch.zeros(n_2d, 1)
+        data["global", "globaltwoD",  "twoD"].edge_index         = _star_edge(n_2d, src_to_ctx=False)
+        data["global", "globaltwoD",  "twoD"].edge_attr_static   = torch.zeros(n_2d, 1)
 
     data.validate()
     return data
@@ -491,8 +483,7 @@ def make_x_dyn(
     from data_config import SELECTED_MODEL as _SEL_MODEL_dyn
     if _SEL_MODEL_dyn == "Model_2" and rain_1d_index is not None:
         _B = y_pred_1d.size(0) // rain_1d_index.size(0)
-        x_dyn["ctx1d"] = torch.zeros(_B, 1, device=y_pred_1d.device, dtype=y_pred_1d.dtype)
-        x_dyn["ctx2d"] = torch.zeros(_B, 1, device=y_pred_1d.device, dtype=y_pred_1d.dtype)
+        x_dyn["global"] = torch.zeros(_B, 1, device=y_pred_1d.device, dtype=y_pred_1d.dtype)
 
     return x_dyn
 
@@ -1344,32 +1335,25 @@ def get_model_config():
         ("oneD", "oneDtwoD",    "twoD"): _cross_dim,
     }
 
-    # Model_2 only: dual domain context nodes (ctx1d + ctx2d) that communicate with each other.
-    # ctx1d aggregates all 1D channel states; ctx2d aggregates all 2D floodplain states.
-    # Cross-context edges let the two summaries exchange information each timestep.
-    # All context edges use GATv2CrossTypeMP (e_dim=1 zero placeholder).
-    # dyn_input=1 (dummy zero) keeps GRU code paths intact — context nodes have no observations.
+    # Model_2 only: single global context node with bidirectional star edges to all real nodes.
+    # The global node accumulates a basin-wide temporal summary via its own GRU hidden state.
+    # All global edges use GATv2CrossTypeMP (e_dim=1 zero placeholder).
+    # dyn_input=1 (dummy zero) keeps GRU code paths intact — global node has no observations.
     if _SEL_MODEL == "Model_2":
-        node_types = ["oneD", "twoD", "ctx1d", "ctx2d"]
+        node_types = ["oneD", "twoD", "global"]
         edge_types += [
-            ("oneD",  "oneDctx1d",   "ctx1d"),   # 1D nodes → 1D context
-            ("ctx1d", "ctx1doneD",   "oneD"),    # 1D context → 1D nodes
-            ("twoD",  "twoDctx2d",   "ctx2d"),   # 2D nodes → 2D context
-            ("ctx2d", "ctx2dtwoD",   "twoD"),    # 2D context → 2D nodes
-            ("ctx1d", "ctx1dctx2d",  "ctx2d"),   # 1D context → 2D context
-            ("ctx2d", "ctx2dctx1d",  "ctx1d"),   # 2D context → 1D context
+            ("oneD",   "oneDglobal",  "global"),  # 1D nodes → global
+            ("global", "globaloneD",  "oneD"),    # global → 1D nodes
+            ("twoD",   "twoDglobal",  "global"),  # 2D nodes → global
+            ("global", "globaltwoD",  "twoD"),    # global → 2D nodes
         ]
-        node_static_dims["ctx1d"] = 1   # dummy — GATv2CrossTypeMP ignores x_static
-        node_static_dims["ctx2d"] = 1
-        node_dyn_input_dims["ctx1d"] = 1  # dummy zero — virtual node has no observations
-        node_dyn_input_dims["ctx2d"] = 1
+        node_static_dims["global"] = 1   # dummy — GATv2CrossTypeMP ignores x_static
+        node_dyn_input_dims["global"] = 1  # dummy zero — virtual node has no observations
         for et in [
-            ("oneD",  "oneDctx1d",  "ctx1d"),
-            ("ctx1d", "ctx1doneD",  "oneD"),
-            ("twoD",  "twoDctx2d",  "ctx2d"),
-            ("ctx2d", "ctx2dtwoD",  "twoD"),
-            ("ctx1d", "ctx1dctx2d", "ctx2d"),
-            ("ctx2d", "ctx2dctx1d", "ctx1d"),
+            ("oneD",   "oneDglobal",  "global"),
+            ("global", "globaloneD",  "oneD"),
+            ("twoD",   "twoDglobal",  "global"),
+            ("global", "globaltwoD",  "twoD"),
         ]:
             edge_static_dims[et] = 1
 

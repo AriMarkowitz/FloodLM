@@ -11,10 +11,11 @@
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
 # Usage:
-#   sbatch slurm/submit_slurm_model2.sh            # resume from checkpoints/latest (default)
-#   sbatch slurm/submit_slurm_model2.sh scratch    # train from scratch (use after arch changes)
+#   sbatch slurm/submit_slurm_model2.sh                                   # resume from checkpoints/latest (default)
+#   sbatch slurm/submit_slurm_model2.sh scratch                           # train from scratch (use after arch changes)
+#   sbatch slurm/submit_slurm_model2.sh checkpoints/Model_2_20260307_XXX  # resume from specific checkpoint dir
 #
-# Trains Model_2 only. Defaults to resume.
+# Trains Model_2 only. Defaults to resume from latest.
 #
 
 mkdir -p /users/admarkowitz/FloodLM/logs
@@ -49,6 +50,9 @@ RESUME_ARG="${1:-}"
 if [ "${RESUME_ARG}" = "scratch" ]; then
     RESUME_FLAG=""
     log_info "Training Model_2 — from scratch (no resume)"
+elif [ -n "${RESUME_ARG}" ]; then
+    RESUME_FLAG="--resume ${RESUME_ARG}"
+    log_info "Training Model_2 — resuming from: ${RESUME_ARG}"
 else
     RESUME_FLAG="--resume checkpoints/latest"
     log_info "Training Model_2 — resuming from latest checkpoint"
