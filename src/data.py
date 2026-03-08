@@ -401,6 +401,38 @@ def create_static_hetero_graph(
             rain_idx[int(row[node_1d_col])] = int(row[node_2d_col])
         data.rain_1d_index = rain_idx  # graph-level attr, not batched by PyG
 
+    # Model_2 only: add global context node connected to all real nodes (both directions).
+    from data_config import SELECTED_MODEL as _SEL_MODEL_graph
+    if _SEL_MODEL_graph == "Model_2":
+        n_2d = len(static_2d_norm)
+        # Global node: 1 virtual node, dummy static feature (dim=1 zero)
+        data["global"].x_static = torch.zeros(1, 1, dtype=torch.float32)
+        data["global"].num_nodes = 1
+        # All 1D → global
+        data["oneD", "oneDglobal", "global"].edge_index = torch.stack([
+            torch.arange(n_1d, dtype=torch.long),
+            torch.zeros(n_1d, dtype=torch.long),
+        ], dim=0)
+        data["oneD", "oneDglobal", "global"].edge_attr_static = torch.zeros(n_1d, 1)
+        # All 2D → global
+        data["twoD", "twoDglobal", "global"].edge_index = torch.stack([
+            torch.arange(n_2d, dtype=torch.long),
+            torch.zeros(n_2d, dtype=torch.long),
+        ], dim=0)
+        data["twoD", "twoDglobal", "global"].edge_attr_static = torch.zeros(n_2d, 1)
+        # Global → all 1D
+        data["global", "globaloneD", "oneD"].edge_index = torch.stack([
+            torch.zeros(n_1d, dtype=torch.long),
+            torch.arange(n_1d, dtype=torch.long),
+        ], dim=0)
+        data["global", "globaloneD", "oneD"].edge_attr_static = torch.zeros(n_1d, 1)
+        # Global → all 2D
+        data["global", "globaltwoD", "twoD"].edge_index = torch.stack([
+            torch.zeros(n_2d, dtype=torch.long),
+            torch.arange(n_2d, dtype=torch.long),
+        ], dim=0)
+        data["global", "globaltwoD", "twoD"].edge_attr_static = torch.zeros(n_2d, 1)
+
     data.validate()
     return data
 
@@ -453,6 +485,13 @@ def make_x_dyn(
         x_dyn["oneD"] = torch.cat([y_pred_1d, rain_1d, wl_2d_for_1d], dim=-1)
     else:
         x_dyn["oneD"] = y_pred_1d
+
+    # Model_2 global context node: dummy zero dynamic input [B, 1] — one entry per graph in batch.
+    # B = y_pred_1d.size(0) / N_1d; rain_1d_index is always set for Model_2.
+    from data_config import SELECTED_MODEL as _SEL_MODEL_dyn
+    if _SEL_MODEL_dyn == "Model_2" and rain_1d_index is not None:
+        _B = y_pred_1d.size(0) // rain_1d_index.size(0)
+        x_dyn["global"] = torch.zeros(_B, 1, device=y_pred_1d.device, dtype=y_pred_1d.dtype)
 
     return x_dyn
 
@@ -914,8 +953,13 @@ class RecurrentFloodDataset(IterableDataset):
                 if sample is not None:
                     event_samples.append(sample)
 
-            # Yield complete batches — all from this event, in temporal order
-            # Tail remainder is dropped (drop_last semantics per event)
+            # Shuffle windows within the event for more diverse gradients per batch.
+            # Each sample is self-contained (h=0 init, no shared hidden state across samples)
+            # so temporal order within a batch doesn't matter.
+            if self.shuffle:
+                random.shuffle(event_samples)
+
+            # Yield complete batches — tail remainder is dropped (drop_last semantics per event)
             for i in range(0, len(event_samples) - self.batch_size + 1, self.batch_size):
                 batch_samples = event_samples[i: i + self.batch_size]
                 yield {
@@ -1297,7 +1341,26 @@ def get_model_config():
         ("twoD", "twoDoneD",    "oneD"): _cross_dim,
         ("oneD", "oneDtwoD",    "twoD"): _cross_dim,
     }
-    
+
+    # Model_2 only: add a single global context node connected to all real nodes.
+    # The global node aggregates basin-wide state and broadcasts it back each timestep.
+    # e_dim=1 (zero placeholder) — GATv2CrossTypeMP used (no meaningful static edge features).
+    # node_dyn_input_dims["global"]=1 (dummy zero input) keeps all existing GRU code paths intact.
+    if _SEL_MODEL == "Model_2":
+        node_types = ["oneD", "twoD", "global"]
+        edge_types += [
+            ("oneD",   "oneDglobal",  "global"),
+            ("twoD",   "twoDglobal",  "global"),
+            ("global", "globaloneD",  "oneD"),
+            ("global", "globaltwoD",  "twoD"),
+        ]
+        node_static_dims["global"] = 1   # dummy dim=1 (zero) — GATv2CrossTypeMP ignores x_static
+        node_dyn_input_dims["global"] = 1  # dummy zero input — virtual node has no observations
+        edge_static_dims[("oneD",   "oneDglobal",  "global")] = 1
+        edge_static_dims[("twoD",   "twoDglobal",  "global")] = 1
+        edge_static_dims[("global", "globaloneD",  "oneD")]   = 1
+        edge_static_dims[("global", "globaltwoD",  "twoD")]   = 1
+
     return {
         "node_types": node_types,
         "edge_types": edge_types,
