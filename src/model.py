@@ -287,12 +287,15 @@ class HeteroTransportCell(nn.Module):
         # ------------------------------------------------------------
         # A) Hetero message passing blocks (one per relation)
         # ------------------------------------------------------------
+        # Context node types: virtual nodes with no static features — always use GATv2
+        _ctx_types = {"ctx1d", "ctx2d", "global"}
+
         conv_dict = {}
         for (src, rel, dst) in edge_types:
             e_dim = edge_static_dims[(src, rel, dst)]
-            if (rel in ("oneDtwoD", "twoDoneD") and e_dim == 1) or "global" in (src, dst):
-                # GATv2Conv for cross-type edges when no rich edge features are available
-                # (Model_1: placeholder dim=1). Attention over node hidden states only.
+            if (rel in ("oneDtwoD", "twoDoneD") and e_dim == 1) or bool(_ctx_types & {src, dst}):
+                # GATv2Conv for: (a) cross-type edges with no rich edge features (Model_1),
+                # (b) any edge involving a context/global virtual node.
                 mp = GATv2CrossTypeMP(
                     h_dim=h_dim,
                     msg_dim=msg_dim,
@@ -353,6 +356,7 @@ class HeteroTransportCell(nn.Module):
         self.dyn_norm = nn.ModuleDict({
             nt: nn.LayerNorm(msg_dim) for nt in node_types
         })
+
 
     def forward(
         self,
@@ -490,7 +494,8 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         # hidden_dim may be a dict (edge-specific); heads use max value as their MLP width.
         # ------------------------------------------------------------
         _head_hidden = max(hidden_dim.values()) if isinstance(hidden_dim, dict) else hidden_dim
-        # "global" is a virtual node with no prediction target — exclude from heads
+        # Context/global nodes are virtual — exclude from prediction heads
+        _no_head = {"global", "ctx1d", "ctx2d"}
         self.heads = nn.ModuleDict({
             nt: nn.Sequential(
                 nn.LayerNorm(h_dim),
@@ -498,7 +503,7 @@ class FloodAutoregressiveHeteroModel(nn.Module):
                 nn.ReLU(),
                 nn.Linear(_head_hidden, 1),
             )
-            for nt in node_types if nt != "global"
+            for nt in node_types if nt not in _no_head
         })
 
     def _make_batched_graph(self, data: HeteroData, B: int) -> HeteroData:
@@ -600,8 +605,9 @@ class FloodAutoregressiveHeteroModel(nn.Module):
 
             y_true_k = {'oneD': y1d_k, 'twoD': y2d_k}
             x_dyn_t = make_x_dyn(y_true_k, r_k, batched_data)
-            if 'global' in self.node_types:
-                x_dyn_t['global'] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
+            for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                if _ctx in self.node_types:
+                    x_dyn_t[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
             h = self.cell(batched_data, h, x_dyn_t)
 
         # Start rollout from last observed water levels (flattened)
@@ -635,29 +641,21 @@ class FloodAutoregressiveHeteroModel(nn.Module):
                 'twoD': y_next['twoD'].reshape(B * N_2d, 1),
             }
             x_dyn_next = make_x_dyn(y_flat, r_next, batched_data)
-            if 'global' in self.node_types:
-                x_dyn_next['global'] = torch.zeros(B, 1, device=device, dtype=y_flat['oneD'].dtype)
+            for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                if _ctx in self.node_types:
+                    x_dyn_next[_ctx] = torch.zeros(B, 1, device=device, dtype=y_flat['oneD'].dtype)
             if use_grad_checkpoint and self.training:
-                # checkpoint requires all inputs to be tensors; pass h values as a flat list
-                h_1d, h_2d = h['oneD'], h['twoD']
-                if 'global' in self.node_types:
-                    h_global = h['global']
-                    def _cell_step(h_1d, h_2d, h_global, dyn_1d, dyn_2d, dyn_global):
-                        return self.cell(batched_data,
-                                         {'oneD': h_1d, 'twoD': h_2d, 'global': h_global},
-                                         {'oneD': dyn_1d, 'twoD': dyn_2d, 'global': dyn_global})
-                    h_out = grad_checkpoint(_cell_step, h_1d, h_2d, h_global,
-                                            x_dyn_next['oneD'], x_dyn_next['twoD'], x_dyn_next['global'],
-                                            use_reentrant=False)
-                else:
-                    def _cell_step(h_1d, h_2d, dyn_1d, dyn_2d):
-                        return self.cell(batched_data,
-                                         {'oneD': h_1d, 'twoD': h_2d},
-                                         {'oneD': dyn_1d, 'twoD': dyn_2d})
-                    h_out = grad_checkpoint(_cell_step, h_1d, h_2d,
-                                            x_dyn_next['oneD'], x_dyn_next['twoD'],
-                                            use_reentrant=False)
-                h = h_out
+                # Build flat tensors for grad_checkpoint (no dict support)
+                _ctx_types = [nt for nt in ('ctx1d', 'ctx2d', 'global') if nt in self.node_types]
+                _all_types = ['oneD', 'twoD'] + _ctx_types
+                h_tensors   = [h[nt] for nt in _all_types]
+                dyn_tensors = [x_dyn_next[nt] for nt in _all_types]
+                def _cell_step(*args):
+                    mid = len(args) // 2
+                    h_dict   = {nt: args[i]       for i, nt in enumerate(_all_types)}
+                    dyn_dict = {nt: args[mid + i]  for i, nt in enumerate(_all_types)}
+                    return self.cell(batched_data, h_dict, dyn_dict)
+                h = grad_checkpoint(_cell_step, *h_tensors, *dyn_tensors, use_reentrant=False)
             else:
                 h = self.cell(batched_data, h, x_dyn_next)
             y_t = y_flat

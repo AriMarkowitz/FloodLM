@@ -162,6 +162,26 @@ Once the model is fully trained and evaluated, re-run a few final epochs with th
 - [x] Added `GATv2CrossTypeMP` (4 heads) for `oneD→twoD` edges. Old `StaticDynamicEdgeMP` kept for all other edge types.
 - [ ] **Revert** — see above priority item.
 
+### ✅ Dual context nodes (ctx1d + ctx2d) + relative position embedding — IMPLEMENTED
+Replace the single global context node with two domain-specific context nodes that communicate with each other. Each node's GRU input is augmented with the context hidden state concatenated with its own static features, giving each node a sense of "where it is" in the global context.
+
+**Edge types** (all use GATv2CrossTypeMP, e_dim=1):
+```
+oneD  → ctx1d  → oneD     (1D domain context: aggregates all channels, broadcasts back)
+twoD  → ctx2d  → twoD     (2D domain context: aggregates all floodplain, broadcasts back)
+ctx1d → ctx2d             (channel context informs floodplain context)
+ctx2d → ctx1d             (floodplain context informs channel context)
+```
+
+**Relative position embedding**: at each timestep, concatenate context hidden state(s) with each node's own static features before the GRU update — lets the model learn "given global state X and I am at position/elevation Y, how should I update?" This is the key difference from just receiving a context message via edges.
+
+**Why dual > single global**: the single global node is dominated by 2D signal (~thousands of nodes vs ~200 1D nodes). Splitting ensures 1D nodes get a channel-network summary that isn't washed out by floodplain dynamics.
+
+**After confirming this works**: try K=3-5 parallel context nodes per domain (replace ctx1d with ctx1d_0..ctx1d_K). GATv2 attention will learn soft regional assignments without hard boundaries. Check learned attention weights for spatial clustering — if present, emergent regions appear for free.
+
+### Multiple learned context nodes per domain (K=3-5, soft regional embeddings)
+Extension of dual context nodes. Replace single ctx1d/ctx2d with K parallel nodes each. No hard region boundaries — GATv2 attention over all K context nodes learns soft assignments. Nodes that are hydraulically similar will naturally attend to the same context node. Only try after dual context nodes are confirmed to help; inspect attention weights for spatial structure before adding more K.
+
 ### Investigate attention-based MP for 1D→1D and 2D→2D edges
 Replace `StaticDynamicEdgeMP` with GAT-style attention for the within-type edges.
 
