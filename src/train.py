@@ -35,7 +35,7 @@ CONFIG = {
     'history_len': 10,
     'forecast_len': 64,          # Max rollout horizon (curriculum will sample 1..max_h per batch)
     'batch_size': 24,
-    'epochs': 36,                # Model_2: 6 epochs for h=1, 4 for h=2-8, 3 for h=16-48, 6 for h=64 (36 total); Model_1: 2 per stage
+    'epochs': 46,                # Model_2: 6@h1, 4@h2, 4@h4, 4@h6, 4@h8, 4@h16, 4@h24, 4@h32, 4@h48, 8@h64 (46 total); Model_1: 2 per stage
     'lr': 1e-3,
     'lr_final': 10**-4.5,          # ~3.16e-5; log-linear decay over all epochs (1.5 decades)
     'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
@@ -100,7 +100,7 @@ def save_normalization_stats(norm_stats, save_dir, model_id=None):
     print(f"[INFO] Saved normalization statistics to {stats_path}")
     print(f"[INFO] Saved normalizer objects to {normalizer_path}")
 
-def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_step=None, scheduler=None):
+def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_step=None, scheduler=None, optimizer=None):
     """Save model checkpoint and related information."""
     os.makedirs(save_dir, exist_ok=True)
 
@@ -122,6 +122,7 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_
         'global_step': global_step,
         'wandb_run_id': wandb.run.id if wandb.run is not None else None,
         'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
+        'optimizer_state': optimizer.state_dict() if optimizer is not None else None,
     }
     
     checkpoint_path = os.path.join(save_dir, f'{model_id}_epoch_{epoch:03d}.pt')
@@ -187,6 +188,52 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
         return float('nan'), float('nan'), float('nan'), None
     per_node_1d_mse = (per_node_1d_accum / n).numpy()
     return total / n, total_1d / n, total_2d / n, per_node_1d_mse
+
+
+def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, static_graph, device,
+                                history_len=10, use_mixed_precision=False, rain_1d_index=None):
+    """Run full autoregressive rollout (t=0 to T) on each val event and compute NRMSE.
+
+    Mirrors the inference loop exactly — warm-starts on history_len true timesteps,
+    then predicts autoregressively for the rest of the event.
+
+    Returns (combined_nrmse, nrmse_1d, nrmse_2d) averaged over all val events.
+    """
+    from autoregressive_inference import prepare_event_tensors, autoregressive_rollout_both
+
+    model.eval()
+    total_1d, total_2d = 0.0, 0.0
+    n_events = 0
+
+    with torch.no_grad():
+        for _, event_path, _ in val_event_file_list:
+            try:
+                from autoregressive_inference import load_event_data
+                node_1d, node_2d = load_event_data(event_path)
+                y1_all, y2_all, rain2_all, _, _, _ = prepare_event_tensors(node_1d, node_2d, norm_stats, device)
+                T = y1_all.size(0)
+                if T <= history_len:
+                    continue
+                y1_hist = y1_all[:history_len]   # [H, N1, 1]
+                y2_hist = y2_all[:history_len]   # [H, N2, 1]
+                with torch.amp.autocast('cuda', enabled=use_mixed_precision):
+                    pred_1d, pred_2d = autoregressive_rollout_both(
+                        model, static_graph, y1_hist, y2_hist, rain2_all, device, history_len=history_len
+                    )
+                # pred_1d: [T-H, N1, 1], y1_all[H:]: [T-H, N1, 1]
+                mse_1d = ((pred_1d - y1_all[history_len:]) ** 2).mean().item()
+                mse_2d = ((pred_2d - y2_all[history_len:]) ** 2).mean().item()
+                total_1d += mse_1d
+                total_2d += mse_2d
+                n_events += 1
+            except Exception as e:
+                print(f"[WARNING] Full-event val failed for {event_path}: {e}")
+
+    if n_events == 0:
+        return float('nan'), float('nan'), float('nan')
+    nrmse_1d = (total_1d / n_events) ** 0.5
+    nrmse_2d = (total_2d / n_events) ** 0.5
+    return (nrmse_1d + nrmse_2d) / 2, nrmse_1d, nrmse_2d
 
 
 def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None, mirror_latest=True):
@@ -427,6 +474,8 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     _static_graph_cpu = next(iter(train_dataloader))['static_graph']
     train_batched_graph = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
     val_batched_graph   = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device) if not skip_validation else None
+    _single_static_graph = _static_graph_cpu  # used by full-event rollout val (B=1 inference)
+    _val_event_file_list = data.get('val_event_file_list', [])
     # Capture rain_1d_index on device for use in make_x_dyn closures (graph-level attr
     # may not survive Batch.from_data_list so we pin it to a closure variable instead).
     _rain_1d_index = _static_graph_cpu.rain_1d_index.to(device) if hasattr(_static_graph_cpu, 'rain_1d_index') else None
@@ -474,8 +523,8 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         #   3 epochs for h=16-48, 6 epochs at h=64:
         #   1-6→1, 7-10→2, 11-14→4, 15-18→8, 19-21→16, 22-24→24, 25-27→32, 28-30→48, 31-36→64
         if SELECTED_MODEL == 'Model_2':
-            _m2_boundaries = [6, 10, 14, 18, 21, 24, 27, 30, 36]  # last epoch of each stage; h=1 runs 6 epochs
-            _m2_horizons   = [1,  2,  4,  8, 16, 24, 32, 48, 64]
+            _m2_boundaries = [6, 10, 14, 18, 22, 26, 30, 34, 38, 46]  # last epoch of each stage; 46 total
+            _m2_horizons   = [1,  2,  4,  6,  8, 16, 24, 32, 48, 64]
             _stage_idx = next((i for i, b in enumerate(_m2_boundaries) if epoch <= b), len(_m2_boundaries) - 1)
             max_h = _m2_horizons[_stage_idx]
         else:
@@ -640,9 +689,40 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                       f"1d={val_1d:.6e} (RMSE={val_rmse_1d:.4f}m, NRMSE={val_nrmse_1d:.4f})  "
                       f"2d={val_2d:.6e} (RMSE={val_rmse_2d:.4f}m, NRMSE={val_nrmse_2d:.4f})  "
                       f"approx_kaggle={val_nrmse_combined:.4f}")
+                # Full-event rollout val — mirrors inference exactly, much cheaper than
+                # windowed val and a far better proxy for the actual Kaggle score.
+                full_event_nrmse_combined = None
+                if _val_event_file_list:
+                    try:
+                        print(f"[INFO] Running full-event rollout val ({len(_val_event_file_list)} events)...")
+                        fe_combined, fe_1d, fe_2d = evaluate_full_event_rollout(
+                            model, _val_event_file_list, data, norm_stats,
+                            _single_static_graph, device,
+                            history_len=CONFIG['history_len'],
+                            use_mixed_precision=use_mixed_precision,
+                            rain_1d_index=_rain_1d_index,
+                        )
+                        full_event_nrmse_combined = fe_combined
+                        fe_rmse_1d = fe_1d * kaggle_sigma_1d
+                        fe_rmse_2d = fe_2d * kaggle_sigma_2d
+                        print(f"  full_event  combined={fe_combined:.4f}  "
+                              f"1d={fe_1d:.4f} (RMSE={fe_rmse_1d:.4f}m)  "
+                              f"2d={fe_2d:.4f} (RMSE={fe_rmse_2d:.4f}m)")
+                        wandb.log({
+                            'full_event_val/combined_nrmse': fe_combined,
+                            'full_event_val/1d_nrmse': fe_1d,
+                            'full_event_val/2d_nrmse': fe_2d,
+                            'full_event_val/1d_rmse_m': fe_rmse_1d,
+                            'full_event_val/2d_rmse_m': fe_rmse_2d,
+                        }, step=global_step)
+                    except Exception as e:
+                        print(f"[WARNING] Full-event rollout val failed: {e}")
+
                 if max_h == CONFIG['forecast_len']:
-                    if val_nrmse_combined < best_kaggle_at_max_h:
-                        best_kaggle_at_max_h = val_nrmse_combined
+                    # Use full-event NRMSE for best-checkpoint tracking when available
+                    _ckpt_metric = full_event_nrmse_combined if full_event_nrmse_combined is not None else val_nrmse_combined
+                    if _ckpt_metric < best_kaggle_at_max_h:
+                        best_kaggle_at_max_h = _ckpt_metric
                         best_kaggle_epoch = epoch
                         no_improve_count = 0
                         # Save best h=64 checkpoint — used by inference script
@@ -654,7 +734,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                                 dst_list.append(os.path.join(latest_dir, f'{SELECTED_MODEL}_best_h64.pt'))
                             for _dst in dst_list:
                                 _shutil.copy(best_h64_src, _dst)
-                            print(f"[INFO] New best h=64 checkpoint saved (approx_kaggle={val_nrmse_combined:.4f})")
+                            print(f"[INFO] New best h=64 checkpoint saved (metric={_ckpt_metric:.4f})")
                     else:
                         no_improve_count += 1
                         patience = CONFIG['early_stopping_patience']
@@ -708,7 +788,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
         # Checkpoint
         if epoch % CONFIG['checkpoint_interval'] == 0 or epoch == CONFIG['epochs']:
-            save_checkpoint(model, epoch, avg_epoch_loss, run_dir, CONFIG, global_step=global_step, scheduler=scheduler)
+            save_checkpoint(model, epoch, avg_epoch_loss, run_dir, CONFIG, global_step=global_step, scheduler=scheduler, optimizer=optimizer)
 
         # Best checkpoint tracking — always save the last epoch's checkpoint to latest/
         # (Early stopping is disabled: val loss is incomparable across epochs with different max_h)

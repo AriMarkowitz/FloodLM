@@ -303,6 +303,9 @@ def autoregressive_rollout_both(
     if rain_1d_index is not None:
         rain_1d_index = rain_1d_index.to(device)
 
+    # Detect if the model has a global context node (Model_2).
+    _has_global = 'global' in model.cell.node_types
+
     def _build_x_dyn(y1, y2, rain2_t):
         """Build x_dyn dict for one timestep. y1: [N1,1], y2: [N2,1], rain2_t: [N2,1]"""
         if rain_1d_index is not None:
@@ -311,10 +314,14 @@ def autoregressive_rollout_both(
             dyn_1d = torch.cat([y1, rain_1d_t, wl_2d_for_1d], dim=-1)  # [N1, 3]
         else:
             dyn_1d = y1
-        return {
+        x_dyn = {
             'oneD': dyn_1d.reshape(B * N1, -1),
             'twoD': torch.cat([y2, rain2_t], dim=-1).reshape(B * N2, -1),
         }
+        if _has_global:
+            # Global context node has no real observations — feed dummy zero [B, 1]
+            x_dyn['global'] = torch.zeros(B, 1, device=device, dtype=y1.dtype)
+        return x_dyn
 
     # Warm start with true history — inputs are [N, F], reshape to [B*N, F] = [N, F]
     for t in range(history_len):
@@ -527,12 +534,49 @@ def match_to_sample_submission(predictions_df, sample_path):
     return result
 
 
+def _find_best_by_val_loss(checkpoint_dir, model_id):
+    """Scan all .pt files in checkpoint_dir for Model_model_id and return the path
+    with the lowest val_loss stored in checkpoint metadata.  Falls back to None
+    if no readable checkpoints are found."""
+    import glob as _glob
+    pattern = os.path.join(checkpoint_dir, f"Model_{model_id}_*.pt")
+    candidates = sorted(_glob.glob(pattern))
+    if not candidates:
+        return None
+    best_path = None
+    best_loss = float('inf')
+    for path in candidates:
+        try:
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            loss = ckpt.get('val_loss', None)
+            if loss is None:
+                loss = ckpt.get('loss', None)
+            if loss is not None and float(loss) < best_loss:
+                best_loss = float(loss)
+                best_path = path
+        except Exception:
+            pass
+    if best_path:
+        print(f"[INFO] Best-by-val-loss in {checkpoint_dir}: {os.path.basename(best_path)} (val_loss={best_loss:.6e})")
+    return best_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Autoregressive inference for FloodLM competition (automatically processes both Model_1 and Model_2)'
     )
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
                         help='Directory containing model checkpoints (default: checkpoints/)')
+    parser.add_argument('--model1-dir', type=str, default=None,
+                        help='Checkpoint directory for Model_1 (overrides --checkpoint-dir for Model_1)')
+    parser.add_argument('--model2-dir', type=str, default=None,
+                        help='Checkpoint directory for Model_2 (overrides --checkpoint-dir for Model_2)')
+    parser.add_argument('--select', type=str, default='best_h64',
+                        choices=['best_h64', 'best', 'val_loss'],
+                        help='How to select the checkpoint from a directory: '
+                             'best_h64 = prefer Model_X_best_h64.pt then Model_X_best.pt (default); '
+                             'best = use Model_X_best.pt only; '
+                             'val_loss = scan all .pt files and pick lowest val_loss in checkpoint metadata')
     parser.add_argument('--output', type=str, default='submission.csv',
                         help='Output CSV file path')
     parser.add_argument('--sample', type=str, default='../FloodModel/sample_submission.csv',
@@ -542,7 +586,7 @@ def main():
                         help='Device to run inference on')
     parser.add_argument('--max-events', type=int, default=None,
                         help='Maximum number of events to process (for testing)')
-    
+
     args = parser.parse_args()
     
     # Setup device
@@ -560,7 +604,12 @@ def main():
     print("FloodLM Autoregressive Inference (Both Models)")
     print(f"{'='*70}")
     print(f"[INFO] Device: {device}")
-    print(f"[INFO] Checkpoint directory: {args.checkpoint_dir}")
+    print(f"[INFO] Checkpoint directory (default): {args.checkpoint_dir}")
+    if args.model1_dir:
+        print(f"[INFO] Model_1 checkpoint dir (override): {args.model1_dir}")
+    if args.model2_dir:
+        print(f"[INFO] Model_2 checkpoint dir (override): {args.model2_dir}")
+    print(f"[INFO] Checkpoint select policy: {args.select}")
     print(f"[INFO] Output: {args.output}")
     
     # Collect predictions from both models
@@ -609,17 +658,38 @@ def main():
             continue
         
         print(f"[INFO] Found {len(test_events)} test events for Model {model_id}")
-        
-        # Find checkpoint in checkpoint_dir (checkpoints/latest/ contains all models)
-        checkpoint_dir = args.checkpoint_dir
-        candidates = [
-            os.path.join(checkpoint_dir, f"Model_{model_id}_best_h64.pt"),  # best val at full horizon
-            os.path.join(checkpoint_dir, f"Model_{model_id}_best.pt"),       # fallback: last epoch
-            os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_003.pt"),
-            os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_002.pt"),
-            os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_001.pt"),
-        ]
-        model_checkpoint_path = next((c for c in candidates if os.path.exists(c)), None)
+
+        # Resolve which directory to search for this model's checkpoint.
+        # --model1-dir / --model2-dir override --checkpoint-dir per-model.
+        per_model_dir = args.model1_dir if model_id == 1 else args.model2_dir
+        checkpoint_dir = per_model_dir if per_model_dir is not None else args.checkpoint_dir
+
+        # Find checkpoint according to --select policy.
+        if args.select == 'val_loss':
+            model_checkpoint_path = _find_best_by_val_loss(checkpoint_dir, model_id)
+            if model_checkpoint_path is None:
+                print(f"[WARN] --select val_loss found nothing in {checkpoint_dir}; falling back to best_h64/best")
+        else:
+            model_checkpoint_path = None
+
+        if model_checkpoint_path is None:
+            # Standard priority: best_h64 → best → numbered epochs (only best_h64 skipped for --select best)
+            if args.select == 'best':
+                candidates = [
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_best.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_003.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_002.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_001.pt"),
+                ]
+            else:  # best_h64 (default)
+                candidates = [
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_best_h64.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_best.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_003.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_002.pt"),
+                    os.path.join(checkpoint_dir, f"Model_{model_id}_epoch_001.pt"),
+                ]
+            model_checkpoint_path = next((c for c in candidates if os.path.exists(c)), None)
 
         if model_checkpoint_path is None:
             print(f"[ERROR] No checkpoint found for Model {model_id}!")

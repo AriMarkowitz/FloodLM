@@ -18,8 +18,21 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="${PROJECT_DIR}/logs"
 
 # Arguments
+# Usage:
+#   bash run/pipeline_inference.sh [GPU_ID] [MODEL_SELECTION] [--model1-dir DIR] [--model2-dir DIR] [--select POLICY]
+#
+# Positional:
+#   GPU_ID          GPU index or "auto" (default: auto)
+#   MODEL_SELECTION Model_1 | Model_2 | all (default: all)
+#
+# Optional (forwarded to autoregressive_inference.py):
+#   --model1-dir DIR   Checkpoint dir for Model_1 (overrides default checkpoints/latest)
+#   --model2-dir DIR   Checkpoint dir for Model_2 (overrides default checkpoints/latest)
+#   --select POLICY    best_h64 | best | val_loss  (default: best_h64)
 GPU_ID="${1:-auto}"
-MODEL_SELECTION="${2:-Model_1}"
+MODEL_SELECTION="${2:-all}"
+shift 2 2>/dev/null || true   # remaining args forwarded to inference script
+EXTRA_INFERENCE_ARGS="$*"
 
 # Validate model selection
 case "${MODEL_SELECTION}" in
@@ -205,9 +218,9 @@ SUBMISSION_FILE="submission_${TIMESTAMP}.csv"
 log_info "Running inference for all trained models..."
 log_info "Output file: ${SUBMISSION_FILE}"
 log_info "Log file: ${LOG_FILE}"
-log_info "Command: ${PYTHON} src/autoregressive_inference.py --checkpoint-dir ${CHECKPOINT_DIR} --output ${SUBMISSION_FILE}"
+log_info "Command: ${PYTHON} src/autoregressive_inference.py --checkpoint-dir ${CHECKPOINT_DIR} --output ${SUBMISSION_FILE} ${EXTRA_INFERENCE_ARGS}"
 
-if cd "${PROJECT_DIR}" && ${PYTHON} -u src/autoregressive_inference.py --checkpoint-dir "${CHECKPOINT_DIR}" --output "${SUBMISSION_FILE}" 2>&1 | tee "${LOG_FILE}"; then
+if cd "${PROJECT_DIR}" && ${PYTHON} -u src/autoregressive_inference.py --checkpoint-dir "${CHECKPOINT_DIR}" --output "${SUBMISSION_FILE}" ${EXTRA_INFERENCE_ARGS} 2>&1 | tee "${LOG_FILE}"; then
     log_info "✓ Inference completed successfully"
     RESULTS_SUMMARY="${RESULTS_SUMMARY}
 ✓ Inference: Passed"

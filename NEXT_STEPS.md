@@ -241,6 +241,31 @@ Train a single model on both Model_1 and Model_2 data simultaneously.
 ---
 
 ## Data
+
+### ⭐ Antecedent rainfall and event-level global context features
+The model currently has no visibility into basin state *before* the event starts. Antecedent soil moisture is one of the strongest predictors of flood magnitude — a saturated basin from recent rain produces dramatically more runoff than a dry one. These features could be injected as scalar event-level inputs (concatenated into the global node's static features or as a separate event embedding broadcast to all nodes at t=0).
+
+**Antecedent rainfall (top priority)**
+- [ ] 7-day cumulative rainfall prior to event start — short-term soil moisture proxy
+- [ ] 30-day cumulative rainfall — medium-term saturation state
+- [ ] 60-day cumulative rainfall — seasonal moisture baseline
+- [ ] Days since last significant rainfall event — drainage/recovery time
+
+**Event characteristics**
+- [ ] Peak rainfall intensity (max hourly/daily rate within event) — distinguishes flash vs slow-rise events
+- [ ] Rainfall duration and timing (e.g. fraction of event elapsed at peak) — shape descriptor
+- [ ] Storm spatial distribution summary (e.g. std of rainfall across 2D nodes) — concentrated vs widespread
+
+**Seasonal / climatological context**
+- [ ] Day of year (sin/cos encoding) — captures snowmelt contribution, ET rates, vegetation state
+- [ ] Mean temperature at event start — drives snowmelt and evapotranspiration
+
+**Basin initial state**
+- [ ] Initial water levels at t=0 relative to long-term node mean — directly sets the "y-intercept" for the rollout; the model currently infers this from h=0 input but a normalized deviation from climatology would make it explicit
+- [ ] Initial spatial variance of water levels — distinguishes locally elevated vs basin-wide wet starts
+
+**Implementation path**: Add as scalar features to `data["global"].x_static` (currently dim=1, would grow to ~10). Requires verifying that pre-event rainfall data is available in the raw dataset or can be reconstructed from the event `timesteps.csv` files by looking back before `t=0`.
+
 - [ ] **Validate Model 2 data — raw and preprocessed**: Sanity-check for outliers, NaNs, unexpected value ranges, and whether flood event distribution is comparable to Model 1. The 1D loss spike magnitude (~10x worse) could partly be a data issue.
 - [ ] Evaluate whether 20% val split is sufficient or if more events are needed.
 - [ ] Consider adding a held-out test set once architecture is finalized.

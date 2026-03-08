@@ -11,7 +11,17 @@
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
 # Usage:
-#   sbatch submit_slurm.sh        # trains both Model_1 and Model_2
+#   sbatch slurm/submit_inference_slurm.sh
+#       # default: infer both models from checkpoints/latest, prefer best_h64
+#
+#   sbatch slurm/submit_inference_slurm.sh auto all \
+#       --model1-dir checkpoints/Model_1_20260307_123456 \
+#       --model2-dir checkpoints/Model_2_20260308_113327 \
+#       --select best_h64
+#       # use specific run dirs; pick best_h64 checkpoint from each
+#
+#   sbatch slurm/submit_inference_slurm.sh auto all --select val_loss
+#       # scan all .pt files in checkpoints/latest and pick lowest val_loss per model
 
 # Ensure log directory exists (must happen before SLURM tries to write output files,
 # so run `mkdir -p /users/admarkowitz/FloodLM/logs` once before your first sbatch)
@@ -33,7 +43,7 @@ echo "GPUs:          $CUDA_VISIBLE_DEVICES"
 echo "Started:       $(date)"
 echo ""
 
-bash run/pipeline_inference.sh auto all
+bash run/pipeline_inference.sh auto all "$@"
 
 echo ""
 echo "Finished: $(date)"
