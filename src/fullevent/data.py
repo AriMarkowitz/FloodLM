@@ -5,12 +5,23 @@ Reuses src/data_lazy.initialize_data() for normalization and preprocessing,
 then wraps events into a FullEventDataset where each sample is one entire event.
 
 Each sample:
-    y_hist_1d:      [H, N_1d, 1]       warm-start ground truth
+    y_hist_1d:      [H, N_1d, 1]       warm-start ground truth (fixed split)
     y_hist_2d:      [H, N_2d, 1]
     rain_hist_2d:   [H, N_2d, 1]
     y_future_1d:    [T_future, N_1d, 1] autoregressive target (variable length)
     y_future_2d:    [T_future, N_2d, 1]
     rain_future_2d: [T_future, N_2d, 1] rainfall for rollout timesteps
+
+    y_all_1d:       [T_total, N_1d, 1]  full raw sequence (for random-history mode)
+    y_all_2d:       [T_total, N_2d, 1]
+    rain_all_2d:    [T_total, N_2d, 1]
+
+Random-history mode (iter_grouped_random_split):
+    For each event, randomly sample split point h ~ Uniform(min_hist, T_total-1).
+    Use event[:h] as warm-start (teacher-forced), predict event[h:] autoregressively.
+    Trains the model to roll out from any point, not just t=H.
+    Events are grouped by bucketed T_future = round(T_total-h, bucket_size) for
+    memory-efficient same-length batching.
 """
 
 import os
@@ -43,9 +54,15 @@ NODE_ID_COL = "node_idx"
 
 
 def _compute_cache_key(event_list, history_len):
-    """Compute a deterministic cache key from event directories + history_len."""
+    """Compute a deterministic cache key from event directories.
+
+    history_len is included for backward-compat with existing cache files,
+    but since we now store full sequences (no fixed split), existing caches
+    with a different history_len will simply regenerate (one-time cost).
+    """
     dirs = sorted(item[1] if len(item) >= 2 else str(item) for item in event_list)
-    raw = f"h{history_len}|" + "|".join(dirs)
+    # Use history_len=0 in key to indicate full-sequence cache (history-len-independent)
+    raw = "h0|" + "|".join(dirs)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -84,8 +101,13 @@ class FullEventDataset(IterableDataset):
             t0 = time.time()
             print(f"[INFO] Loading cached dataset from {cache_file}...")
             self._samples = torch.load(cache_file, weights_only=False)
+            T_range = (
+                min(s['y_all_1d'].shape[0] for s in self._samples),
+                max(s['y_all_1d'].shape[0] for s in self._samples),
+            )
             print(f"[INFO] Loaded {len(self._samples)} events from cache in {time.time()-t0:.1f}s "
-                  f"(T_future range: {self._min_future()}-{self._max_future()} steps)")
+                  f"(T_total range: {T_range[0]}-{T_range[1]} steps, "
+                  f"T_future range with H={history_len}: {self._min_future()}-{self._max_future()} steps)")
             return
 
         normalizer_1d = norm_stats['normalizer_1d']
@@ -146,19 +168,20 @@ class FullEventDataset(IterableDataset):
             )
             rain_2d = torch.tensor(rain_vals, dtype=torch.float32).reshape(T_total, N_2d, 1)
 
-            H = history_len
+            # Store only the full raw sequence — no pre-split.
+            # Slicing in iter_grouped / iter_grouped_random_split is O(1) (view).
             self._samples.append({
-                'y_hist_1d':      wl_1d[:H],        # [H, N_1d, 1]
-                'y_hist_2d':      wl_2d[:H],        # [H, N_2d, 1]
-                'rain_hist_2d':   rain_2d[:H],      # [H, N_2d, 1]
-                'y_future_1d':    wl_1d[H:],        # [T_future, N_1d, 1]
-                'y_future_2d':    wl_2d[H:],        # [T_future, N_2d, 1]
-                'rain_future_2d': rain_2d[H:],      # [T_future, N_2d, 1]
+                'y_all_1d':    wl_1d,    # [T_total, N_1d, 1]
+                'y_all_2d':    wl_2d,    # [T_total, N_2d, 1]
+                'rain_all_2d': rain_2d,  # [T_total, N_2d, 1]
             })
 
         elapsed = time.time() - t0
         print(f"[INFO] Pre-loaded {len(self._samples)} events in {elapsed:.1f}s "
-              f"(T_future range: {self._min_future()}-{self._max_future()} steps)")
+              f"(T_total range: "
+              f"{min(s['y_all_1d'].shape[0] for s in self._samples)}-"
+              f"{max(s['y_all_1d'].shape[0] for s in self._samples)} steps, "
+              f"T_future with H={history_len}: {self._min_future()}-{self._max_future()} steps)")
 
         # Save cache for next time
         try:
@@ -171,30 +194,45 @@ class FullEventDataset(IterableDataset):
     def _min_future(self):
         if not self._samples:
             return 0
-        return min(s['y_future_1d'].shape[0] for s in self._samples)
+        H = self.history_len
+        return min(s['y_all_1d'].shape[0] - H for s in self._samples)
 
     def _max_future(self):
         if not self._samples:
             return 0
-        return max(s['y_future_1d'].shape[0] for s in self._samples)
+        H = self.history_len
+        return max(s['y_all_1d'].shape[0] - H for s in self._samples)
 
     def _t_future_counts(self):
         """Return dict mapping T_future → count of events with that length."""
+        H = self.history_len
         counts = defaultdict(int)
         for s in self._samples:
-            counts[s['y_future_1d'].shape[0]] += 1
+            counts[s['y_all_1d'].shape[0] - H] += 1
         return dict(sorted(counts.items()))
 
     def __len__(self):
         return len(self._samples)
 
+    def _split_sample(self, s, h):
+        """Slice a raw sample at split point h → (hist_dict, future_dict)."""
+        return {
+            'y_hist_1d':      s['y_all_1d'][:h],
+            'y_hist_2d':      s['y_all_2d'][:h],
+            'rain_hist_2d':   s['rain_all_2d'][:h],
+            'y_future_1d':    s['y_all_1d'][h:],
+            'y_future_2d':    s['y_all_2d'][h:],
+            'rain_future_2d': s['rain_all_2d'][h:],
+        }
+
     def __iter__(self):
-        """Yield individual samples (B=1 mode)."""
+        """Yield individual samples (B=1 mode) with fixed history_len split."""
+        H = self.history_len
         indices = list(range(len(self._samples)))
         if self.shuffle:
             random.shuffle(indices)
         for i in indices:
-            yield self._samples[i]
+            yield self._split_sample(self._samples[i], H)
 
     def iter_grouped(self, batch_size: int):
         """
@@ -214,10 +252,12 @@ class FullEventDataset(IterableDataset):
 
         B may be less than batch_size for the last batch of each group.
         """
+        H = self.history_len
+
         # Group indices by T_future
         groups = defaultdict(list)
         for idx, s in enumerate(self._samples):
-            T = s['y_future_1d'].shape[0]
+            T = s['y_all_1d'].shape[0] - H
             groups[T].append(idx)
 
         # Build list of (T_future, batch_indices) tuples
@@ -234,12 +274,102 @@ class FullEventDataset(IterableDataset):
             random.shuffle(all_batches)
 
         for T, batch_indices in all_batches:
-            samples = [self._samples[i] for i in batch_indices]
+            samples = [self._split_sample(self._samples[i], H) for i in batch_indices]
             batch = {
                 key: torch.stack([s[key] for s in samples], dim=0)
                 for key in samples[0].keys()
             }
             yield batch
+
+    def iter_grouped_random_split(self, batch_size: int,
+                                  eff_T: int,
+                                  min_hist: int = 1,
+                                  max_K: int = None):
+        """
+        Yield batches with curriculum-aware randomly-sampled warm-start splits.
+
+        For each event of length T_total, the rollout target is exactly eff_T steps
+        (the curriculum effective horizon). The split point h is sampled uniformly
+        over all positions that leave at least eff_T future steps:
+
+            h ~ Uniform(min_hist, T_total - eff_T)
+
+        Number of splits per event (K) scales with available split positions:
+            K = max(1, T_total - eff_T - min_hist + 1)
+        i.e. proportional to how many distinct valid h values exist. This keeps
+        the total gradient signal roughly constant across curriculum stages —
+        early training (small eff_T) → many splits per event; late training
+        (large eff_T) → few splits, approaching 1 at eff_T = T_total - min_hist.
+
+        All batches within an epoch share T_future = eff_T, so no bucketing is
+        needed — events pool together and batch directly, maximising GPU utilisation.
+
+        Events shorter than (min_hist + eff_T) are skipped for this epoch.
+
+        Each yielded batch:
+            y_hist_1d:      [B, h_actual, N_1d, 1]  (h_actual = min h in batch)
+            y_hist_2d:      [B, h_actual, N_2d, 1]
+            rain_hist_2d:   [B, h_actual, N_2d, 1]
+            y_future_1d:    [B, eff_T, N_1d, 1]
+            y_future_2d:    [B, eff_T, N_2d, 1]
+            rain_future_2d: [B, eff_T, N_2d, 1]
+        """
+        # Sample K independent splits per eligible event
+        assignments = []  # (h, idx)
+        for idx, s in enumerate(self._samples):
+            T_total = s['y_all_1d'].shape[0]
+            max_h = T_total - eff_T  # largest h that leaves eff_T future steps
+            if max_h < min_hist:
+                continue
+            K = max(1, max_h - min_hist + 1)  # number of distinct valid split positions
+            if max_K is not None:
+                K = min(K, max_K)
+            for _ in range(K):
+                h = random.randint(min_hist, max_h)
+                assignments.append((h, idx))
+
+        # Sort by h so items batched together have similar warm-start lengths,
+        # minimising history lost to min(h) truncation within each batch.
+        assignments.sort(key=lambda x: x[0])
+
+        # Build all batches, then shuffle batch order so the model doesn't always
+        # see short-history batches before long-history batches.
+        all_batches = [
+            assignments[start:start + batch_size]
+            for start in range(0, len(assignments), batch_size)
+        ]
+        if self.shuffle:
+            random.shuffle(all_batches)
+
+        for items in all_batches:
+
+            # Within a batch, h values are now close → min(h) loses very few steps
+            h_actual = min(h for h, _ in items)
+
+            hist_1d_list, hist_2d_list, rain_hist_list = [], [], []
+            fut_1d_list, fut_2d_list, rain_fut_list = [], [], []
+
+            for h_i, idx in items:
+                s = self._samples[idx]
+                y_all  = s['y_all_1d']
+                y2_all = s['y_all_2d']
+                r2_all = s['rain_all_2d']
+
+                hist_1d_list.append(y_all[:h_actual])
+                hist_2d_list.append(y2_all[:h_actual])
+                rain_hist_list.append(r2_all[:h_actual])
+                fut_1d_list.append(y_all[h_i:h_i + eff_T])
+                fut_2d_list.append(y2_all[h_i:h_i + eff_T])
+                rain_fut_list.append(r2_all[h_i:h_i + eff_T])
+
+            yield {
+                'y_hist_1d':      torch.stack(hist_1d_list, dim=0),   # [B, h_actual, N_1d, 1]
+                'y_hist_2d':      torch.stack(hist_2d_list, dim=0),
+                'rain_hist_2d':   torch.stack(rain_hist_list, dim=0),
+                'y_future_1d':    torch.stack(fut_1d_list, dim=0),    # [B, eff_T, N_1d, 1]
+                'y_future_2d':    torch.stack(fut_2d_list, dim=0),
+                'rain_future_2d': torch.stack(rain_fut_list, dim=0),
+            }
 
 
 def get_full_event_dataloader(split='train', shuffle=True, history_len=10):

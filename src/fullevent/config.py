@@ -23,10 +23,10 @@ KAGGLE_SIGMA = {
 # Training hyperparameters
 CONFIG = {
     'history_len': 10,          # Warm-start timesteps (teacher forcing with ground truth)
-    'max_batch_size': 4,        # Max events per batch (grouped by same T_future, no padding)
-    'max_BxT': 450,             # Memory budget: adaptive B = min(max_batch_size, max_BxT // T_eff)
+    'max_batch_size': 16,       # Max events per batch (grouped by same T_future, no padding)
+    'max_BxT': 1600,            # Memory budget: adaptive B = min(max_batch_size, max_BxT // T_eff)
     'grad_accum_steps': 4,      # Accumulate gradients over N batches before optimizer step
-    'epochs': 1000,
+    'epochs': 100,
     'lr': 5e-4,
     'lr_final': 1e-5,
     'grad_clip': 1.0,
@@ -44,11 +44,21 @@ CONFIG = {
     # At each epoch an "effective horizon" L grows geometrically from
     # L_start to T_max_global over the full training run.
     # Weight at timestep t = exp(-t / L), normalized to mean=1.
-    # Early epochs: only the first few timesteps matter (L≈2).
+    # Early epochs: only the first few timesteps matter (L≈0.6 → eff_T=3).
     # Late epochs:  nearly uniform (L≈T_max).
     # Set horizon_L_start=0 to disable (uniform from the start).
-    'horizon_L_start': 2.0,     # Initial effective horizon (in timesteps)
+    'horizon_L_start': 0.2,     # Initial effective horizon; eff_T = ceil(5*L) = 1 at epoch 1
     'horizon_power': 3,          # Power applied to progress curve (>1 = more time at short horizons)
+
+    # Random warm-start history augmentation.
+    # When True, for each event randomly sample split point h ~ Uniform(min_hist, T-1)
+    # instead of always splitting at history_len. The model learns to condition on
+    # any amount of prior history, closing the train/inference distribution gap.
+    # bucket_size: events are grouped by round(T_future, bucket_size) for same-length batching.
+    # min_hist: minimum warm-start length (should be ≥ 1).
+    'random_history': True,
+    'random_history_min_hist': 10,  # minimum warm-start steps (h >= this)
+    'random_history_max_K': 85,     # max splits sampled per event per epoch (caps early-curriculum bloat)
 
     # Model architecture — larger dims than base training to use available
     # GPU memory (base uses h=96/msg=64; we have ~38% VRAM headroom at B=1).

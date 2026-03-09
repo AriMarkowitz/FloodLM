@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import pickle
+import random
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +26,7 @@ if str(THIS_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from data import get_recurrent_dataloader, get_model_config, make_x_dyn
+from data import get_recurrent_dataloader, get_model_config, make_x_dyn, NonBatchableGraph
 from model import FloodAutoregressiveHeteroModel
 from data_lazy import initialize_data
 from data_config import SELECTED_MODEL
@@ -236,7 +237,7 @@ def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, st
     return (nrmse_1d + nrmse_2d) / 2, nrmse_1d, nrmse_2d
 
 
-def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None, mirror_latest=True):
+def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None, mirror_latest=True, cold_start_passes=None):
     """Main training loop.
     
     Args:
@@ -321,6 +322,8 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         split=train_split,
     )
     print(f"  Training split: {train_split}")
+    if cold_start_passes is not None:
+        print(f"  Cold-start mode: full-event rollout per event, {cold_start_passes} passes")
 
     if skip_validation:
         val_dataloader = None
@@ -497,6 +500,102 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
     epoch_start_time = time.time()
     global_step = _global_step_resume  # Restored from checkpoint on resume; 0 for fresh runs
+
+    # -----------------------------------------------------------------------
+    # Cold-start fine-tuning mode: train exclusively on the first window of
+    # each event (matching the inference condition) for N shuffled passes.
+    # Replaces the standard epoch loop entirely when --cold-start-passes is set.
+    # -----------------------------------------------------------------------
+    if cold_start_passes is not None:
+        from fullevent.data import get_full_event_dataset
+        print(f"[INFO] Cold-start fine-tuning: loading full-event dataset (train split={train_split})...")
+        cs_dataset = get_full_event_dataset(split=train_split, shuffle=True,
+                                            history_len=CONFIG['history_len'])
+        n_events = len(cs_dataset)
+        print(f"[INFO] Cold-start pool: {n_events} events, batch_size={CONFIG['batch_size']}, "
+              f"{cold_start_passes} passes (grouped by T_future for memory efficiency)")
+
+        # Move static graph to device once — reused for every cold-start batch
+        cs_static_graph_dev = _static_graph_cpu.to(device)
+
+        total_loss = 0.0
+        total_batches = 0
+        pass_start = time.time()
+
+        for pass_idx in range(1, cold_start_passes + 1):
+            cs_dataset.shuffle = True  # re-shuffle each pass
+            for batch in cs_dataset.iter_grouped(CONFIG['batch_size']):
+                y_hist_1d_b      = batch['y_hist_1d'].to(device, non_blocking=True)
+                y_hist_2d_b      = batch['y_hist_2d'].to(device, non_blocking=True)
+                rain_hist_2d_b   = batch['rain_hist_2d'].to(device, non_blocking=True)
+                y_future_1d_b    = batch['y_future_1d'].to(device, non_blocking=True)
+                y_future_2d_b    = batch['y_future_2d'].to(device, non_blocking=True)
+                rain_future_2d_b = batch['rain_future_2d'].to(device, non_blocking=True)
+                rollout_steps    = y_future_1d_b.shape[1]  # full event length (variable)
+                B = y_hist_1d_b.shape[0]
+
+                # Build batched static graph for this batch size (may differ from train_batched_graph)
+                cs_batched_graph = model._make_batched_graph(_static_graph_cpu, B).to(device)
+
+                optimizer.zero_grad()
+                with torch.amp.autocast('cuda', enabled=use_mixed_precision):
+                    predictions = model.forward_unroll(
+                        data=cs_static_graph_dev,
+                        y_hist_1d=y_hist_1d_b,
+                        y_hist_2d=y_hist_2d_b,
+                        rain_hist=rain_hist_2d_b,
+                        rain_future=rain_future_2d_b,
+                        make_x_dyn=lambda y, r, d: make_x_dyn(
+                            y['oneD'], y['twoD'], r, d,
+                            rain_1d_index=_rain_1d_index,
+                        ),
+                        rollout_steps=rollout_steps,
+                        device=device,
+                        batched_data=cs_batched_graph,
+                        use_grad_checkpoint=use_mixed_precision,
+                    )
+                    loss_1d = criterion(predictions['oneD'], y_future_1d_b)
+                    loss_2d = criterion(predictions['twoD'], y_future_2d_b)
+                    loss = (loss_1d + loss_2d) / 2
+
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                total_loss += loss.item()
+                total_batches += 1
+                global_step += 1
+                wandb.log({'loss/train': loss.item(), 'coldstart/rollout_steps': rollout_steps}, step=global_step)
+
+            if pass_idx % 50 == 0 or pass_idx == cold_start_passes:
+                elapsed = time.time() - pass_start
+                avg = total_loss / total_batches if total_batches > 0 else 0.0
+                print(f"[INFO] Cold-start pass {pass_idx}/{cold_start_passes} | "
+                      f"Avg loss: {avg:.6f} | {elapsed:.1f}s")
+
+        # Save final checkpoint and mirror to latest
+        save_checkpoint(model, start_epoch, total_loss / max(total_batches, 1),
+                        run_dir, CONFIG, global_step=global_step, scheduler=scheduler, optimizer=optimizer)
+        import shutil
+        best_checkpoint = os.path.join(run_dir, f'{SELECTED_MODEL}_epoch_{start_epoch:03d}.pt')
+        if os.path.exists(best_checkpoint) and mirror_latest:
+            shutil.copy(best_checkpoint, os.path.join(latest_dir, f'{SELECTED_MODEL}_best.pt'))
+            shutil.copy(best_checkpoint, os.path.join(latest_dir, f'{SELECTED_MODEL}_best_h64.pt'))
+            for fname in [f'{SELECTED_MODEL}_normalizers.pkl', f'{SELECTED_MODEL}_normalization_stats.json']:
+                src = os.path.join(run_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy(src, os.path.join(latest_dir, fname))
+            print(f"[INFO] Cold-start checkpoint mirrored to latest/")
+        print(f"\n[INFO] Cold-start fine-tuning complete: {cold_start_passes} passes, "
+              f"{total_batches} batches, avg loss={total_loss/max(total_batches,1):.6f}")
+        return
 
     # Mid-epoch validation disabled — at h=64 even 3-batch rollouts are expensive.
     # Full validation runs at end of each epoch instead.
@@ -861,6 +960,10 @@ if __name__ == "__main__":
                         help='Which data split to use for training. "all" = train+val+test (use only for final submission fine-tuning).')
     parser.add_argument('--no-mirror-latest', action='store_true',
                         help='Skip mirroring checkpoints to checkpoints/latest/. Use for probe/experimental runs to avoid overwriting the best saved model.')
+    parser.add_argument('--cold-start-passes', type=int, default=None,
+                        help='Fine-tune on cold-start windows only (first window per event). '
+                             'Runs N shuffled passes over the pool instead of the standard epoch loop. '
+                             'Intended for use with --resume and --max-h 64 at a low LR.')
     args = parser.parse_args()
     
     # Apply command-line overrides to CONFIG
@@ -886,4 +989,4 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('medium')  # Speeds up matmuls on L40S/A100
         # Actual fp16 autocast + GradScaler is applied inside train()
     
-    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain, train_split=args.train_split, extra_epochs=extra_epochs, mirror_latest=not args.no_mirror_latest)
+    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain, train_split=args.train_split, extra_epochs=extra_epochs, mirror_latest=not args.no_mirror_latest, cold_start_passes=args.cold_start_passes)
