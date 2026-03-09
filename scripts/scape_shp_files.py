@@ -1,16 +1,3 @@
-"""
-scrape_shp_files.py
-===================
-Scrape node and link shapefiles into pandas DataFrames.
-
-Two entry-point functions:
-  - process_node_shapefiles(paths)  -> dict[label, DataFrame]
-  - process_link_shapefiles(paths)  -> dict[label, DataFrame]
-
-Each function reads every attribute field in the shapefile and also adds
-derived geometric columns (x/y for nodes; length, start/end coords for links).
-"""
-
 import geopandas as gpd
 import numpy as np
 import pandas as pd
