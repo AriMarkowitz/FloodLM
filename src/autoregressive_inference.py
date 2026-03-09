@@ -33,7 +33,7 @@ if str(THIS_DIR) not in sys.path:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from data import unnormalize_col, get_model_config, create_static_hetero_graph
+from data import unnormalize_col, get_model_config, create_static_hetero_graph, compute_rainfall_features, RAIN_N_CHANNELS
 from model import FloodAutoregressiveHeteroModel
 from data_lazy import initialize_data
 from data_config import SELECTED_MODEL, DATA_FOLDER, BASE_PATH
@@ -47,8 +47,8 @@ def load_checkpoint(checkpoint_path, device):
     # Get model config (graph topology)
     model_config = get_model_config()
 
-    # Merge architecture hyperparams from checkpoint (h_dim, msg_dim, hidden_dim).
-    # Fallback for old checkpoints that predate model_arch_config serialization.
+    # Merge architecture hyperparams from checkpoint (h_dim, msg_dim, hidden_dim,
+    # node_dyn_input_dims). Fallback for old checkpoints that predate serialization.
     arch_config = checkpoint.get('model_arch_config', {
         'h_dim': 96,
         'msg_dim': 64,
@@ -61,7 +61,22 @@ def load_checkpoint(checkpoint_path, device):
             'oneDtwoD':    64,
         },
     })
-    model_config.update(arch_config)
+    # node_dyn_input_dims may differ between old checkpoints (oneD=3, twoD=2) and new
+    # ones trained with augmented rainfall features (oneD=8, twoD=7). Always restore
+    # from checkpoint so the model is built with the dims it was trained with.
+    if 'node_dyn_input_dims' in arch_config:
+        model_config['node_dyn_input_dims'] = arch_config['node_dyn_input_dims']
+    else:
+        # Old checkpoint — trained with raw rainfall only (1 channel)
+        model_config['node_dyn_input_dims'] = {'oneD': 3, 'twoD': 2}
+        if 'global' in model_config.get('node_types', []):
+            model_config['node_dyn_input_dims']['global'] = 1
+    model_config.update({k: v for k, v in arch_config.items() if k != 'node_dyn_input_dims'})
+
+    # Determine how many rain channels this checkpoint expects.
+    # twoD dyn_input = 1 (water_level) + n_rain_channels, so n_rain_channels = twoD_dim - 1.
+    _twoD_dyn = model_config['node_dyn_input_dims'].get('twoD', 2)
+    n_rain_channels = _twoD_dyn - 1  # 1 for old checkpoints, RAIN_N_CHANNELS for new ones
 
     # Initialize model
     model = FloodAutoregressiveHeteroModel(**model_config)
@@ -234,7 +249,7 @@ def prepare_event_tensors(node_1d, node_2d, norm_stats, device):
 
     y1_all = np.zeros((T, N1, 1), dtype=np.float32)
     y2_all = np.zeros((T, N2, 1), dtype=np.float32)
-    rain2_all = np.zeros((T, N2, 1), dtype=np.float32)
+    rain2_raw = np.zeros((T, N2), dtype=np.float32)
 
     for t_idx, t in enumerate(timesteps):
         t1 = node_1d[node_1d['timestep'] == t].sort_values('node_idx')
@@ -247,12 +262,19 @@ def prepare_event_tensors(node_1d, node_2d, norm_stats, device):
         y2_all[t_idx, :, 0] = t2['water_level'].values
         if 'rainfall' not in t2.columns:
             raise KeyError("Missing required column in 2D event data: rainfall")
-        rain2_all[t_idx, :, 0] = t2['rainfall'].values
+        rain2_raw[t_idx, :] = t2['rainfall'].values
+
+    # Always compute augmented rainfall [T, N2, RAIN_N_CHANNELS].
+    # Callers that loaded an old checkpoint (1-channel rain) should slice [:, :, :1].
+    rain2_aug = compute_rainfall_features(
+        torch.tensor(rain2_raw, dtype=torch.float32),
+        rain_sum_maxes=norm_stats.get('rain_sum_maxes'),
+    )
 
     return (
         torch.tensor(y1_all, dtype=torch.float32, device=device),
         torch.tensor(y2_all, dtype=torch.float32, device=device),
-        torch.tensor(rain2_all, dtype=torch.float32, device=device),
+        rain2_aug.to(device),
         timesteps,
         node_ids_1d,
         node_ids_2d,
@@ -423,10 +445,11 @@ def process_all_events(
             # Load event data
             node_1d, node_2d = load_event_data(event_dir)
 
-            # Prepare tensors
+            # Prepare tensors — slice rain to the number of channels the model expects
             y1_all, y2_all, rain2_all, timesteps, node_ids_1d, node_ids_2d = prepare_event_tensors(
                 node_1d, node_2d, norm_stats, device
             )
+            rain2_all = rain2_all[:, :, :n_rain_channels]
 
             T_total = y2_all.size(0)
             

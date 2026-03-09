@@ -741,15 +741,13 @@ class RecurrentFloodDataset(IterableDataset):
         - y_future_2d:    [B, T, N_2d, 1]
         - rain_future_2d: [B, T, N_2d, RAIN_N_CHANNELS] augmented future rainfall
 
-    Rainfall channels (RAIN_N_CHANNELS=8):
+    Rainfall channels (RAIN_N_CHANNELS=6):
         0: raw normalized rainfall
-        1: mean rainfall since event start (cumsum/t+1)
-        2: 6-step rolling sum (normalized by global max)
-        3: 12-step rolling sum (normalized by global max)
-        4: 24-step rolling sum (normalized by global max)
-        5: 36-step rolling sum (normalized by global max)
-        6: sin(t_abs / T_max) — absolute event position encoding
-        7: cos(t_abs / T_max) — absolute event position encoding
+        1: cumulative sum since event start
+        2: 6-step rolling mean
+        3: 12-step rolling mean
+        4: 24-step rolling mean
+        5: 36-step rolling mean
     """
     def __init__(
         self,
@@ -972,7 +970,7 @@ class RecurrentFloodDataset(IterableDataset):
             T_event = max_timestep - min_timestep + 1
             rain_raw_event = torch.tensor(
                 n2["rainfall"].values.reshape(T_event, self.n_nodes_2d), dtype=torch.float32)
-            rain_aug_event = compute_rainfall_features(rain_raw_event, rain_sum_maxes=self.norm_stats.get('rain_sum_maxes'), t_offset=min_timestep)  # [T, N_2d, R]
+            rain_aug_event = compute_rainfall_features(rain_raw_event)  # [T, N_2d, R]
 
             # Collect all valid windows for this event in temporal order
             event_samples = []
@@ -1094,7 +1092,7 @@ class ShuffledFloodDataset(IterableDataset):
                 n2["water_level"].values.reshape(T, self.n_nodes_2d), dtype=torch.float32)
             rain_raw = torch.tensor(
                 n2["rainfall"].values.reshape(T, self.n_nodes_2d), dtype=torch.float32)
-            rain_aug = compute_rainfall_features(rain_raw, rain_sum_maxes=norm_stats.get('rain_sum_maxes'))
+            rain_aug = compute_rainfall_features(rain_raw)  # [T, N_2d, RAIN_N_CHANNELS]
 
             self._events.append((wl_1d, wl_2d, rain_aug))
 
@@ -1156,50 +1154,32 @@ class ShuffledFloodDataset(IterableDataset):
 
 # Moving-average window sizes (in timesteps) appended after raw rainfall
 RAIN_MA_WINDOWS = [6, 12, 24, 36]
-# Max event length for positional encoding (sin/cos normalization)
-RAIN_T_MAX = 205.0
-# Total rainfall channels per node: raw + event-mean + len(RAIN_MA_WINDOWS) rolling sums + sin + cos
-RAIN_N_CHANNELS = 1 + 1 + len(RAIN_MA_WINDOWS) + 2  # = 8
+# Total rainfall channels per node: raw + cumulative + len(RAIN_MA_WINDOWS) MAs
+RAIN_N_CHANNELS = 1 + 1 + len(RAIN_MA_WINDOWS)  # = 6
 
 
-def compute_rainfall_features(rain_series: torch.Tensor, rain_sum_maxes=None,
-                              t_offset: int = 0) -> torch.Tensor:
-    """Compute augmented rainfall + positional feature tensor for a full event.
+def compute_rainfall_features(rain_series: torch.Tensor) -> torch.Tensor:
+    """Compute augmented rainfall feature tensor for a full event.
 
     Args:
-        rain_series:    [T, N] normalized raw rainfall (float32)
-        rain_sum_maxes: array-like of length len(RAIN_MA_WINDOWS), global max rolling sum
-                        per window computed over training events. Used to normalize channels
-                        2-5. If None, falls back to dividing by window size.
-        t_offset:       absolute timestep index of the first row in rain_series within the
-                        event. Used to compute correct sin/cos positional encoding.
+        rain_series: [T, N] normalized raw rainfall (float32)
 
     Returns:
         [T, N, RAIN_N_CHANNELS] where channels are:
-          0: raw rainfall (normalized)
-          1: mean rainfall since event start (cumsum / t+1)
-          2..5: rolling sums over last 6, 12, 24, 36 timesteps, divided by global max
-          6: sin(t_abs / RAIN_T_MAX)  — absolute positional encoding
-          7: cos(t_abs / RAIN_T_MAX)  — absolute positional encoding
+          0: raw rainfall
+          1: cumulative sum up to t (inclusive)
+          2..5: rolling means over last 6, 12, 24, 36 timesteps (zero-padded before event start)
     """
     T, N = rain_series.shape
     out = torch.zeros(T, N, RAIN_N_CHANNELS, dtype=torch.float32)
     out[:, :, 0] = rain_series
-    # Mean rainfall since event start (cumsum / t+1)
-    cumsum = rain_series.cumsum(dim=0)  # [T, N]
-    counts = torch.arange(1, T + 1, dtype=torch.float32).unsqueeze(1)  # [T, 1]
-    out[:, :, 1] = cumsum / counts
-    # Rolling window sums normalized by global training max per window
+    # Cumulative sum
+    out[:, :, 1] = rain_series.cumsum(dim=0)
+    # Rolling means — pad with zeros before event start
     for i, w in enumerate(RAIN_MA_WINDOWS):
-        norm = float(rain_sum_maxes[i]) if rain_sum_maxes is not None else float(w)
         for t in range(T):
             t0 = max(0, t - w + 1)
-            out[t, :, 2 + i] = rain_series[t0:t + 1].sum(dim=0) / norm
-    # Absolute positional encoding: sin/cos of absolute timestep / T_max
-    # t_offset accounts for windows that start mid-event
-    t_abs = torch.arange(t_offset, t_offset + T, dtype=torch.float32) / RAIN_T_MAX  # [T]
-    out[:, :, 6] = torch.sin(t_abs).unsqueeze(1)  # broadcast over N
-    out[:, :, 7] = torch.cos(t_abs).unsqueeze(1)
+            out[t, :, 2 + i] = rain_series[t0:t + 1].mean(dim=0)
     return out
 
 
@@ -1431,7 +1411,7 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
 
         Rainfall channels (RAIN_N_CHANNELS=6):
           0: raw normalized rainfall
-          1: mean rainfall since event start (cumsum/t+1)
+          1: cumulative sum since event start
           2–5: rolling means over 6, 12, 24, 36 timesteps (zero-padded before event start)
     """
     # Initialize data lazily on first call
@@ -1569,8 +1549,8 @@ def get_model_config():
     # 2D: water_level + rain_channels
     # rain_channels = RAIN_N_CHANNELS (raw + cumulative + 4 moving averages = 6)
     node_dyn_input_dims = {
-        "oneD": 1 + RAIN_N_CHANNELS + 1,  # water_level + rain_channels(8) + wl_connected_2d = 10
-        "twoD": 1 + RAIN_N_CHANNELS,       # water_level + rain_channels(8) = 9
+        "oneD": 1 + RAIN_N_CHANNELS + 1,  # water_level + rain_channels + wl_connected_2d
+        "twoD": 1 + RAIN_N_CHANNELS,       # water_level + rain_channels
     }
 
     # Static edge feature dimensions

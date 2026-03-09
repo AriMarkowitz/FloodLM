@@ -345,35 +345,6 @@ def initialize_data():
     print(f"[INFO] Final 1D features: {len(node1d_cols)} ({sum(1 for v in feature_type_1d.values() if v=='static')} static, {sum(1 for v in feature_type_1d.values() if v=='dynamic')} dynamic)")
     print(f"[INFO] Final 2D features: {len(node2d_cols)} ({sum(1 for v in feature_type_2d.values() if v=='static')} static, {sum(1 for v in feature_type_2d.values() if v=='dynamic')} dynamic)")
     
-    # Pass 2: compute global max rolling sum per window across all training events.
-    # Used to normalize rainfall history features in compute_rainfall_features().
-    # Only training events used to avoid data leakage.
-    print(f"[INFO] Computing rainfall rolling-sum normalization (Pass 2, {len(train_events)} train events)...")
-    from data import RAIN_MA_WINDOWS
-    import numpy as np
-    rain_sum_maxes = np.zeros(len(RAIN_MA_WINDOWS), dtype=np.float32)
-    for event_dir in train_events:
-        try:
-            n2_rain = pd.read_csv(event_dir + "/2d_nodes_dynamic_all.csv")
-            n2_rain = n2_rain.drop(columns=[c for c in EXCLUDE_2D_DYNAMIC if c in n2_rain.columns])
-            n2_rain = normalizer_2d.transform_dynamic(n2_rain, exclude_cols=None)
-            n2_rain = n2_rain.sort_values(['timestep', NODE_ID_COL]).reset_index(drop=True)
-            T_ev = n2_rain['timestep'].nunique()
-            N_ev = n2_rain[NODE_ID_COL].nunique()
-            rain_norm = n2_rain['rainfall'].values.reshape(T_ev, N_ev)  # [T, N]
-            for i, w in enumerate(RAIN_MA_WINDOWS):
-                for t in range(T_ev):
-                    t0 = max(0, t - w + 1)
-                    # sum over timesteps only → [N], then take max over nodes
-                    s = rain_norm[t0:t + 1].sum(axis=0).max()
-                    if s > rain_sum_maxes[i]:
-                        rain_sum_maxes[i] = s
-        except Exception as e:
-            print(f"[WARN] Pass 2 failed for {event_dir}: {e}")
-    # Add a small epsilon to avoid division by zero
-    rain_sum_maxes = np.maximum(rain_sum_maxes, 1e-6)
-    print(f"[INFO] Rolling sum maxes (windows {RAIN_MA_WINDOWS}): {rain_sum_maxes.tolist()}")
-
     # Build norm_stats
     norm_stats = {
         "oneD_mu": torch.zeros(len(node1d_cols)),
@@ -396,7 +367,6 @@ def initialize_data():
         "exclude_2d": EXCLUDE_2D_DYNAMIC,
         "normalizer_1d": normalizer_1d,
         "normalizer_2d": normalizer_2d,
-        "rain_sum_maxes": rain_sum_maxes,  # [len(RAIN_MA_WINDOWS)] global max per window
     }
     
     static_1d_cols = [c for c in normalizer_1d.static_features if c != NODE_ID_COL]

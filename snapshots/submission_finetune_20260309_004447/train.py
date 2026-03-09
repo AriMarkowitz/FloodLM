@@ -117,7 +117,6 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_
             'h_dim': model.h_dim,
             'msg_dim': model.cell.msg_dim,
             'hidden_dim': model.cell._hidden_dim,
-            'node_dyn_input_dims': CONFIG.get('node_dyn_input_dims'),
         },
         'loss': loss,
         'model_id': model_id,
@@ -193,8 +192,7 @@ def evaluate_rollout(model, dataloader, criterion, device, norm_stats, rollout_s
 
 
 def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, static_graph, device,
-                                history_len=10, use_mixed_precision=False, rain_1d_index=None,
-                                n_rain_channels=None):
+                                history_len=10, use_mixed_precision=False, rain_1d_index=None):
     """Run full autoregressive rollout (t=0 to T) on each val event and compute NRMSE.
 
     Mirrors the inference loop exactly — warm-starts on history_len true timesteps,
@@ -214,8 +212,6 @@ def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, st
                 from autoregressive_inference import load_event_data
                 node_1d, node_2d = load_event_data(event_path)
                 y1_all, y2_all, rain2_all, _, _, _ = prepare_event_tensors(node_1d, node_2d, norm_stats, device)
-                if n_rain_channels is not None:
-                    rain2_all = rain2_all[:, :, :n_rain_channels]
                 T = y1_all.size(0)
                 if T <= history_len:
                     continue
@@ -347,8 +343,6 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     print(f"  Node types: {model_config['node_types']}")
     print(f"  Node static dims: {model_config['node_static_dims']}")
     print(f"  Node dynamic dims: {model_config['node_dyn_input_dims']}")
-    CONFIG['node_dyn_input_dims'] = model_config['node_dyn_input_dims']
-    _n_rain_channels = model_config['node_dyn_input_dims']['twoD'] - 1  # twoD = wl + rain_channels
     
     # Initialize model
     print(f"\n[INFO] Building model...")
@@ -421,11 +415,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
             if 'scheduler_state' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state'])
-                # base_lrs is saved in scheduler state from the original run.
-                # After load, base_lrs may reflect the old lr (e.g. 1e-3) — override
-                # with the current CONFIG lr so scheduler.step() doesn't jump to old scale.
-                scheduler.base_lrs = [CONFIG['lr']] * len(scheduler.base_lrs)
-                print(f"[INFO] Scheduler state restored (base_lrs overridden to {CONFIG['lr']:.2e})")
+                print(f"[INFO] Scheduler state restored")
             
             # Get start epoch from checkpoint metadata
             if 'epoch' in checkpoint:
@@ -810,7 +800,6 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                             history_len=CONFIG['history_len'],
                             use_mixed_precision=use_mixed_precision,
                             rain_1d_index=_rain_1d_index,
-                            n_rain_channels=_n_rain_channels,
                         )
                         full_event_nrmse_combined = fe_combined
                         fe_rmse_1d = fe_1d * kaggle_sigma_1d
