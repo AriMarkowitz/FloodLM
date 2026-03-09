@@ -1,0 +1,6 @@
+Model_1_best_h64.pt: epoch=28, loss=0.000055, model_id=Model_1
+Model_1_best.pt: epoch=28, loss=0.000055, model_id=Model_1
+Model_2_best_fullevent_ep50.pt: epoch=50, loss=0.013387, model_id=Model_2
+Model_2_best_h64.pt: epoch=50, loss=0.003907, model_id=Model_2
+Model_2_best.pt: epoch=50, loss=0.003907, model_id=Model_2
+Model_3_best.pt: epoch=1, loss=0.661153, model_id=Model_3

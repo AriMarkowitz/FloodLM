@@ -49,7 +49,9 @@ for _p in (str(SRC_DIR), str(ROOT_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from fullevent.config import CONFIG, KAGGLE_SIGMA, SAVE_DIR, SELECTED_MODEL
+from fullevent.config import CONFIG as _CONFIG_DEFAULT, KAGGLE_SIGMA, SAVE_DIR as _SAVE_DIR_DEFAULT, SELECTED_MODEL
+CONFIG = _CONFIG_DEFAULT
+SAVE_DIR = _SAVE_DIR_DEFAULT
 from fullevent.data import get_full_event_dataloader, get_full_event_dataset
 from data_lazy import initialize_data
 from data import get_model_config, make_x_dyn, create_static_hetero_graph
@@ -189,7 +191,7 @@ def horizon_curriculum_weights(T_future: int, T_max_global: int,
 
 
 def effective_rollout_length(L: float, T_future: int, n_lifetimes: float = 5.0,
-                             min_steps: int = 3) -> int:
+                             min_steps: int = 1) -> int:
     """
     Compute the number of rollout steps needed given curriculum horizon L.
 
@@ -438,12 +440,16 @@ def full_event_forward(
             ).reshape(-1)  # [B*N_1d]
 
     # ---- Warm-start with ground truth ----
-    for t in range(H):
-        y1d_t = y_hist_1d[:, t, :, :].reshape(B * N_1d, -1)  # [B*N_1d, 1]
-        y2d_t = y_hist_2d[:, t, :, :].reshape(B * N_2d, -1)
-        r2d_t = rain_hist_2d[:, t, :, :].reshape(B * N_2d, -1)
-        x_dyn_t = _build_x_dyn(y1d_t, y2d_t, r2d_t, abs_t=t)
-        h = model.cell(batched_graph, h, x_dyn_t)
+    # No gradients needed through warm-start — loss only flows through the rollout.
+    # This is critical for memory: without no_grad, PyTorch stores activations for
+    # every warm-start step (up to hundreds of steps with random history), which OOMs.
+    with torch.no_grad():
+        for t in range(H):
+            y1d_t = y_hist_1d[:, t, :, :].reshape(B * N_1d, -1)  # [B*N_1d, 1]
+            y2d_t = y_hist_2d[:, t, :, :].reshape(B * N_2d, -1)
+            r2d_t = rain_hist_2d[:, t, :, :].reshape(B * N_2d, -1)
+            x_dyn_t = _build_x_dyn(y1d_t, y2d_t, r2d_t, abs_t=t)
+            h = model.cell(batched_graph, h, x_dyn_t)
 
     # ---- Autoregressive rollout ----
     node_counts = {'oneD': N_1d, 'twoD': N_2d}
@@ -535,14 +541,19 @@ def evaluate(model, val_dataset, static_graph_cpu, rain_1d_index, device,
 # Training
 # ============================================================
 
-def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
+def train(resume_from=None, use_mixed_precision=None, pretrain_from=None, config_override=None, save_dir_override=None):
+    # Allow caller to inject a different config/save_dir (e.g. --finetune mode)
+    _cfg = config_override if config_override is not None else CONFIG
+    _save_dir = save_dir_override if save_dir_override is not None else SAVE_DIR
+
     if use_mixed_precision is None:
-        use_mixed_precision = CONFIG['mixed_precision']
+        use_mixed_precision = _cfg['mixed_precision']
 
     model_id = f"FullEvent_{SELECTED_MODEL}"
     print("\n" + "=" * 70)
-    print(f"Full-Event Autoregressive Training — {SELECTED_MODEL}")
-    print(f"  Each training step = autoregressive rollout over one entire event")
+    _mode_label = "fine-tune" if config_override is not None else "scratch"
+    print(f"Full-Event Autoregressive Training — {SELECTED_MODEL} ({_mode_label})")
+    print(f"  Each batch = variable warm-start history → autoregressive rollout with expanding horizon curriculum")
     print(f"  Loss = Kaggle-aligned per-node RMSE (accounts for variable n)")
     print("=" * 70)
 
@@ -569,12 +580,12 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
     run_name = f"{model_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if _wandb_run_id:
         wandb.init(project="floodlm", group="fullevent", id=_wandb_run_id,
-                   resume="must", config=CONFIG)
+                   resume="must", config=_cfg)
     else:
-        wandb.init(project="floodlm", group="fullevent", name=run_name, config=CONFIG)
+        wandb.init(project="floodlm", group="fullevent", name=run_name, config=_cfg)
 
-    run_dir = os.path.join(SAVE_DIR, run_name)
-    latest_dir = os.path.join(SAVE_DIR, 'latest')
+    run_dir = os.path.join(_save_dir, run_name)
+    latest_dir = os.path.join(_save_dir, 'latest')
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(latest_dir, exist_ok=True)
 
@@ -618,24 +629,29 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
     # ---- Datasets (grouped batching) ----
     print("[INFO] Building datasets...")
     train_dataset = get_full_event_dataset(
-        split='train', shuffle=True, history_len=CONFIG['history_len'])
+        split='train', shuffle=True, history_len=_cfg['history_len'])
     val_dataset = get_full_event_dataset(
-        split='val', shuffle=False, history_len=CONFIG['history_len'])
-    _max_batch_size = CONFIG.get('max_batch_size', 4)
+        split='val', shuffle=False, history_len=_cfg['history_len'])
+    _max_batch_size = _cfg.get('max_batch_size', 4)
 
     # Discover T_max_global across all training events for curriculum weighting
     _T_max_global = train_dataset._max_future()
-    _horizon_L_start = CONFIG.get('horizon_L_start', 0)
-    _horizon_power = CONFIG.get('horizon_power', 1)
-    _max_BxT = CONFIG.get('max_BxT', 0)  # 0 = disabled (use fixed max_batch_size)
+    _horizon_L_start = _cfg.get('horizon_L_start', 0)
+    _horizon_power = _cfg.get('horizon_power', 1)
+    _max_BxT = _cfg.get('max_BxT', 0)  # 0 = disabled (use fixed max_batch_size)
+    _random_history = _cfg.get('random_history', False)
+    _rh_min_hist = _cfg.get('random_history_min_hist', 1)
+    _rh_max_K = _cfg.get('random_history_max_K', None)
     print(f"[INFO] T_max_global={_T_max_global}, horizon_L_start={_horizon_L_start}, horizon_power={_horizon_power}")
     print(f"[INFO] max_batch_size={_max_batch_size}, max_BxT={_max_BxT}")
+    print(f"[INFO] random_history={_random_history}"
+          + (f" (min_hist={_rh_min_hist}, max_K={_rh_max_K})" if _random_history else ""))
     print(f"[INFO] T_future distribution: {train_dataset._t_future_counts()}")
 
     # ---- Model ----
     # Bump dynamic input dims to account for time embedding
-    _time_embed_dim = CONFIG.get('time_embed_dim', 0)
-    _time_embed_max_period = CONFIG.get('time_embed_max_period', 512.0)
+    _time_embed_dim = _cfg.get('time_embed_dim', 0)
+    _time_embed_max_period = _cfg.get('time_embed_max_period', 512.0)
     if _time_embed_dim > 0:
         for nt in model_config['node_dyn_input_dims']:
             if nt not in ('global', 'ctx1d', 'ctx2d'):  # Don't add to virtual nodes
@@ -643,11 +659,49 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
         print(f"[INFO] Time embedding: dim={_time_embed_dim}, max_period={_time_embed_max_period}")
         print(f"[INFO] Adjusted node_dyn_input_dims: {model_config['node_dyn_input_dims']}")
 
+    # When loading pretrained weights, use the checkpoint's arch config so dims match.
+    _arch_h_dim = _cfg['h_dim']
+    _arch_msg_dim = _cfg['msg_dim']
+    _arch_hidden_dim = _cfg['hidden_dim']
+    if pretrain_from and not resume_path:
+        try:
+            _peek = torch.load(pretrain_from, map_location='cpu', weights_only=False)
+            _peek_arch = _peek.get('model_arch_config', {})
+            if _peek_arch:
+                _arch_h_dim = _peek_arch.get('h_dim', _arch_h_dim)
+                _arch_msg_dim = _peek_arch.get('msg_dim', _arch_msg_dim)
+                _arch_hidden_dim = dict(_peek_arch.get('hidden_dim', _arch_hidden_dim))
+                # model_arch_config may be missing global edge dims (saved before that feature).
+                # Detect them from state dict keys and add with a sensible default dim.
+                _state = _peek.get('model_state', {})
+                _global_edge_types = set()
+                for k in _state.keys():
+                    # Keys like: cell.mp_modules.oneD_oneDglobal_global.*
+                    # Edge type is the middle part: oneDglobal, globaloneD, etc.
+                    if 'mp_modules' in k:
+                        parts = k.split('.')
+                        if len(parts) >= 3:
+                            rel = parts[2]  # e.g. oneD_oneDglobal_global
+                            subparts = rel.split('_')
+                            if len(subparts) >= 2:
+                                edge_type = subparts[1]  # e.g. oneDglobal
+                                if 'global' in edge_type and edge_type not in _arch_hidden_dim:
+                                    _global_edge_types.add(edge_type)
+                if _global_edge_types:
+                    # Infer dim from existing cross-type edges as a fallback
+                    _fallback_dim = _arch_hidden_dim.get('twoDoneD', 32)
+                    for et in _global_edge_types:
+                        _arch_hidden_dim[et] = _fallback_dim
+                    print(f"[INFO] Detected global edge types from state dict: {sorted(_global_edge_types)} (dim={_fallback_dim})")
+                print(f"[INFO] Using checkpoint arch: h_dim={_arch_h_dim}, msg_dim={_arch_msg_dim}, hidden_dim={_arch_hidden_dim}")
+        except Exception as e:
+            print(f"[WARN] Could not peek checkpoint arch: {e}")
+
     print("[INFO] Building model...")
     model_config.update({
-        'h_dim': CONFIG['h_dim'],
-        'msg_dim': CONFIG['msg_dim'],
-        'hidden_dim': CONFIG['hidden_dim'],
+        'h_dim': _arch_h_dim,
+        'msg_dim': _arch_msg_dim,
+        'hidden_dim': _arch_hidden_dim,
     })
     model = FloodAutoregressiveHeteroModel(**model_config).to(device)
 
@@ -661,9 +715,9 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
     wandb.watch(model, log='all', log_freq=50)
 
     # ---- Optimizer / Scheduler ----
-    optimizer = Adam(model.parameters(), lr=CONFIG['lr'])
-    _lr_ratio = CONFIG['lr_final'] / CONFIG['lr']
-    _total_epochs = CONFIG['epochs']
+    optimizer = Adam(model.parameters(), lr=_cfg['lr'])
+    _lr_ratio = _cfg['lr_final'] / _cfg['lr']
+    _total_epochs = _cfg['epochs']
     scheduler = LambdaLR(
         optimizer,
         lr_lambda=lambda e: _lr_ratio ** (e / max(_total_epochs - 1, 1))
@@ -696,16 +750,26 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
             print(f"[WARN] Missing keys: {missing[:5]}{'...' if len(missing)>5 else ''}")
         if unexpected:
             print(f"[WARN] Unexpected keys: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
-        print(f"[INFO] Pretrained weights loaded (fresh optimizer & scheduler)")
+        if ckpt.get('optimizer_state'):
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state'])
+                # Override lr to match the fine-tune config (not the original training lr)
+                for pg in optimizer.param_groups:
+                    pg['lr'] = _cfg['lr']
+                print(f"[INFO] Pretrained weights + optimizer state loaded (lr reset to {_cfg['lr']})")
+            except Exception as e:
+                print(f"[WARN] Could not load optimizer state: {e}. Using fresh optimizer.")
+        else:
+            print(f"[INFO] Pretrained weights loaded (no optimizer state in checkpoint)")
 
     # ---- Logging setup ----
     sigma_1d = KAGGLE_SIGMA[SELECTED_MODEL]['oneD']
     sigma_2d = KAGGLE_SIGMA[SELECTED_MODEL]['twoD']
 
     print(f"\n[INFO] Training config:")
-    print(f"  Epochs: {CONFIG['epochs']}, LR: {CONFIG['lr']} → {CONFIG['lr_final']:.2e}")
+    print(f"  Epochs: {_cfg['epochs']}, LR: {_cfg['lr']} → {_cfg['lr_final']:.2e}")
     print(f"  Batch: up to {_max_batch_size} same-length events, "
-          f"grad_accum: {CONFIG['grad_accum_steps']} batches")
+          f"grad_accum: {_cfg['grad_accum_steps']} batches")
     print(f"  Loss: Kaggle-aligned per-node RMSE (normalizes by n automatically)")
     print(f"  Kaggle sigma 1D={sigma_1d}, 2D={sigma_2d}")
     print(f"  Mixed precision: {use_mixed_precision}")
@@ -716,7 +780,7 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
     no_improve = 0
     _train_start_time = time.time()  # Cumulative wall-clock tracking
 
-    for epoch in range(start_epoch, CONFIG['epochs'] + 1):
+    for epoch in range(start_epoch, _cfg['epochs'] + 1):
         model.train()
         epoch_loss = 0.0
         epoch_nrmse_1d = 0.0
@@ -747,12 +811,20 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
         }, step=global_step)
         optimizer.zero_grad(set_to_none=True)
 
-        for batch_idx, batch in enumerate(train_dataset.iter_grouped(_adaptive_B)):
+        _batch_iter = (
+            train_dataset.iter_grouped_random_split(
+                _adaptive_B, eff_T=_effective_T, min_hist=_rh_min_hist, max_K=_rh_max_K)
+            if _random_history
+            else train_dataset.iter_grouped(_adaptive_B)
+        )
+        for batch_idx, batch in enumerate(_batch_iter):
             B = batch['y_hist_1d'].size(0)
+            H_actual = batch['y_hist_1d'].size(1)
             T_full = batch['y_future_1d'].size(1)
 
-            # Truncate rollout BEFORE moving to GPU (saves VRAM)
-            T_future = effective_rollout_length(_effective_L, T_full)
+            # random_history mode: iterator already guarantees T_future = eff_T exactly.
+            # fixed-split mode: truncate to eff_T before moving to GPU (saves VRAM).
+            T_future = T_full if _random_history else effective_rollout_length(_effective_L, T_full)
 
             y_hist_1d    = batch['y_hist_1d'].to(device, non_blocking=True)
             y_hist_2d    = batch['y_hist_2d'].to(device, non_blocking=True)
@@ -798,7 +870,7 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
                 nrmse_2d = batch_nrmse_2d / B
 
                 # Scale by grad_accum so effective LR is stable
-                loss_scaled = loss / CONFIG['grad_accum_steps']
+                loss_scaled = loss / _cfg['grad_accum_steps']
 
             if scaler is not None:
                 scaler.scale(loss_scaled).backward()
@@ -812,26 +884,25 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
             global_step += 1
 
             wandb.log({
-                'epoch': epoch,
                 'train/loss': loss.item(),
                 'train/nrmse_1d': nrmse_1d,
                 'train/nrmse_2d': nrmse_2d,
                 'train/rollout_steps': T_future,
-                'train/batch_size': B,
                 'train/rmse_1d_m': nrmse_1d * sigma_1d,
                 'train/rmse_2d_m': nrmse_2d * sigma_2d,
+                'train/epoch': epoch,
                 'lr': optimizer.param_groups[0]['lr'],
             }, step=global_step)
 
             # Gradient accumulation: step every N batches
-            if (batch_idx + 1) % CONFIG['grad_accum_steps'] == 0:
+            if (batch_idx + 1) % _cfg['grad_accum_steps'] == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), _cfg['grad_clip'])
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), _cfg['grad_clip'])
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -839,17 +910,17 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
             if (batch_idx + 1) % 3 == 0:
                 avg = epoch_loss / max(n_events / B, 1)
                 print(f"  Epoch {epoch} | Batch {batch_idx+1} | "
-                      f"B={B} n={T_future}/{T_full} | loss={loss.item():.4f} | avg={avg:.4f}")
+                      f"hist={H_actual} n={T_future} | loss={loss.item():.4f} | avg={avg:.4f}")
 
         # Flush remaining accumulated gradients
-        if (batch_idx + 1) % CONFIG['grad_accum_steps'] != 0:
+        if (batch_idx + 1) % _cfg['grad_accum_steps'] != 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), _cfg['grad_clip'])
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), _cfg['grad_clip'])
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -861,7 +932,7 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
         mean_loss = epoch_loss / max(n_batches, 1)
         mean_1d = epoch_nrmse_1d / max(n_batches, 1)
         mean_2d = epoch_nrmse_2d / max(n_batches, 1)
-        print(f"\n[Epoch {epoch:03d}/{CONFIG['epochs']}] "
+        print(f"\n[Epoch {epoch:03d}/{_cfg['epochs']}] "
               f"loss={mean_loss:.4f}  NRMSE 1D={mean_1d:.4f} 2D={mean_2d:.4f}  "
               f"events={n_events} batches={n_batches}  "
               f"time={epoch_time:.0f}s  cumulative={cumulative_time/60:.1f}min")
@@ -892,6 +963,9 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
         val_time = time.time() - val_start
 
         # Free GPU memory after validation (reduces fragmentation before next epoch)
+        # Also clear graph_cache: inference_mode taints cached tensors, which would
+        # cause "Inference tensors cannot be saved for backward" on next training step.
+        graph_cache.clear()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -922,7 +996,7 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
         }, step=global_step)
 
         # ---- Checkpoint ----
-        if epoch % CONFIG['checkpoint_interval'] == 0:
+        if epoch % _cfg['checkpoint_interval'] == 0:
             save_checkpoint(
                 model, epoch, mean_loss, run_dir,
                 optimizer=optimizer, scheduler=scheduler,
@@ -954,7 +1028,7 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None):
             no_improve += 1
 
         # Early stopping — only active once curriculum horizon is substantial
-        patience = CONFIG['early_stopping_patience']
+        patience = _cfg['early_stopping_patience']
         if patience is not None and _curriculum_mostly_done and no_improve >= patience:
             print(f"[INFO] Early stopping at epoch {epoch} "
                   f"(no improvement for {no_improve} epochs)")
@@ -986,7 +1060,16 @@ if __name__ == '__main__':
                         help='Use AMP mixed precision training')
     parser.add_argument('--no-mixed-precision', action='store_true',
                         help='Disable mixed precision')
+    parser.add_argument('--finetune', action='store_true', default=False,
+                        help='Use fine-tune config (config_finetune.py): starts at eff_T=64, lower lr, fresh wandb run')
     args = parser.parse_args()
+
+    _config_override = None
+    _save_dir_override = None
+    if args.finetune:
+        from fullevent.config_finetune import CONFIG as _ft_config, SAVE_DIR as _ft_save_dir
+        _config_override = _ft_config
+        _save_dir_override = _ft_save_dir
 
     mp = args.mixed_precision
     if args.no_mixed_precision:
@@ -996,4 +1079,6 @@ if __name__ == '__main__':
         resume_from=args.resume,
         use_mixed_precision=mp,
         pretrain_from=args.pretrain_from,
+        config_override=_config_override,
+        save_dir_override=_save_dir_override,
     )

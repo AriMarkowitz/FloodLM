@@ -440,24 +440,20 @@ def make_x_dyn(
     """
     Construct dynamic input dict for one timestep.
 
-    Called by the model at each warm-start and rollout step to inject dynamic features.
+    This function is called by the model at each timestep to inject dynamic data.
 
     Args:
         y_pred_1d: [B*N_1d, 1] current water level estimate for 1D nodes
         y_pred_2d: [B*N_2d, 1] current water level estimate for 2D nodes
-        rain_2d:   [B*N_2d, RAIN_N_CHANNELS] augmented rainfall features for 2D nodes.
-            Channels: raw rainfall, cumulative sum, rolling means (6/12/24/36 steps).
+        rain_2d: [B*N_2d, R] rainfall features for 2D nodes
         data: HeteroData graph (contains num_nodes for sizing)
         rain_1d_index: [N_1d] LongTensor mapping each 1D node to its connected 2D node.
-            If provided, gathers rainfall and water_level from connected 2D nodes as extra
-            1D dynamic features.
+            If provided, gathers rainfall and water_level from connected 2D nodes as 1D dynamic features.
 
     Returns:
-        x_dyn_t: dict[str, torch.Tensor] with dynamic inputs per node type:
-          - x_dyn_t["oneD"]: [B*N_1d, 1 + RAIN_N_CHANNELS + 1]
-              water_level + rain_channels(from connected 2D node) + wl_connected_2d
-          - x_dyn_t["twoD"]: [B*N_2d, 1 + RAIN_N_CHANNELS]
-              water_level + rain_channels
+        x_dyn_t: dict[str, torch.Tensor] with dynamic inputs per node type
+          - x_dyn_t["oneD"]: [B*N_1d, dyn_dim_1d]  (1 or 3 features depending on rain_1d_index)
+          - x_dyn_t["twoD"]: [B*N_2d, dyn_dim_2d]
     """
     x_dyn = {}
 
@@ -722,34 +718,22 @@ class RecurrentFloodDataset(IterableDataset):
     """
     Dataset for recurrent model with static graph and dynamic time series.
 
-    Yields pre-formed batches of shape [B, ...] where every batch contains
+    Yields pre-formed batches of shape [B, ...] so that every batch contains
     windows from a single event only (temporal fidelity guaranteed).
-    For cross-event shuffled batching (recommended for training), use
-    ShuffledFloodDataset instead.
 
     Shuffling behaviour:
-      - shuffle=True : event order is randomised each epoch; windows within
-                       each event are also shuffled before batching.
+      - shuffle=True : event order is randomised each epoch; window order
+                       within each event is preserved (temporal order).
       - shuffle=False: events and windows are both iterated in original order.
 
     Returns batches as dicts with:
-        - static_graph:   HeteroData with static features only
+        - static_graph: HeteroData with static features only
         - y_hist_1d:      [B, H, N_1d, 1]
         - y_hist_2d:      [B, H, N_2d, 1]
-        - rain_hist_2d:   [B, H, N_2d, RAIN_N_CHANNELS] augmented rainfall history
+        - rain_hist_2d:   [B, H, N_2d, 1]
         - y_future_1d:    [B, T, N_1d, 1]
         - y_future_2d:    [B, T, N_2d, 1]
-        - rain_future_2d: [B, T, N_2d, RAIN_N_CHANNELS] augmented future rainfall
-
-    Rainfall channels (RAIN_N_CHANNELS=8):
-        0: raw normalized rainfall
-        1: mean rainfall since event start (cumsum/t+1)
-        2: 6-step rolling sum (normalized by global max)
-        3: 12-step rolling sum (normalized by global max)
-        4: 24-step rolling sum (normalized by global max)
-        5: 36-step rolling sum (normalized by global max)
-        6: sin(t_abs / T_max) — absolute event position encoding
-        7: cos(t_abs / T_max) — absolute event position encoding
+        - rain_future_2d: [B, T, N_2d, 1]
     """
     def __init__(
         self,
@@ -800,14 +784,8 @@ class RecurrentFloodDataset(IterableDataset):
         self.n_nodes_1d = len(static_1d_norm)
         self.n_nodes_2d = len(static_2d_norm)
         
-    def _build_sample(self, n1, n2, tcol, t_start, rain_aug_event=None, event_t0=0):
-        """Extract and validate a single window sample. Returns a dict or None if invalid.
-
-        Args:
-            rain_aug_event: [T_event, N_2d, RAIN_N_CHANNELS] pre-computed augmented rainfall
-                for the full event. If None, only raw rainfall (1 channel) is used.
-            event_t0: the minimum timestep value for this event (used to index rain_aug_event).
-        """
+    def _build_sample(self, n1, n2, tcol, t_start):
+        """Extract and validate a single window sample. Returns a dict or None if invalid."""
         t_hist_end = t_start + self.history_len - 1
         t_pred_end = t_hist_end + self.forecast_len
 
@@ -835,20 +813,12 @@ class RecurrentFloodDataset(IterableDataset):
         y_future_2d = torch.tensor(
             future_2d['water_level'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
             dtype=torch.float32)
-        if rain_aug_event is not None:
-            # Slice pre-computed augmented features [H/T, N_2d, R] from full-event tensor
-            i_hist_start = t_start - event_t0
-            i_hist_end   = i_hist_start + self.history_len
-            i_fut_end    = i_hist_end + self.forecast_len
-            rain_hist_2d   = rain_aug_event[i_hist_start:i_hist_end]    # [H, N_2d, R]
-            rain_future_2d = rain_aug_event[i_hist_end:i_fut_end]       # [T, N_2d, R]
-        else:
-            rain_hist_2d = torch.tensor(
-                hist_2d['rainfall'].values.reshape(self.history_len, self.n_nodes_2d, 1),
-                dtype=torch.float32)
-            rain_future_2d = torch.tensor(
-                future_2d['rainfall'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
-                dtype=torch.float32)
+        rain_hist_2d = torch.tensor(
+            hist_2d['rainfall'].values.reshape(self.history_len, self.n_nodes_2d, 1),
+            dtype=torch.float32)
+        rain_future_2d = torch.tensor(
+            future_2d['rainfall'].values.reshape(self.forecast_len, self.n_nodes_2d, 1),
+            dtype=torch.float32)
 
         # Finite check
         if not (torch.isfinite(y_hist_1d).all() and torch.isfinite(y_hist_2d).all() and
@@ -968,16 +938,10 @@ class RecurrentFloodDataset(IterableDataset):
             min_timestep = int(n1[tcol].min())
             max_timestep = int(n1[tcol].max())
 
-            # Pre-compute augmented rainfall features for the full event once.
-            T_event = max_timestep - min_timestep + 1
-            rain_raw_event = torch.tensor(
-                n2["rainfall"].values.reshape(T_event, self.n_nodes_2d), dtype=torch.float32)
-            rain_aug_event = compute_rainfall_features(rain_raw_event, rain_sum_maxes=self.norm_stats.get('rain_sum_maxes'), t_offset=min_timestep)  # [T, N_2d, R]
-
             # Collect all valid windows for this event in temporal order
             event_samples = []
             for t_start in range(min_timestep, max_timestep - self.history_len - self.forecast_len + 2):
-                sample = self._build_sample(n1, n2, tcol, t_start, rain_aug_event, min_timestep)
+                sample = self._build_sample(n1, n2, tcol, t_start)
                 if sample is not None:
                     event_samples.append(sample)
 
@@ -999,208 +963,6 @@ class RecurrentFloodDataset(IterableDataset):
                     'y_future_2d':    torch.stack([s['y_future_2d']    for s in batch_samples]),
                     'rain_future_2d': torch.stack([s['rain_future_2d'] for s in batch_samples]),
                 }
-
-
-# =========================
-# Cross-event shuffled dataset (all events pre-loaded in memory)
-# =========================
-
-class ShuffledFloodDataset(IterableDataset):
-    """
-    Dataset that pre-loads ALL events into memory as raw tensors and builds a
-    flat global window index list. On each epoch iteration the full list is
-    shuffled so every batch can contain windows from different events, giving
-    much richer gradient signal than per-event sequential batching.
-
-    Memory cost: ~0.6 GB for 68 events (raw tensors only; windows are sliced on-the-fly).
-
-    Yields pre-formed batches of shape [B, ...] identical to RecurrentFloodDataset.
-    """
-
-    def __init__(
-        self,
-        event_file_list,
-        static_1d_norm, static_2d_norm,
-        edges1d, edges2d, edges1d2d,
-        edges1dfeats_norm, edges2dfeats_norm,
-        static_1d_cols, static_2d_cols,
-        edge1_cols, edge2_cols,
-        norm_stats,
-        history_len=10,
-        forecast_len=1,
-        batch_size=1,
-        shuffle=True,
-        node_id_col: str = "node_idx",
-    ):
-        super().__init__()
-        self.history_len = history_len
-        self.forecast_len = forecast_len
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.node_id_col = node_id_col
-
-        self.static_graph = create_static_hetero_graph(
-            static_1d_norm, static_2d_norm,
-            edges1d, edges2d, edges1d2d,
-            edges1dfeats_norm, edges2dfeats_norm,
-            static_1d_cols, static_2d_cols,
-            edge1_cols, edge2_cols,
-            node_id_col=node_id_col,
-        )
-        self.n_nodes_1d = len(static_1d_norm)
-        self.n_nodes_2d = len(static_2d_norm)
-
-        normalizer_1d = norm_stats["normalizer_1d"]
-        normalizer_2d = norm_stats["normalizer_2d"]
-        exclude_1d = norm_stats.get("exclude_1d", [])
-        exclude_2d = norm_stats.get("exclude_2d", [])
-
-        # Pre-load every event as a tuple of raw tensors:
-        #   wl_1d:   [T, N_1d]
-        #   wl_2d:   [T, N_2d]
-        #   rain_2d: [T, N_2d, RAIN_N_CHANNELS]  (augmented)
-        self._events = []          # list of (wl_1d, wl_2d, rain_2d_aug)
-        self._window_index = []    # list of (event_idx, t_start) across all events
-
-        print(f"[ShuffledFloodDataset] Pre-loading {len(event_file_list)} events into memory...")
-        for ev_idx, item in enumerate(event_file_list):
-            if len(item) == 3:
-                _, event_dir, _ = item
-            else:
-                _, event_dir = item
-
-            n1 = pd.read_csv(event_dir + "/1d_nodes_dynamic_all.csv")
-            n2 = pd.read_csv(event_dir + "/2d_nodes_dynamic_all.csv")
-
-            n1 = n1.drop(columns=[c for c in exclude_1d if c in n1.columns])
-            n2 = n2.drop(columns=[c for c in exclude_2d if c in n2.columns])
-
-            n1 = normalizer_1d.transform_dynamic(n1, exclude_cols=None)
-            n2 = normalizer_2d.transform_dynamic(n2, exclude_cols=None)
-
-            n1 = pd.merge(n1, static_1d_norm, on=node_id_col, how="left")
-            n2 = pd.merge(n2, static_2d_norm, on=node_id_col, how="left")
-            n2 = preprocess_2d_nodes(n2)
-
-            tcol = "timestep_raw" if "timestep_raw" in n1.columns else "timestep"
-            n1 = n1.sort_values([tcol, node_id_col]).reset_index(drop=True)
-            n2 = n2.sort_values([tcol, node_id_col]).reset_index(drop=True)
-
-            T = n1[tcol].nunique()
-            # [T, N]
-            wl_1d = torch.tensor(
-                n1["water_level"].values.reshape(T, self.n_nodes_1d), dtype=torch.float32)
-            wl_2d = torch.tensor(
-                n2["water_level"].values.reshape(T, self.n_nodes_2d), dtype=torch.float32)
-            rain_raw = torch.tensor(
-                n2["rainfall"].values.reshape(T, self.n_nodes_2d), dtype=torch.float32)
-            rain_aug = compute_rainfall_features(rain_raw, rain_sum_maxes=norm_stats.get('rain_sum_maxes'))
-
-            self._events.append((wl_1d, wl_2d, rain_aug))
-
-            win_len = history_len + forecast_len
-            for t_start in range(T - win_len + 1):
-                self._window_index.append((ev_idx, t_start))
-
-        print(f"[ShuffledFloodDataset] Loaded {len(self._events)} events, "
-              f"{len(self._window_index)} total windows.")
-
-    def _get_window(self, ev_idx: int, t_start: int) -> dict:
-        wl_1d, wl_2d, rain_aug = self._events[ev_idx]
-        h = self.history_len
-        f = self.forecast_len
-        t_hist_end = t_start + h  # exclusive
-
-        y_hist_1d      = wl_1d[t_start:t_hist_end, :].unsqueeze(-1)           # [H, N_1d, 1]
-        y_hist_2d      = wl_2d[t_start:t_hist_end, :].unsqueeze(-1)           # [H, N_2d, 1]
-        rain_hist_2d   = rain_aug[t_start:t_hist_end, :, :]                   # [H, N_2d, R]
-        y_future_1d    = wl_1d[t_hist_end:t_hist_end + f, :].unsqueeze(-1)    # [T, N_1d, 1]
-        y_future_2d    = wl_2d[t_hist_end:t_hist_end + f, :].unsqueeze(-1)    # [T, N_2d, 1]
-        rain_future_2d = rain_aug[t_hist_end:t_hist_end + f, :, :]            # [T, N_2d, R]
-
-        return {
-            'y_hist_1d':      y_hist_1d,
-            'y_hist_2d':      y_hist_2d,
-            'rain_hist_2d':   rain_hist_2d,
-            'y_future_1d':    y_future_1d,
-            'y_future_2d':    y_future_2d,
-            'rain_future_2d': rain_future_2d,
-        }
-
-    def __iter__(self):
-        index = list(self._window_index)
-        if self.shuffle:
-            random.shuffle(index)
-
-        batch_samples = []
-        for ev_idx, t_start in index:
-            sample = self._get_window(ev_idx, t_start)
-            batch_samples.append(sample)
-            if len(batch_samples) == self.batch_size:
-                yield {
-                    'static_graph':   NonBatchableGraph(self.static_graph),
-                    'y_hist_1d':      torch.stack([s['y_hist_1d']      for s in batch_samples]),
-                    'y_hist_2d':      torch.stack([s['y_hist_2d']      for s in batch_samples]),
-                    'rain_hist_2d':   torch.stack([s['rain_hist_2d']   for s in batch_samples]),
-                    'y_future_1d':    torch.stack([s['y_future_1d']    for s in batch_samples]),
-                    'y_future_2d':    torch.stack([s['y_future_2d']    for s in batch_samples]),
-                    'rain_future_2d': torch.stack([s['rain_future_2d'] for s in batch_samples]),
-                }
-                batch_samples = []
-        # tail windows that don't fill a complete batch are dropped (drop_last semantics)
-
-
-# =========================
-# Rainfall history feature computation
-# =========================
-
-# Moving-average window sizes (in timesteps) appended after raw rainfall
-RAIN_MA_WINDOWS = [6, 12, 24, 36]
-# Max event length for positional encoding (sin/cos normalization)
-RAIN_T_MAX = 205.0
-# Total rainfall channels per node: raw + event-mean + len(RAIN_MA_WINDOWS) rolling sums + sin + cos
-RAIN_N_CHANNELS = 1 + 1 + len(RAIN_MA_WINDOWS) + 2  # = 8
-
-
-def compute_rainfall_features(rain_series: torch.Tensor, rain_sum_maxes=None,
-                              t_offset: int = 0) -> torch.Tensor:
-    """Compute augmented rainfall + positional feature tensor for a full event.
-
-    Args:
-        rain_series:    [T, N] normalized raw rainfall (float32)
-        rain_sum_maxes: array-like of length len(RAIN_MA_WINDOWS), global max rolling sum
-                        per window computed over training events. Used to normalize channels
-                        2-5. If None, falls back to dividing by window size.
-        t_offset:       absolute timestep index of the first row in rain_series within the
-                        event. Used to compute correct sin/cos positional encoding.
-
-    Returns:
-        [T, N, RAIN_N_CHANNELS] where channels are:
-          0: raw rainfall (normalized)
-          1: mean rainfall since event start (cumsum / t+1)
-          2..5: rolling sums over last 6, 12, 24, 36 timesteps, divided by global max
-          6: sin(t_abs / RAIN_T_MAX)  — absolute positional encoding
-          7: cos(t_abs / RAIN_T_MAX)  — absolute positional encoding
-    """
-    T, N = rain_series.shape
-    out = torch.zeros(T, N, RAIN_N_CHANNELS, dtype=torch.float32)
-    out[:, :, 0] = rain_series
-    # Mean rainfall since event start (cumsum / t+1)
-    cumsum = rain_series.cumsum(dim=0)  # [T, N]
-    counts = torch.arange(1, T + 1, dtype=torch.float32).unsqueeze(1)  # [T, 1]
-    out[:, :, 1] = cumsum / counts
-    # Rolling window sums normalized by global training max per window
-    for i, w in enumerate(RAIN_MA_WINDOWS):
-        norm = float(rain_sum_maxes[i]) if rain_sum_maxes is not None else float(w)
-        for t in range(T):
-            t0 = max(0, t - w + 1)
-            out[t, :, 2 + i] = rain_series[t0:t + 1].sum(dim=0) / norm
-    # Absolute positional encoding: sin/cos of absolute timestep / T_max
-    # t_offset accounts for windows that start mid-event
-    t_abs = torch.arange(t_offset, t_offset + T, dtype=torch.float32) / RAIN_T_MAX  # [T]
-    out[:, :, 6] = torch.sin(t_abs).unsqueeze(1)  # broadcast over N
-    out[:, :, 7] = torch.cos(t_abs).unsqueeze(1)
-    return out
 
 
 # =========================
@@ -1406,33 +1168,21 @@ def get_dataloader_old():
 def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuffle=True, split='train'):
     """
     Get dataloader for recurrent model with static graph + dynamic time series.
-
-    Uses ShuffledFloodDataset, which pre-loads all events into memory (~0.6 GB) and
-    shuffles windows globally across events each epoch. This gives every batch a mix
-    of windows from different events, producing much richer gradient signal than
-    per-event sequential batching.
-
+    
     Args:
         history_len: Number of historical timesteps for warm start
         forecast_len: Number of future timesteps to predict
         batch_size: Batch size
-        shuffle: Whether to shuffle the global window list each epoch
+        shuffle: Whether to shuffle events
         split: Data split to use ('train', 'val', 'test', or 'all')
-
+    
     Returns:
         DataLoader that yields dicts with:
-          - static_graph:   HeteroData with static features
-          - y_hist_1d:      [B, H, N_1d, 1] historical water levels
-          - y_hist_2d:      [B, H, N_2d, 1] historical water levels
-          - rain_hist_2d:   [B, H, N_2d, RAIN_N_CHANNELS] augmented rainfall history
-          - y_future_1d:    [B, T, N_1d, 1] future water levels (labels)
-          - y_future_2d:    [B, T, N_2d, 1] future water levels (labels)
-          - rain_future_2d: [B, T, N_2d, RAIN_N_CHANNELS] augmented future rainfall
-
-        Rainfall channels (RAIN_N_CHANNELS=6):
-          0: raw normalized rainfall
-          1: mean rainfall since event start (cumsum/t+1)
-          2–5: rolling means over 6, 12, 24, 36 timesteps (zero-padded before event start)
+          - static_graph: HeteroData with static features
+          - y_hist_1d, y_hist_2d: [H, N, 1] historical water levels
+          - rain_hist_2d: [H, N, R] historical rainfall
+          - y_future_1d, y_future_2d: [T, N, 1] future water levels (labels)
+          - rain_future_2d: [T, N, R] future rainfall
     """
     # Initialize data lazily on first call
     data = initialize_data()
@@ -1468,7 +1218,7 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
     norm_stats = data['norm_stats']
     node_id_col = data['NODE_ID_COL']
     
-    dataset = ShuffledFloodDataset(
+    dataset = RecurrentFloodDataset(
         event_file_list=event_file_list,
         static_1d_norm=static_1d_sorted,
         static_2d_norm=static_2d_sorted,
@@ -1565,12 +1315,11 @@ def get_model_config():
     from data_config import SELECTED_MODEL as _SEL_MODEL
 
     # Dynamic input dimensions (what make_x_dyn will provide)
-    # 1D: water_level + rain_channels + water_level of connected 2D node
-    # 2D: water_level + rain_channels
-    # rain_channels = RAIN_N_CHANNELS (raw + cumulative + 4 moving averages = 6)
+    # 1D: water_level + rain + water_level of connected 2D node (3 features)
+    # 2D: water_level + rainfall (2 features)
     node_dyn_input_dims = {
-        "oneD": 1 + RAIN_N_CHANNELS + 1,  # water_level + rain_channels(8) + wl_connected_2d = 10
-        "twoD": 1 + RAIN_N_CHANNELS,       # water_level + rain_channels(8) = 9
+        "oneD": 3,  # water_level + rain from connected 2D node + water_level of connected 2D node
+        "twoD": 2,  # water_level + rainfall
     }
 
     # Static edge feature dimensions
