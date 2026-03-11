@@ -56,6 +56,7 @@ def load_checkpoint(checkpoint_path, device):
         'dec_ffn_dim':        arch.get('dec_ffn_dim',        CONFIG['dec_ffn_dim']),
         'dec_dropout':        arch.get('dec_dropout',        CONFIG['dec_dropout']),
         'dec_node_chunk':     arch.get('dec_node_chunk',     CONFIG['dec_node_chunk']),
+        'num_mp_rounds':      arch.get('num_mp_rounds',      CONFIG.get('num_mp_rounds', 1)),
     }
 
 

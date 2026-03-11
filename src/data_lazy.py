@@ -193,10 +193,12 @@ def initialize_data():
         print(f"[ERROR] {e}")
         raise
     
-    # Load static data
-    static_1d = pd.read_csv(f"{TRAIN_PATH}/1d_nodes_static.csv")
+    # Load static data — use expanded files (with shapefile-derived features) when available
+    _n1d_path = f"{TRAIN_PATH}/1d_nodes_static_expanded.csv"
+    _e1d_path = f"{TRAIN_PATH}/1d_edges_static_expanded.csv"
+    static_1d = pd.read_csv(_n1d_path if os.path.exists(_n1d_path) else f"{TRAIN_PATH}/1d_nodes_static.csv")
     static_2d = pd.read_csv(f"{TRAIN_PATH}/2d_nodes_static.csv")
-    edges1dfeats = pd.read_csv(f"{TRAIN_PATH}/1d_edges_static.csv")
+    edges1dfeats = pd.read_csv(_e1d_path if os.path.exists(_e1d_path) else f"{TRAIN_PATH}/1d_edges_static.csv")
     edges2dfeats = pd.read_csv(f"{TRAIN_PATH}/2d_edges_static.csv")
     edges1d = pd.read_csv(f"{TRAIN_PATH}/1d_edge_index.csv")
     edges2d = pd.read_csv(f"{TRAIN_PATH}/2d_edge_index.csv")

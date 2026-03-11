@@ -45,6 +45,18 @@ CONFIG = {
     'early_stopping_patience': 5,  # Only active once max_h == forecast_len; None to disable
     'early_stopping_min_rel_delta': 0.01,
     'curriculum_val_horizon': 32,  # Fixed horizon for multi-step val rollout
+    # Noise-injection warm-start curriculum (Model_2 only)
+    # Stage k trains with:  10 clean warm-start steps + k perturbed steps → predict step 11+k
+    # Smart-detect advance: after each epoch, scan per-step train NRMSE up to noise_max_extra_steps.
+    # K advances to the largest contiguous prefix where nrmse[k] <= min(nrmse[:5]) * noise_smart_alpha.
+    # noise_smart_init_epochs: epochs of pure h=1 training before smart detection activates
+    # noise_smart_probe_batches: train batches used for the per-step NRMSE scan (keep small)
+    # noise_smart_alpha: relative threshold — include step k if nrmse[k] <= alpha * min(nrmse[:5])
+    # noise_max_extra_steps:  maximum extra perturbed warm-start steps (K_max)
+    'noise_smart_alpha': 1.3,
+    'noise_smart_init_epochs': 2,
+    'noise_smart_probe_batches': 8,
+    'noise_max_extra_steps': 54,   # 10 + 54 = 64 total warm-start, then predict step 65 (or clamp)
 }
 
 # Kaggle sigmas — used only for logging RMSE in meters and approx Kaggle score.
@@ -114,9 +126,10 @@ def save_checkpoint(model, epoch, loss, save_dir, config, model_id=None, global_
         'model_state': model.state_dict(),
         'config': config,
         'model_arch_config': {
-            'h_dim': model.h_dim,
+            'h_dim': model.cell._h_dim,  # may be dict (per node type) or int
             'msg_dim': model.cell.msg_dim,
             'hidden_dim': model.cell._hidden_dim,
+            'num_1d_extra_hops': model.cell.num_1d_extra_hops,
             'node_dyn_input_dims': CONFIG.get('node_dyn_input_dims'),
         },
         'loss': loss,
@@ -200,13 +213,17 @@ def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, st
     Mirrors the inference loop exactly — warm-starts on history_len true timesteps,
     then predicts autoregressively for the rest of the event.
 
-    Returns (combined_nrmse, nrmse_1d, nrmse_2d) averaged over all val events.
+    Returns (combined_nrmse, nrmse_1d, nrmse_2d, per_event_results) averaged over all val events.
+    per_event_results: list of dicts with keys 'event_name', 'combined_nrmse', 'nrmse_1d', 'nrmse_2d', 'T',
+        't_worst' (timestep of max combined error), 't_worst_frac' (as fraction of T),
+        'rain_total', 'rain_peak', 't_rain_peak_frac', 'rain_at_worst' (spatially-averaged rain channel 0)
     """
     from autoregressive_inference import prepare_event_tensors, autoregressive_rollout_both
 
     model.eval()
     total_1d, total_2d = 0.0, 0.0
     n_events = 0
+    per_event_results = []
 
     with torch.no_grad():
         for _, event_path, _ in val_event_file_list:
@@ -226,19 +243,258 @@ def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, st
                         model, static_graph, y1_hist, y2_hist, rain2_all, device, history_len=history_len
                     )
                 # pred_1d: [T-H, N1, 1], y1_all[H:]: [T-H, N1, 1]
-                mse_1d = ((pred_1d - y1_all[history_len:]) ** 2).mean().item()
-                mse_2d = ((pred_2d - y2_all[history_len:]) ** 2).mean().item()
+                T_pred = T - history_len
+                # Per-timestep MSE: [T_pred]
+                err_1d_t = ((pred_1d - y1_all[history_len:]) ** 2).mean(dim=(1, 2))  # [T_pred]
+                err_2d_t = ((pred_2d - y2_all[history_len:]) ** 2).mean(dim=(1, 2))
+                mse_1d = err_1d_t.mean().item()
+                mse_2d = err_2d_t.mean().item()
                 total_1d += mse_1d
                 total_2d += mse_2d
                 n_events += 1
+
+                # Combined per-timestep instantaneous NRMSE
+                combined_t = (err_1d_t ** 0.5 + err_2d_t ** 0.5) / 2  # [T_pred]
+                # t_worst = timestep where error grows fastest (largest single-step jump)
+                if T_pred > 1:
+                    delta_t = combined_t[1:] - combined_t[:-1]  # [T_pred-1]
+                    t_worst = delta_t.argmax().item() + 1        # +1 since diff is shifted
+                else:
+                    t_worst = 0
+                t_worst_frac = t_worst / max(T_pred - 1, 1)
+
+                # Rainfall stats over prediction window (rain2_all: [T, N_rain, C])
+                rain_pred = rain2_all[history_len:, :, 0]  # [T_pred, N_rain] — first rain channel
+                rain_mean_t = rain_pred.mean(dim=1)        # [T_pred] — spatial mean per timestep
+                rain_total = rain_mean_t.sum().item()
+                rain_peak = rain_mean_t.max().item()
+                t_rain_peak = rain_mean_t.argmax().item()
+                t_rain_peak_frac = t_rain_peak / max(T_pred - 1, 1)
+                rain_at_worst = rain_mean_t[t_worst].item()
+
+                event_name = Path(str(event_path)).name
+                per_event_results.append({
+                    'event_name': event_name,
+                    'nrmse_1d': mse_1d ** 0.5,
+                    'nrmse_2d': mse_2d ** 0.5,
+                    'combined_nrmse': (mse_1d ** 0.5 + mse_2d ** 0.5) / 2,
+                    'T': T_pred,
+                    't_worst': t_worst,
+                    't_worst_frac': round(t_worst_frac, 3),
+                    'rain_total': round(rain_total, 4),
+                    'rain_peak': round(rain_peak, 4),
+                    't_rain_peak_frac': round(t_rain_peak_frac, 3),
+                    'rain_at_worst': round(rain_at_worst, 4),
+                })
             except Exception as e:
                 print(f"[WARNING] Full-event val failed for {event_path}: {e}")
 
     if n_events == 0:
-        return float('nan'), float('nan'), float('nan')
+        return float('nan'), float('nan'), float('nan'), []
     nrmse_1d = (total_1d / n_events) ** 0.5
     nrmse_2d = (total_2d / n_events) ** 0.5
-    return (nrmse_1d + nrmse_2d) / 2, nrmse_1d, nrmse_2d
+    return (nrmse_1d + nrmse_2d) / 2, nrmse_1d, nrmse_2d, per_event_results
+
+
+def _measure_rollout_nrmse_per_step(model, train_dataloader, max_steps, device,
+                                     batched_static_graph=None, use_mixed_precision=False,
+                                     rain_1d_index=None, max_batches=8):
+    """
+    Cheap per-step NRMSE scan for smart curriculum advance.
+
+    Runs a true-fed rollout on up to max_batches train batches and returns
+    scalar NRMSE for each step 0..max_steps-1.  Step k NRMSE is the sqrt of
+    the mean squared normalised error when predicting step k from the true
+    history (i.e. no error accumulation — each step is independent).
+
+    Returns:
+        nrmse_per_step: list of floats, length = actual steps measured (<= max_steps)
+    """
+    model.eval()
+    # sq_err[k] accumulates sum of squared errors; count[k] counts samples
+    sq_err = [0.0] * max_steps
+    counts = [0]   * max_steps
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(train_dataloader):
+            if batch is None:
+                continue
+            if batch_idx >= max_batches:
+                break
+
+            avail = batch['y_future_1d'].shape[1]
+            steps = min(max_steps, avail)
+
+            static_graph   = batch['static_graph'].to(device)
+            y_hist_1d      = batch['y_hist_1d'].to(device)
+            y_hist_2d      = batch['y_hist_2d'].to(device)
+            rain_hist_2d   = batch['rain_hist_2d'].to(device)
+            y_future_1d    = batch['y_future_1d'].to(device)
+            y_future_2d    = batch['y_future_2d'].to(device)
+            rain_future_2d = batch['rain_future_2d'].to(device)
+
+            B    = y_hist_1d.size(0)
+            N_1d = y_hist_1d.size(2)
+            N_2d = y_hist_2d.size(2)
+            H    = y_hist_1d.size(1)
+
+            bsg = batched_static_graph
+            if bsg is None:
+                bsg = model._make_batched_graph(static_graph, B)
+
+            _r1d = rain_1d_index if rain_1d_index is not None else getattr(static_graph, 'rain_1d_index', None)
+
+            def _make_x(y, r, d, _r=_r1d):
+                return make_x_dyn(y['oneD'], y['twoD'], r, d, rain_1d_index=_r)
+
+            with torch.amp.autocast('cuda', enabled=use_mixed_precision):
+                # Clean warm-start
+                h = model.init_hidden(static_graph, B, device=device)
+                for k in range(H):
+                    y1d_k = y_hist_1d[:, k].reshape(B * N_1d, 1)
+                    y2d_k = y_hist_2d[:, k].reshape(B * N_2d, 1)
+                    r_k   = rain_hist_2d[:, k].reshape(B * N_2d, -1)
+                    y_t   = {'oneD': y1d_k, 'twoD': y2d_k}
+                    x_dyn = _make_x(y_t, r_k, bsg)
+                    for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                        if _ctx in model.node_types:
+                            x_dyn[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
+                    h = model.cell(bsg, h, x_dyn)
+
+                # True-fed rollout: predict each step from true history
+                for k in range(steps):
+                    y_pred_dict = model.predict_water_levels(h, B, {'oneD': N_1d, 'twoD': N_2d})
+                    # Combined MSE (both node types equally weighted)
+                    mse_1d = float(((y_pred_dict['oneD'] - y_future_1d[:, k]) ** 2).mean())
+                    mse_2d = float(((y_pred_dict['twoD'] - y_future_2d[:, k]) ** 2).mean())
+                    sq_err[k] += (mse_1d + mse_2d) / 2.0
+                    counts[k] += 1
+
+                    # Feed TRUE value for isolation
+                    y1d_true = y_future_1d[:, k].reshape(B * N_1d, 1)
+                    y2d_true = y_future_2d[:, k].reshape(B * N_2d, 1)
+                    r_k      = rain_future_2d[:, k].reshape(B * N_2d, -1)
+                    y_t      = {'oneD': y1d_true, 'twoD': y2d_true}
+                    x_dyn    = _make_x(y_t, r_k, bsg)
+                    for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                        if _ctx in model.node_types:
+                            x_dyn[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_true.dtype)
+                    h = model.cell(bsg, h, x_dyn)
+
+    nrmse_per_step = [
+        (sq_err[k] / counts[k]) ** 0.5 if counts[k] > 0 else float('inf')
+        for k in range(max_steps)
+    ]
+    model.train()
+    return nrmse_per_step
+
+
+def collect_per_lag_noise_stats(model, val_dataloader, max_lag, device,
+                                 batched_static_graph=None, use_mixed_precision=False,
+                                 rain_1d_index=None):
+    """
+    Run a single-step rollout over the val set to collect per-node, per-lag
+    signed prediction errors.
+
+    For lag k (0-indexed), we measure err[b, n] = pred[k] - true[k]  when the
+    model is fed true water levels for steps 0..k-1 and predicts step k.
+    This gives the distribution of errors that arise when a (k+1)-step-ahead
+    prediction is fed back as input.
+
+    Returns:
+        noise_mu_1d:    [max_lag, N_1d]  — per-lag per-node mean signed error
+        noise_sigma_1d: [max_lag, N_1d]  — per-lag per-node std of signed error
+        noise_mu_2d:    [max_lag, N_2d]
+        noise_sigma_2d: [max_lag, N_2d]
+    """
+    model.eval()
+    # Accumulators: list of lists — outer = lag, inner = per-batch error tensors
+    errs_1d = [[] for _ in range(max_lag)]
+    errs_2d = [[] for _ in range(max_lag)]
+    N_1d = N_2d = 1  # fallback; overwritten from first batch
+
+    with torch.no_grad():
+        for batch in val_dataloader:
+            if batch is None:
+                continue
+            avail = batch['y_future_1d'].shape[1]
+            lags_to_use = min(max_lag, avail)
+
+            static_graph  = batch['static_graph'].to(device)
+            y_hist_1d     = batch['y_hist_1d'].to(device)      # [B, H, N_1d, 1]
+            y_hist_2d     = batch['y_hist_2d'].to(device)
+            rain_hist_2d  = batch['rain_hist_2d'].to(device)
+            y_future_1d   = batch['y_future_1d'].to(device)    # [B, T, N_1d, 1]
+            y_future_2d   = batch['y_future_2d'].to(device)
+            rain_future_2d = batch['rain_future_2d'].to(device)
+
+            B    = y_hist_1d.size(0)
+            N_1d = y_hist_1d.size(2)
+            N_2d = y_hist_2d.size(2)
+            H    = y_hist_1d.size(1)
+
+            bsg = batched_static_graph
+            if bsg is None:
+                bsg = model._make_batched_graph(static_graph, B)
+
+            _r1d = rain_1d_index if rain_1d_index is not None else getattr(static_graph, 'rain_1d_index', None)
+
+            def _make_x(y, r, d, _r=_r1d):
+                return make_x_dyn(y['oneD'], y['twoD'], r, d, rain_1d_index=_r)
+
+            with torch.amp.autocast('cuda', enabled=use_mixed_precision):
+                # Clean warm-start
+                h = model.init_hidden(static_graph, B, device=device)
+                for k in range(H):
+                    y1d_k = y_hist_1d[:, k].reshape(B * N_1d, 1)
+                    y2d_k = y_hist_2d[:, k].reshape(B * N_2d, 1)
+                    r_k   = rain_hist_2d[:, k].reshape(B * N_2d, -1)
+                    y_t   = {'oneD': y1d_k, 'twoD': y2d_k}
+                    x_dyn = _make_x(y_t, r_k, bsg)
+                    for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                        if _ctx in model.node_types:
+                            x_dyn[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
+                    h = model.cell(bsg, h, x_dyn)
+
+                # Roll out one step at a time, always feeding TRUE water level at each step
+                # so we measure the error at lag k independently of prior errors.
+                # At each lag k:  predict from h_k (warmed up on true[0..k-1]), compare to true[k]
+                for k in range(lags_to_use):
+                    y_pred_dict = model.predict_water_levels(h, B, {'oneD': N_1d, 'twoD': N_2d})
+                    # signed error: pred - true, shape [B, N, 1]
+                    err_1d = (y_pred_dict['oneD'] - y_future_1d[:, k]).squeeze(-1)  # [B, N_1d]
+                    err_2d = (y_pred_dict['twoD'] - y_future_2d[:, k]).squeeze(-1)  # [B, N_2d]
+                    errs_1d[k].append(err_1d.float().cpu())
+                    errs_2d[k].append(err_2d.float().cpu())
+
+                    # Feed TRUE value for next step (not prediction) to isolate each lag
+                    y1d_true = y_future_1d[:, k].reshape(B * N_1d, 1)
+                    y2d_true = y_future_2d[:, k].reshape(B * N_2d, 1)
+                    r_k      = rain_future_2d[:, k].reshape(B * N_2d, -1)
+                    y_t      = {'oneD': y1d_true, 'twoD': y2d_true}
+                    x_dyn    = _make_x(y_t, r_k, bsg)
+                    for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                        if _ctx in model.node_types:
+                            x_dyn[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_true.dtype)
+                    h = model.cell(bsg, h, x_dyn)
+
+    # Aggregate across batches
+    noise_mu_1d    = torch.zeros(max_lag, N_1d)
+    noise_sigma_1d = torch.zeros(max_lag, N_1d)
+    noise_mu_2d    = torch.zeros(max_lag, N_2d)
+    noise_sigma_2d = torch.zeros(max_lag, N_2d)
+    for k in range(max_lag):
+        if errs_1d[k]:
+            e1 = torch.cat(errs_1d[k], dim=0)   # [total_B, N_1d]
+            noise_mu_1d[k]    = e1.mean(dim=0)
+            noise_sigma_1d[k] = e1.std(dim=0).clamp(min=1e-6)
+        if errs_2d[k]:
+            e2 = torch.cat(errs_2d[k], dim=0)
+            noise_mu_2d[k]    = e2.mean(dim=0)
+            noise_sigma_2d[k] = e2.std(dim=0).clamp(min=1e-6)
+
+    model.train()
+    return noise_mu_1d, noise_sigma_1d, noise_mu_2d, noise_sigma_2d
 
 
 def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None, mirror_latest=True, cold_start_passes=None):
@@ -353,7 +609,10 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     # Initialize model
     print(f"\n[INFO] Building model...")
     model_config.update({
-        'h_dim': 96,     # GRU hidden size — kept large for temporal memory
+        # Per-node-type GRU hidden size: Model_2 gives 1D nodes extra capacity
+        # since its 190-node channel network is the hard bottleneck (order-of-mag harder).
+        # Model_1 uses scalar 96 (17 nodes, shared dim is fine).
+        'h_dim': {'oneD': 192, 'twoD': 96, 'global': 32} if SELECTED_MODEL == 'Model_2' else 96,
         'msg_dim': 64,
         # Edge-type-specific hidden dims (reduced from 96/192 to 64/128)
         'hidden_dim': {
@@ -367,6 +626,9 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             'twoDoneD':    32,
             'oneDtwoD':    32,
         },
+        # Model_2 has 190 1D nodes (vs 17 for Model_1) — extra hops propagate
+        # information further along the larger channel network each timestep.
+        'num_1d_extra_hops': 4 if SELECTED_MODEL == 'Model_2' else 0,
     })
     model = FloodAutoregressiveHeteroModel(**model_config)
     model = model.to(device)
@@ -620,6 +882,31 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     best_train_loss_at_max_h = float('inf')  # fallback for early stopping when val disabled
     val_loss_norm = None  # Set in epoch loop; initialized here to avoid UnboundLocalError if loop is empty
 
+    # -----------------------------------------------------------------------
+    # Noise-injection warm-start curriculum state (Model_2 only)
+    # -----------------------------------------------------------------------
+    # noise_extra_steps (K): number of perturbed steps appended beyond the 10-step clean warm-start
+    # Smart-detect advance: each epoch, scan per-step train NRMSE up to noise_max_extra_steps.
+    # K advances to the largest contiguous prefix where nrmse[k] <= min(nrmse[:5]) * noise_smart_alpha.
+    # noise_smart_init_epochs: pure h=1 warmup epochs before smart detection activates.
+    _use_noise_curriculum = (SELECTED_MODEL == 'Model_2')
+    _noise_extra_steps = 0          # K — starts at 0 (no extra steps); advances via smart detect
+    _noise_max_extra = CONFIG['noise_max_extra_steps']
+    _noise_smart_alpha = CONFIG['noise_smart_alpha']
+    _noise_smart_init_epochs = CONFIG['noise_smart_init_epochs']
+    _noise_smart_probe_batches = CONFIG['noise_smart_probe_batches']
+    _noise_init_epochs_done = 0     # counts pure h=1 warmup epochs
+    # noise_stats: None until first smart-detect advance
+    _noise_mu_1d    = None   # [K_cur, N_1d]
+    _noise_sigma_1d = None   # [K_cur, N_1d]
+    _noise_mu_2d    = None   # [K_cur, N_2d]
+    _noise_sigma_2d = None   # [K_cur, N_2d]
+    if _use_noise_curriculum:
+        print(f"[INFO] Noise-injection curriculum enabled (Model_2) — smart-detect mode")
+        print(f"  alpha={_noise_smart_alpha}, init_epochs={_noise_smart_init_epochs}, "
+              f"probe_batches={_noise_smart_probe_batches}, max_extra={_noise_max_extra}")
+        print(f"  Init phase: {_noise_smart_init_epochs} epoch(s) of pure h=1 before smart detection")
+
     for epoch in range(start_epoch, CONFIG['epochs'] + 1):
         model.train()
         epoch_loss = 0.0
@@ -628,32 +915,38 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
 
         # Curriculum schedule
         # Model_1: doubles every 2 epochs (power-of-2); epoch 1-2→1, 3-4→2, ..., 13+→64
-        # Model_2: variable stage lengths — 6 epochs for h=1, 4 for h=2-8,
-        #   3 epochs for h=16-48, 6 epochs at h=64:
-        #   1-6→1, 7-10→2, 11-14→4, 15-18→8, 19-21→16, 22-24→24, 25-27→32, 28-30→48, 31-36→64
-        if SELECTED_MODEL == 'Model_2':
+        # Model_2: noise-injection warm-start curriculum — each stage k adds one more
+        #   perturbed warm-start step (beyond the 10 clean steps) and predicts 1 step ahead.
+        #   After noise_max_extra_steps stages, falls back to full h=1 horizon-expanding schedule.
+        if _use_noise_curriculum and _noise_extra_steps <= _noise_max_extra:
+            # Noise curriculum is active — fixed 1-step rollout target, expanding warm-start
+            max_h = 1  # predict only the next step (step 11+K)
+            noise_K = _noise_extra_steps
+        elif SELECTED_MODEL == 'Model_2':
             _m2_boundaries = [6, 10, 14, 18, 22, 26, 30, 34, 38, 46]  # last epoch of each stage; 46 total
             _m2_horizons   = [1,  2,  4,  6,  8, 16, 24, 32, 48, 64]
             _stage_idx = next((i for i, b in enumerate(_m2_boundaries) if epoch <= b), len(_m2_boundaries) - 1)
             max_h = _m2_horizons[_stage_idx]
+            noise_K = 0
         else:
             _stage_len = 2
             max_h = min(CONFIG['forecast_len'], 2 ** ((epoch - 1) // _stage_len))
+            noise_K = 0
 
         # Epoch boundary marker — visible as a vertical annotation in wandb
-        wandb.log({'epoch': epoch, 'curriculum/max_h': max_h}, step=global_step)
+        wandb.log({'epoch': epoch, 'curriculum/max_h': max_h,
+                   'curriculum/noise_extra_steps': noise_K}, step=global_step)
 
-        print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h} (all batches train at h={max_h})")
+        if _use_noise_curriculum and noise_K <= _noise_max_extra:
+            _phase = "init" if _noise_init_epochs_done < _noise_smart_init_epochs else "smart-detect"
+            print(f"[INFO] Noise curriculum [{_phase}]: epoch={epoch}/{CONFIG['epochs']}, "
+                  f"noise_K={noise_K} (10 clean + {noise_K} perturbed → predict step {11+noise_K})")
+        else:
+            print(f"[INFO] Curriculum: epoch={epoch}/{CONFIG['epochs']}, max_h={max_h}")
 
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
                 continue
-
-            # Train at the full curriculum horizon for this epoch — no sampling.
-            # Each epoch IS the curriculum stage; always training at max_h maximizes
-            # exposure to the deployment-length rollout (target ~50 steps).
-            avail = batch['y_future_1d'].shape[1]
-            rollout_steps = min(max_h, avail)
 
             # Extract batch data
             static_graph = batch['static_graph'].to(device, non_blocking=True)
@@ -664,36 +957,70 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             y_future_2d = batch['y_future_2d'].to(device, non_blocking=True)    # [B, T, N_2d, 1]
             rain_future_2d = batch['rain_future_2d'].to(device, non_blocking=True)  # [B, T, N_2d, R]
 
-            # Vectorized forward pass over all B samples at once
-            # predictions: {'oneD': [B, rollout_steps, N_1d, 1], 'twoD': [B, rollout_steps, N_2d, 1]}
+            avail = y_future_1d.shape[1]
+
             optimizer.zero_grad()
             with torch.amp.autocast('cuda', enabled=use_mixed_precision):
-                predictions = model.forward_unroll(
-                    data=static_graph,
-                    y_hist_1d=y_hist_1d,
-                    y_hist_2d=y_hist_2d,
-                    rain_hist=rain_hist_2d,
-                    rain_future=rain_future_2d,
-                    make_x_dyn=lambda y, r, d: make_x_dyn(
-                        y['oneD'], y['twoD'], r, d,
-                        rain_1d_index=_rain_1d_index,
-                    ),
-                    rollout_steps=rollout_steps,
-                    device=device,
-                    batched_data=train_batched_graph,
-                    use_grad_checkpoint=use_mixed_precision,
-                )
+                # Noise-injection curriculum: K extra perturbed warm-start steps, rollout=1
+                if _use_noise_curriculum and noise_K > 0 and _noise_mu_1d is not None and avail > noise_K:
+                    # Slice extra steps from y_future: steps 0..K-1 are the perturbed warm-start
+                    # Target: step K (y_future[:, K:K+1])
+                    y_extra_1d  = y_future_1d[:, :noise_K]        # [B, K, N_1d, 1]
+                    y_extra_2d  = y_future_2d[:, :noise_K]
+                    rain_extra  = rain_future_2d[:, :noise_K]
+                    # Remaining future for autoregressive rollout (just 1 step target)
+                    rain_fut    = rain_future_2d[:, noise_K:noise_K+1]
+                    # noise stats: slice to current K lags (mu/sigma are [K_max, N])
+                    nm1 = _noise_mu_1d[:noise_K].to(device)
+                    ns1 = _noise_sigma_1d[:noise_K].to(device)
+                    nm2 = _noise_mu_2d[:noise_K].to(device)
+                    ns2 = _noise_sigma_2d[:noise_K].to(device)
+                    rollout_steps = 1
 
-                # Sigma-weighted normalized loss: convex combo keeps scale ~1x raw MSE
-                # Slice targets to match the sampled rollout_steps
-                if _loss_mask_1d is not None:
-                    # Per-node MSE for 1D, mask out node 197, then average over valid nodes
-                    # predictions['oneD']: [B, T, N_1d, 1]; y_future_1d: [B, T, N_1d, 1]
-                    sq_err_1d = (predictions['oneD'] - y_future_1d[:, :rollout_steps]) ** 2
-                    loss_1d = (sq_err_1d.mean(dim=(0, 1, 3)) * _loss_mask_1d).sum() / _loss_mask_1d.sum()
+                    predictions = model.forward_unroll_with_noise(
+                        data=static_graph,
+                        y_hist_1d=y_hist_1d, y_hist_2d=y_hist_2d,
+                        rain_hist=rain_hist_2d,
+                        y_extra_1d=y_extra_1d, y_extra_2d=y_extra_2d,
+                        rain_extra=rain_extra,
+                        noise_mu_1d=nm1, noise_sigma_1d=ns1,
+                        noise_mu_2d=nm2, noise_sigma_2d=ns2,
+                        rain_future=rain_fut,
+                        make_x_dyn=lambda y, r, d: make_x_dyn(
+                            y['oneD'], y['twoD'], r, d,
+                            rain_1d_index=_rain_1d_index,
+                        ),
+                        rollout_steps=rollout_steps,
+                        device=device,
+                        batched_data=train_batched_graph,
+                        use_grad_checkpoint=use_mixed_precision,
+                    )
+                    loss_1d = criterion(predictions['oneD'], y_future_1d[:, noise_K:noise_K+1])
+                    loss_2d = criterion(predictions['twoD'], y_future_2d[:, noise_K:noise_K+1])
                 else:
-                    loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
-                loss_2d = criterion(predictions['twoD'], y_future_2d[:, :rollout_steps])
+                    # Standard horizon-expanding curriculum (or noise K=0 / no stats yet)
+                    rollout_steps = min(max_h, avail)
+                    predictions = model.forward_unroll(
+                        data=static_graph,
+                        y_hist_1d=y_hist_1d,
+                        y_hist_2d=y_hist_2d,
+                        rain_hist=rain_hist_2d,
+                        rain_future=rain_future_2d,
+                        make_x_dyn=lambda y, r, d: make_x_dyn(
+                            y['oneD'], y['twoD'], r, d,
+                            rain_1d_index=_rain_1d_index,
+                        ),
+                        rollout_steps=rollout_steps,
+                        device=device,
+                        batched_data=train_batched_graph,
+                        use_grad_checkpoint=use_mixed_precision,
+                    )
+                    if _loss_mask_1d is not None:
+                        sq_err_1d = (predictions['oneD'] - y_future_1d[:, :rollout_steps]) ** 2
+                        loss_1d = (sq_err_1d.mean(dim=(0, 1, 3)) * _loss_mask_1d).sum() / _loss_mask_1d.sum()
+                    else:
+                        loss_1d = criterion(predictions['oneD'], y_future_1d[:, :rollout_steps])
+                    loss_2d = criterion(predictions['twoD'], y_future_2d[:, :rollout_steps])
                 loss = (loss_1d + loss_2d) / 2
 
             # Backward pass (scaler handles fp16 gradient scaling when enabled)
@@ -719,10 +1046,10 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 'loss/train_avg': avg_loss,
                 'loss/train_1d': loss_1d.item(),
                 'loss/train_2d': loss_2d.item(),
-                # Horizon-stratified: separate curve per epoch's rollout length in wandb
                 f'loss/train_h{rollout_steps}': loss.item(),
                 'curriculum/rollout_steps': rollout_steps,
                 'curriculum/max_h': max_h,
+                'curriculum/noise_extra_steps': noise_K,
                 'epoch': epoch,
             }
 
@@ -804,7 +1131,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 if _val_event_file_list:
                     try:
                         print(f"[INFO] Running full-event rollout val ({len(_val_event_file_list)} events)...")
-                        fe_combined, fe_1d, fe_2d = evaluate_full_event_rollout(
+                        fe_combined, fe_1d, fe_2d, fe_per_event = evaluate_full_event_rollout(
                             model, _val_event_file_list, data, norm_stats,
                             _single_static_graph, device,
                             history_len=CONFIG['history_len'],
@@ -818,13 +1145,44 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                         print(f"  full_event  combined={fe_combined:.4f}  "
                               f"1d={fe_1d:.4f} (RMSE={fe_rmse_1d:.4f}m)  "
                               f"2d={fe_2d:.4f} (RMSE={fe_rmse_2d:.4f}m)")
-                        wandb.log({
+                        fe_log = {
                             'full_event_val/combined_nrmse': fe_combined,
                             'full_event_val/1d_nrmse': fe_1d,
                             'full_event_val/2d_nrmse': fe_2d,
                             'full_event_val/1d_rmse_m': fe_rmse_1d,
                             'full_event_val/2d_rmse_m': fe_rmse_2d,
-                        }, step=global_step)
+                        }
+                        # Per-event breakdown table — sortable in wandb, reveals hard events
+                        if fe_per_event:
+                            fe_sorted = sorted(fe_per_event, key=lambda x: x['combined_nrmse'], reverse=True)
+                            fe_table = wandb.Table(columns=[
+                                'rank', 'event_name', 'combined_nrmse', 'nrmse_1d', 'nrmse_2d', 'T_steps',
+                                't_worst', 't_worst_frac', 'rain_total', 'rain_peak',
+                                't_rain_peak_frac', 'rain_at_worst',
+                            ])
+                            for rank, ev in enumerate(fe_sorted, 1):
+                                fe_table.add_data(
+                                    rank, ev['event_name'],
+                                    round(ev['combined_nrmse'], 5), round(ev['nrmse_1d'], 5), round(ev['nrmse_2d'], 5),
+                                    ev['T'],
+                                    ev.get('t_worst', -1), ev.get('t_worst_frac', -1.0),
+                                    ev.get('rain_total', 0.0), ev.get('rain_peak', 0.0),
+                                    ev.get('t_rain_peak_frac', -1.0), ev.get('rain_at_worst', 0.0),
+                                )
+                            fe_log['full_event_val/per_event_table'] = fe_table
+                            # Std across events — how uneven the difficulty is
+                            _fe_nrmses = [ev['combined_nrmse'] for ev in fe_per_event]
+                            fe_log['full_event_val/combined_nrmse_std'] = float(np.std(_fe_nrmses))
+                            fe_log['full_event_val/combined_nrmse_max'] = float(max(_fe_nrmses))
+                            # Top-5 worst events printed to console
+                            print(f"  Top-5 hardest val events:")
+                            for ev in fe_sorted[:5]:
+                                print(f"    {ev['event_name']:40s}  combined={ev['combined_nrmse']:.4f}  "
+                                      f"1d={ev['nrmse_1d']:.4f}  2d={ev['nrmse_2d']:.4f}  T={ev['T']}  "
+                                      f"t_jump={ev.get('t_worst_frac',-1):.2f}  "
+                                      f"rain_peak={ev.get('rain_peak',0):.3f}@{ev.get('t_rain_peak_frac',-1):.2f}  "
+                                      f"rain@jump={ev.get('rain_at_worst',0):.3f}")
+                        wandb.log(fe_log, step=global_step)
                     except Exception as e:
                         print(f"[WARNING] Full-event rollout val failed: {e}")
 
@@ -854,6 +1212,88 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                             break
             except Exception as e:
                 print(f"[WARNING] Validation failed (epoch {epoch}): {e} — skipping val this epoch")
+
+        # -----------------------------------------------------------------------
+        # Noise curriculum smart-detect advance (Model_2 only)
+        # Each epoch: scan per-step train NRMSE up to noise_max_extra_steps.
+        # K advances to the largest contiguous prefix where nrmse[k] <= alpha * nrmse[0].
+        # First noise_smart_init_epochs epochs are a pure h=1 warmup (no detection).
+        # -----------------------------------------------------------------------
+        if _use_noise_curriculum and noise_K <= _noise_max_extra:
+            if _noise_init_epochs_done < _noise_smart_init_epochs:
+                # Init phase: just count epochs, don't scan yet
+                _noise_init_epochs_done += 1
+                print(f"[INFO] Noise curriculum init phase: {_noise_init_epochs_done}/{_noise_smart_init_epochs} epochs done")
+            else:
+                # Smart-detect phase: measure per-step NRMSE on train, find new K
+                try:
+                    # Probe enough ahead to detect a jump, but don't scan all 54 steps early on.
+                    # Headroom: 2× current K + 10, capped at noise_max_extra.
+                    probe_steps = min(max(_noise_extra_steps * 2 + 10, 10), _noise_max_extra)
+                    print(f"[INFO] Smart-detect: probing {probe_steps} steps (K={_noise_extra_steps}) on {_noise_smart_probe_batches} train batches...")
+                    nrmse_steps = _measure_rollout_nrmse_per_step(
+                        model, train_dataloader, max_steps=probe_steps, device=device,
+                        batched_static_graph=train_batched_graph,
+                        use_mixed_precision=use_mixed_precision,
+                        rain_1d_index=_rain_1d_index,
+                        max_batches=_noise_smart_probe_batches,
+                    )
+                    # Baseline = min over first 5 steps (true-fed dips early, use the best
+                    # the model can do rather than the noisy step-0 warm-start artifact).
+                    # Threshold relative to that minimum: stricter than step-0 baseline.
+                    baseline = min(nrmse_steps[:min(5, len(nrmse_steps))])
+                    threshold = baseline * _noise_smart_alpha
+                    new_K = 0
+                    for k, nrmse_k in enumerate(nrmse_steps):
+                        if nrmse_k <= threshold:
+                            new_K = k + 1
+                        else:
+                            break  # stop at first breach (contiguous prefix only)
+                    new_K = min(new_K, _noise_max_extra)
+
+                    # Log per-step NRMSE to wandb for visibility
+                    wandb.log({
+                        'noise_curriculum/smart_K': new_K,
+                        'noise_curriculum/baseline_nrmse': baseline,
+                        'noise_curriculum/threshold_nrmse': threshold,
+                        **{f'noise_curriculum/nrmse_step_{k}': v for k, v in enumerate(nrmse_steps[:min(10, len(nrmse_steps))])},
+                    }, step=global_step)
+                    print(f"[INFO] Smart-detect: baseline={baseline:.5f}, threshold={threshold:.5f} (alpha={_noise_smart_alpha})")
+                    print(f"  Per-step NRMSE: {[f'{v:.4f}' for v in nrmse_steps[:min(15, len(nrmse_steps))]]}")
+                    print(f"  K: {_noise_extra_steps} → {new_K}")
+
+                    if new_K > _noise_extra_steps:
+                        # Collect full per-node noise stats up to new_K
+                        try:
+                            print(f"[INFO] Collecting per-lag noise stats for K={new_K} lags (from train set)...")
+                            _nm1, _ns1, _nm2, _ns2 = collect_per_lag_noise_stats(
+                                model, train_dataloader, max_lag=new_K, device=device,
+                                batched_static_graph=train_batched_graph,
+                                use_mixed_precision=use_mixed_precision,
+                                rain_1d_index=_rain_1d_index,
+                            )
+                            _noise_mu_1d    = _nm1
+                            _noise_sigma_1d = _ns1
+                            _noise_mu_2d    = _nm2
+                            _noise_sigma_2d = _ns2
+                            wandb.log({
+                                'noise_curriculum/K': new_K,
+                                'noise_curriculum/mu_1d_mean': float(_nm1.abs().mean()),
+                                'noise_curriculum/sigma_1d_mean': float(_ns1.mean()),
+                                'noise_curriculum/mu_2d_mean': float(_nm2.abs().mean()),
+                                'noise_curriculum/sigma_2d_mean': float(_ns2.mean()),
+                            }, step=global_step)
+                            print(f"[INFO] Noise stats collected: "
+                                  f"|mu_1d|={float(_nm1.abs().mean()):.4f}  sig_1d={float(_ns1.mean()):.4f}  "
+                                  f"|mu_2d|={float(_nm2.abs().mean()):.4f}  sig_2d={float(_ns2.mean()):.4f}")
+                            _noise_extra_steps = new_K
+                            print(f"[INFO] Noise curriculum: K advanced to {_noise_extra_steps}")
+                        except Exception as e:
+                            print(f"[WARNING] Noise stats collection failed: {e} — keeping K={_noise_extra_steps}")
+                    else:
+                        print(f"[INFO] Noise curriculum: K stays at {_noise_extra_steps} (model not ready to advance)")
+                except Exception as e:
+                    print(f"[WARNING] Smart-detect probe failed: {e} — K unchanged")
 
         # Fallback early stopping on training loss when validation is disabled
         if skip_validation and max_h == CONFIG['forecast_len']:

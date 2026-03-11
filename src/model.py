@@ -56,9 +56,17 @@ class StaticDynamicEdgeMP(MessagePassing):
         hidden_dim: int,
         dropout: float = 0.0,
         aggr: str = "add",
+        h_dim_src: int = None,
+        h_dim_dst: int = None,
     ):
         super().__init__(aggr=aggr)
-        self.h_dim = h_dim
+        # h_dim_src / h_dim_dst allow per-node-type hidden sizes.
+        # Fall back to h_dim if not provided (homogeneous case).
+        _h_src = h_dim_src if h_dim_src is not None else h_dim
+        _h_dst = h_dim_dst if h_dim_dst is not None else h_dim
+        self.h_dim = h_dim  # kept for compat
+        self.h_dim_src = _h_src
+        self.h_dim_dst = _h_dst
         self.msg_dim = msg_dim
 
         # ------------------------------------------------------------
@@ -89,7 +97,7 @@ class StaticDynamicEdgeMP(MessagePassing):
         # representing e.g. saturation / thresholding / nonlinear flow.
         # ------------------------------------------------------------
         self.dynamic_gate = MLP(
-            in_dim=2 * h_dim,
+            in_dim=_h_src + _h_dst,
             hidden_dim=hidden_dim,
             out_dim=1,
             dropout=dropout
@@ -100,7 +108,7 @@ class StaticDynamicEdgeMP(MessagePassing):
         # v_j(t) = MLP_v(h_src)
         # ------------------------------------------------------------
         self.payload = MLP(
-            in_dim=h_dim,
+            in_dim=_h_src,
             hidden_dim=hidden_dim,
             out_dim=msg_dim,
             dropout=dropout
@@ -207,14 +215,18 @@ class GATv2CrossTypeMP(MessagePassing):
         hidden_dim: int,
         heads: int = 4,
         dropout: float = 0.0,
+        h_dim_src: int = None,
+        h_dim_dst: int = None,
     ):
         super().__init__(aggr="add")
+        _h_src = h_dim_src if h_dim_src is not None else h_dim
+        _h_dst = h_dim_dst if h_dim_dst is not None else h_dim
         self.h_dim = h_dim
         self.msg_dim = msg_dim
         self.heads = heads
-        # GATv2Conv expects in_channels for (src, dst) separately
+        # GATv2Conv expects in_channels for (src, dst) separately — supports asymmetric dims
         self.gatv2 = _GATv2Conv(
-            in_channels=(h_dim, h_dim),
+            in_channels=(_h_src, _h_dst),
             out_channels=msg_dim // heads,
             heads=heads,
             dropout=dropout,
@@ -260,12 +272,16 @@ class HeteroTransportCell(nn.Module):
         node_static_dims: dict[str, int],
         node_dyn_input_dims: dict[str, int],   # how many dynamic inputs you feed each node type per step
         edge_static_dims: dict[tuple[str, str, str], int],
-        h_dim: int = 64,
+        h_dim: int | dict = 64,
         msg_dim: int = 64,
         hidden_dim: int | dict = 128,
         dropout: float = 0.0,
+        num_1d_extra_hops: int = 0,
     ):
         """
+        h_dim: either a single int (shared across all node types) or a dict mapping
+            node type -> int, e.g. {'oneD': 192, 'twoD': 96, 'global': 32}.
+            Missing keys fall back to the scalar value or 64.
         hidden_dim: either a single int (shared across all edge types) or a dict mapping
             edge relation name -> int, e.g. {'oneDedge': 64, 'twoDedge': 192, 'oneDtwoD': 192}.
             Missing keys fall back to the default (first int value or 128).
@@ -273,9 +289,20 @@ class HeteroTransportCell(nn.Module):
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
-        self.h_dim = h_dim
         self.msg_dim = msg_dim
+        self._h_dim = h_dim    # stored for checkpoint serialization
         self._hidden_dim = hidden_dim  # stored for checkpoint serialization
+        self.num_1d_extra_hops = num_1d_extra_hops
+
+        # Resolve h_dim per node type
+        if isinstance(h_dim, dict):
+            _h_default = next(iter(h_dim.values()), 64)
+            def _h(nt): return h_dim.get(nt, _h_default)
+        else:
+            def _h(nt): return h_dim
+        self._h_per_type = {nt: _h(nt) for nt in node_types}
+        # Expose scalar h_dim for backward compat (largest value)
+        self.h_dim = max(self._h_per_type.values())
 
         # Resolve hidden_dim per edge relation
         if isinstance(hidden_dim, dict):
@@ -293,15 +320,18 @@ class HeteroTransportCell(nn.Module):
         conv_dict = {}
         for (src, rel, dst) in edge_types:
             e_dim = edge_static_dims[(src, rel, dst)]
+            h_src, h_dst = _h(src), _h(dst)
             if (rel in ("oneDtwoD", "twoDoneD") and e_dim == 1) or bool(_ctx_types & {src, dst}):
                 # GATv2Conv for: (a) cross-type edges with no rich edge features (Model_1),
                 # (b) any edge involving a context/global virtual node.
                 mp = GATv2CrossTypeMP(
-                    h_dim=h_dim,
+                    h_dim=max(h_src, h_dst),
                     msg_dim=msg_dim,
                     hidden_dim=_hid(rel),
                     heads=4,
                     dropout=dropout,
+                    h_dim_src=h_src,
+                    h_dim_dst=h_dst,
                 )
             else:
                 # StaticDynamicEdgeMP for all homogeneous edges, and for cross-type edges
@@ -309,7 +339,7 @@ class HeteroTransportCell(nn.Module):
                 # base_weight can learn to suppress deeply-incised-channel connections
                 # from the elev_diff feature alone.
                 mp = StaticDynamicEdgeMP(
-                    h_dim=h_dim,
+                    h_dim=max(h_src, h_dst),
                     node_static_dim_src=node_static_dims[src],
                     node_static_dim_dst=node_static_dims[dst],
                     edge_static_dim=e_dim,
@@ -317,6 +347,8 @@ class HeteroTransportCell(nn.Module):
                     hidden_dim=_hid(rel),
                     dropout=dropout,
                     aggr="add",
+                    h_dim_src=h_src,
+                    h_dim_dst=h_dst,
                 )
             conv_dict[(src, rel, dst)] = mp
 
@@ -326,8 +358,19 @@ class HeteroTransportCell(nn.Module):
         })
         self.edge_types = list(conv_dict.keys())  # Store for iteration
 
+        # 1D extra hop edge keys (oneD→oneD homogeneous edges only)
+        self._1d_hop_keys = [
+            (src, rel, dst) for (src, rel, dst) in self.edge_types
+            if src == "oneD" and dst == "oneD"
+        ]
+
         # Use HeteroConv to orchestrate message passing (for clean PyG integration)
         self.hetero_conv = HeteroConv(conv_dict, aggr="sum")
+
+        # Projection for extra 1D hop feedback: msg_dim → h_dim_1d so accumulated
+        # messages can be added back into the proxy state between hops.
+        if num_1d_extra_hops > 0:
+            self.hop_msg_to_h = nn.Linear(msg_dim, _h("oneD"))
 
         # ------------------------------------------------------------
         # B) Dynamic input projection per node type
@@ -342,11 +385,11 @@ class HeteroTransportCell(nn.Module):
         #    GRUCell operates on [B*N, *] directly.
         # ------------------------------------------------------------
         self.update = nn.ModuleDict({
-            nt: nn.GRUCell(input_size=2 * msg_dim, hidden_size=h_dim) for nt in node_types
+            nt: nn.GRUCell(input_size=2 * msg_dim, hidden_size=_h(nt)) for nt in node_types
         })
         # LayerNorm on hidden state — prevents magnitude explosion over 64 rollout steps
         self.h_norm = nn.ModuleDict({
-            nt: nn.LayerNorm(h_dim) for nt in node_types
+            nt: nn.LayerNorm(_h(nt)) for nt in node_types
         })
         # LayerNorm on GRU inputs — normalizes aggregated messages (sum agg can grow
         # with node degree) and dynamic projection before they enter the GRU
@@ -427,6 +470,30 @@ class HeteroTransportCell(nn.Module):
                 )
 
         # ------------------------------------------------------------
+        # Extra 1D hops: run oneD→oneD MP additional times to propagate
+        # information further along the 1D channel network each timestep.
+        # Each hop uses the accumulated messages as a proxy updated state,
+        # injected additively so the GRU sees the full multi-hop aggregate.
+        # ------------------------------------------------------------
+        if self.num_1d_extra_hops > 0 and self._1d_hop_keys:
+            h_1d_hop = h_t["oneD"]  # start from current hidden state
+            edge_index_1d = {et: data[et].edge_index for et in self._1d_hop_keys}
+            for _ in range(self.num_1d_extra_hops):
+                # Update proxy: project normalised messages to h_dim and add to h
+                h_1d_hop = h_1d_hop + self.hop_msg_to_h(self.msg_norm["oneD"](messages["oneD"]))
+                for (src, rel, dst) in self._1d_hop_keys:
+                    key = f"{src}_{rel}_{dst}"
+                    mp = self.mp_modules[key]
+                    mp._set_context(
+                        h_src=h_1d_hop,
+                        h_dst=h_1d_hop,
+                        edge_attr_static=edge_static[(src, rel, dst)],
+                        x_static_src=x_static["oneD"],
+                        x_static_dst=x_static["oneD"],
+                    )
+                    messages["oneD"] = messages["oneD"] + mp(edge_index=edge_index_1d[(src, rel, dst)])
+
+        # ------------------------------------------------------------
         # 2) Inject DYNAMIC inputs and run GRU update.
         #    All in [B*N, *] space — GRUCell handles this natively.
         # ------------------------------------------------------------
@@ -464,15 +531,16 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         node_static_dims: dict[str, int],
         node_dyn_input_dims: dict[str, int],
         edge_static_dims: dict[tuple[str, str, str], int],
-        h_dim: int = 64,
+        h_dim: int | dict = 64,
         msg_dim: int = 64,
-        hidden_dim: int = 128,
+        hidden_dim: int | dict = 128,
         dropout: float = 0.0,
+        num_1d_extra_hops: int = 0,
     ):
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
-        self.h_dim = h_dim
+        self._h_dim = h_dim  # store raw (may be dict) for checkpoint
 
         # The recurrent graph cell
         self.cell = HeteroTransportCell(
@@ -485,12 +553,15 @@ class FloodAutoregressiveHeteroModel(nn.Module):
             msg_dim=msg_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
+            num_1d_extra_hops=num_1d_extra_hops,
         )
+        # Expose h_dim (max across types) for backward compat
+        self.h_dim = self.cell.h_dim
 
         # ------------------------------------------------------------
         # Prediction heads (one per node type):
         # Each head maps hidden state -> predicted water level.
-        # Operates on [B*N, h_dim] -> [B*N, 1].
+        # Operates on [B*N, h_dim_nt] -> [B*N, 1].
         # hidden_dim may be a dict (edge-specific); heads use max value as their MLP width.
         # ------------------------------------------------------------
         _head_hidden = max(hidden_dim.values()) if isinstance(hidden_dim, dict) else hidden_dim
@@ -498,8 +569,8 @@ class FloodAutoregressiveHeteroModel(nn.Module):
         _no_head = {"global", "ctx1d", "ctx2d"}
         self.heads = nn.ModuleDict({
             nt: nn.Sequential(
-                nn.LayerNorm(h_dim),
-                nn.Linear(h_dim, _head_hidden),
+                nn.LayerNorm(self.cell._h_per_type[nt]),
+                nn.Linear(self.cell._h_per_type[nt], _head_hidden),
                 nn.ReLU(),
                 nn.Linear(_head_hidden, 1),
             )
@@ -524,12 +595,12 @@ class FloodAutoregressiveHeteroModel(nn.Module):
     def init_hidden(self, data: HeteroData, B: int, device: torch.device) -> dict[str, torch.Tensor]:
         """
         Initialize hidden state for a batch of B samples.
-        Returns h[nt]: [B*N_nt, h_dim]
+        Returns h[nt]: [B*N_nt, h_dim_nt]
         """
         h = {}
         for nt in self.node_types:
             N = data[nt].num_nodes
-            h[nt] = torch.zeros((B * N, self.cell.h_dim), device=device)
+            h[nt] = torch.zeros((B * N, self.cell._h_per_type[nt]), device=device)
         return h
 
     def predict_water_levels(
@@ -646,6 +717,141 @@ class FloodAutoregressiveHeteroModel(nn.Module):
                     x_dyn_next[_ctx] = torch.zeros(B, 1, device=device, dtype=y_flat['oneD'].dtype)
             if use_grad_checkpoint and self.training:
                 # Build flat tensors for grad_checkpoint (no dict support)
+                _ctx_types = [nt for nt in ('ctx1d', 'ctx2d', 'global') if nt in self.node_types]
+                _all_types = ['oneD', 'twoD'] + _ctx_types
+                h_tensors   = [h[nt] for nt in _all_types]
+                dyn_tensors = [x_dyn_next[nt] for nt in _all_types]
+                def _cell_step(*args):
+                    mid = len(args) // 2
+                    h_dict   = {nt: args[i]       for i, nt in enumerate(_all_types)}
+                    dyn_dict = {nt: args[mid + i]  for i, nt in enumerate(_all_types)}
+                    return self.cell(batched_data, h_dict, dyn_dict)
+                h = grad_checkpoint(_cell_step, *h_tensors, *dyn_tensors, use_reentrant=False)
+            else:
+                h = self.cell(batched_data, h, x_dyn_next)
+            y_t = y_flat
+
+        return {
+            'oneD': torch.stack(preds_1d, dim=1),  # [B, rollout_steps, N_1d, 1]
+            'twoD': torch.stack(preds_2d, dim=1),  # [B, rollout_steps, N_2d, 1]
+        }
+
+    def forward_unroll_with_noise(
+        self,
+        data: HeteroData,
+        y_hist_1d: torch.Tensor,       # [B, H, N_1d, 1]  — clean base history
+        y_hist_2d: torch.Tensor,       # [B, H, N_2d, 1]
+        rain_hist: torch.Tensor,       # [B, H, N_2d, R]
+        y_extra_1d: torch.Tensor,      # [B, K, N_1d, 1]  — true values for extra steps
+        y_extra_2d: torch.Tensor,      # [B, K, N_2d, 1]
+        rain_extra: torch.Tensor,      # [B, K, N_2d, R]
+        noise_mu_1d: torch.Tensor,     # [K, N_1d]  — per-lag per-node mean error
+        noise_sigma_1d: torch.Tensor,  # [K, N_1d]  — per-lag per-node std error
+        noise_mu_2d: torch.Tensor,     # [K, N_2d]
+        noise_sigma_2d: torch.Tensor,  # [K, N_2d]
+        rain_future: torch.Tensor,     # [B, T, N_2d, R]
+        make_x_dyn,
+        rollout_steps: int,
+        device: torch.device,
+        batched_data: HeteroData = None,
+        use_grad_checkpoint: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Forward pass with calibrated noise injection for the warm-start curriculum.
+
+        Structure:
+          1) Clean warm-start for H steps (teacher forcing on y_hist)
+          2) Perturbed warm-start for K extra steps:
+             - Input = true value + N(mu[k], sigma[k]) noise per node, lag k
+          3) Autoregressive rollout for rollout_steps steps
+
+        noise_mu/sigma are per-lag-per-node tensors collected from the previous
+        curriculum stage's val rollout errors.  They capture both the systematic
+        bias (mu != 0) and spread (sigma) of predictions-used-as-inputs.
+        """
+        B = y_hist_1d.size(0)
+        N_1d = y_hist_1d.size(2)
+        N_2d = y_hist_2d.size(2)
+        K = y_extra_1d.size(1)
+        node_counts = {'oneD': N_1d, 'twoD': N_2d}
+
+        if batched_data is None:
+            batched_data = self._make_batched_graph(data, B)
+
+        h = self.init_hidden(data, B, device=device)
+
+        # ---------------------------------------------------------------
+        # (1) Clean warm-start (H steps, teacher forcing)
+        # ---------------------------------------------------------------
+        H = y_hist_1d.size(1)
+        for k in range(H):
+            y1d_k = y_hist_1d[:, k, :, :].reshape(B * N_1d, 1)
+            y2d_k = y_hist_2d[:, k, :, :].reshape(B * N_2d, 1)
+            r_k   = rain_hist[:, k, :, :].reshape(B * N_2d, -1)
+            y_true_k = {'oneD': y1d_k, 'twoD': y2d_k}
+            x_dyn_t = make_x_dyn(y_true_k, r_k, batched_data)
+            for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                if _ctx in self.node_types:
+                    x_dyn_t[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
+            h = self.cell(batched_data, h, x_dyn_t)
+
+        # ---------------------------------------------------------------
+        # (2) Perturbed warm-start (K extra steps)
+        #     Each step k: inject noise calibrated to lag-k prediction error.
+        #     noise_mu_1d[k]: [N_1d], noise_sigma_1d[k]: [N_1d] — shared across batch.
+        #     Perturbation is sampled fresh per-batch-item by broadcasting.
+        # ---------------------------------------------------------------
+        for k in range(K):
+            # True water level at this extra step
+            y1d_true = y_extra_1d[:, k, :, :]   # [B, N_1d, 1]
+            y2d_true = y_extra_2d[:, k, :, :]   # [B, N_2d, 1]
+
+            # Sample per-node noise: eps ~ N(0, 1), then scale+shift
+            # mu/sigma: [N] -> unsqueeze to [1, N, 1] for broadcasting over B
+            mu1  = noise_mu_1d[k].unsqueeze(0).unsqueeze(-1)    # [1, N_1d, 1]
+            sig1 = noise_sigma_1d[k].unsqueeze(0).unsqueeze(-1) # [1, N_1d, 1]
+            mu2  = noise_mu_2d[k].unsqueeze(0).unsqueeze(-1)
+            sig2 = noise_sigma_2d[k].unsqueeze(0).unsqueeze(-1)
+
+            eps1 = torch.randn_like(y1d_true)   # [B, N_1d, 1]
+            eps2 = torch.randn_like(y2d_true)
+
+            y1d_perturbed = y1d_true + mu1 + sig1 * eps1   # [B, N_1d, 1]
+            y2d_perturbed = y2d_true + mu2 + sig2 * eps2
+
+            y1d_flat = y1d_perturbed.reshape(B * N_1d, 1)
+            y2d_flat = y2d_perturbed.reshape(B * N_2d, 1)
+            r_k = rain_extra[:, k, :, :].reshape(B * N_2d, -1)
+
+            y_noisy_k = {'oneD': y1d_flat, 'twoD': y2d_flat}
+            x_dyn_t = make_x_dyn(y_noisy_k, r_k, batched_data)
+            for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                if _ctx in self.node_types:
+                    x_dyn_t[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_flat.dtype)
+            h = self.cell(batched_data, h, x_dyn_t)
+
+        # y_t is set inside the rollout loop from model predictions; initialization unused.
+
+        # ---------------------------------------------------------------
+        # (3) Autoregressive rollout
+        # ---------------------------------------------------------------
+        preds_1d = []
+        preds_2d = []
+        for t in range(rollout_steps):
+            y_next = self.predict_water_levels(h, B, node_counts)
+            preds_1d.append(y_next['oneD'])
+            preds_2d.append(y_next['twoD'])
+
+            r_next = rain_future[:, t, :, :].reshape(B * N_2d, -1)
+            y_flat = {
+                'oneD': y_next['oneD'].reshape(B * N_1d, 1),
+                'twoD': y_next['twoD'].reshape(B * N_2d, 1),
+            }
+            x_dyn_next = make_x_dyn(y_flat, r_next, batched_data)
+            for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                if _ctx in self.node_types:
+                    x_dyn_next[_ctx] = torch.zeros(B, 1, device=device, dtype=y_flat['oneD'].dtype)
+            if use_grad_checkpoint and self.training:
                 _ctx_types = [nt for nt in ('ctx1d', 'ctx2d', 'global') if nt in self.node_types]
                 _all_types = ['oneD', 'twoD'] + _ctx_types
                 h_tensors   = [h[nt] for nt in _all_types]

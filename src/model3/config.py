@@ -48,11 +48,13 @@ CONFIG = {
     'h_dim':        _enc(96),   # GRU hidden size
     'msg_dim':      _enc(64),   # Message passing dimension
     'history_len':  _enc(10),   # Warm-start steps
+    'num_mp_rounds': 2,         # Message passing rounds per GRU step (multi-hop spatial reasoning)
+                                # 1 = original (1-hop), 2 = 2-hop, 3 = 3-hop receptive field per step
 
     # Transformer decoder
     'dec_d_model':   _dec(64),  # Transformer model dimension
     'dec_nhead':     _dec(2),   # Attention heads  (must divide dec_d_model)
-    'dec_num_layers':_dec(2),   # Transformer encoder layers
+    'dec_num_layers':_dec(4),   # Transformer encoder layers (increased from 2 for deeper temporal reasoning)
     'dec_ffn_dim':   _dec(128), # Feedforward dim inside transformer
     'dec_dropout': 0.1,
 

@@ -114,15 +114,24 @@ class GATv2CrossTypeMP(MessagePassing):
 # ============================================================
 
 class HeteroTransportCell(nn.Module):
-    """Single GRU timestep over a heterogeneous graph. B=1 in Model_3."""
+    """
+    Single GRU timestep over a heterogeneous graph. B=1 in Model_3.
+
+    Supports multi-hop message passing: when num_mp_rounds > 1, the cell runs
+    multiple rounds of message passing before the GRU update. Each intermediate
+    round refines the hidden state via a residual MLP, expanding the spatial
+    receptive field from 1 hop to num_mp_rounds hops per timestep.
+    """
     def __init__(self, node_types, edge_types, node_static_dims, node_dyn_input_dims,
-                 edge_static_dims, h_dim=96, msg_dim=64, hidden_dim=128, dropout=0.0):
+                 edge_static_dims, h_dim=96, msg_dim=64, hidden_dim=128, dropout=0.0,
+                 num_mp_rounds=1):
         super().__init__()
         self.node_types = node_types
         self.edge_types = edge_types
         self.h_dim = h_dim
         self.msg_dim = msg_dim
         self._hidden_dim = hidden_dim
+        self.num_mp_rounds = num_mp_rounds
 
         if isinstance(hidden_dim, dict):
             _hid_default = next(iter(hidden_dim.values()), 128)
@@ -131,23 +140,54 @@ class HeteroTransportCell(nn.Module):
             def _hid(rel): return hidden_dim
 
         _ctx_types = {"ctx1d", "ctx2d", "global"}
-        conv_dict = {}
-        for (src, rel, dst) in edge_types:
-            e_dim = edge_static_dims[(src, rel, dst)]
-            if (rel in ("oneDtwoD", "twoDoneD") and e_dim == 1) or bool(_ctx_types & {src, dst}):
-                mp = GATv2CrossTypeMP(h_dim=h_dim, msg_dim=msg_dim, hidden_dim=_hid(rel),
-                                     heads=4, dropout=dropout)
-            else:
-                mp = StaticDynamicEdgeMP(
-                    h_dim=h_dim, node_static_dim_src=node_static_dims[src],
-                    node_static_dim_dst=node_static_dims[dst], edge_static_dim=e_dim,
-                    msg_dim=msg_dim, hidden_dim=_hid(rel), dropout=dropout, aggr="add")
-            conv_dict[(src, rel, dst)] = mp
 
-        self.mp_modules = nn.ModuleDict({
-            f"{src}_{rel}_{dst}": mp for (src, rel, dst), mp in conv_dict.items()})
-        self.edge_types = list(conv_dict.keys())
-        self.hetero_conv = HeteroConv(conv_dict, aggr="sum")
+        # Build MP modules for each round (separate parameters per round)
+        self.mp_modules_per_round = nn.ModuleList()
+        self.hetero_convs = nn.ModuleList()
+        for _round in range(num_mp_rounds):
+            conv_dict = {}
+            for (src, rel, dst) in edge_types:
+                e_dim = edge_static_dims[(src, rel, dst)]
+                if (rel in ("oneDtwoD", "twoDoneD") and e_dim == 1) or bool(_ctx_types & {src, dst}):
+                    mp = GATv2CrossTypeMP(h_dim=h_dim, msg_dim=msg_dim, hidden_dim=_hid(rel),
+                                         heads=4, dropout=dropout)
+                else:
+                    mp = StaticDynamicEdgeMP(
+                        h_dim=h_dim, node_static_dim_src=node_static_dims[src],
+                        node_static_dim_dst=node_static_dims[dst], edge_static_dim=e_dim,
+                        msg_dim=msg_dim, hidden_dim=_hid(rel), dropout=dropout, aggr="add")
+                conv_dict[(src, rel, dst)] = mp
+
+            mp_mod = nn.ModuleDict({
+                f"{src}_{rel}_{dst}": mp for (src, rel, dst), mp in conv_dict.items()})
+            self.mp_modules_per_round.append(mp_mod)
+            self.hetero_convs.append(HeteroConv(conv_dict, aggr="sum"))
+
+        # Keep references for backward compat (round 0)
+        self.mp_modules = self.mp_modules_per_round[0]
+        self.hetero_conv = self.hetero_convs[0]
+        self.edge_types = list(self.mp_modules.keys())
+        # Convert module-dict keys back to (src, rel, dst) tuples
+        self._edge_type_tuples = [
+            tuple(k.split('_', 2)) for k in self.edge_types
+        ]
+
+        # Intermediate round: project aggregated messages → h_dim update with residual
+        if num_mp_rounds > 1:
+            self.inter_msg_norm = nn.ModuleList([
+                nn.ModuleDict({nt: nn.LayerNorm(msg_dim) for nt in node_types})
+                for _ in range(num_mp_rounds - 1)
+            ])
+            self.inter_proj = nn.ModuleList([
+                nn.ModuleDict({nt: nn.Sequential(
+                    nn.Linear(msg_dim, h_dim), nn.GELU(), nn.Dropout(dropout),
+                ) for nt in node_types})
+                for _ in range(num_mp_rounds - 1)
+            ])
+            self.inter_h_norm = nn.ModuleList([
+                nn.ModuleDict({nt: nn.LayerNorm(h_dim) for nt in node_types})
+                for _ in range(num_mp_rounds - 1)
+            ])
 
         self.dyn_proj = nn.ModuleDict({nt: nn.Linear(node_dyn_input_dims[nt], msg_dim) for nt in node_types})
         self.update = nn.ModuleDict({nt: nn.GRUCell(input_size=2*msg_dim, hidden_size=h_dim) for nt in node_types})
@@ -155,24 +195,38 @@ class HeteroTransportCell(nn.Module):
         self.msg_norm = nn.ModuleDict({nt: nn.LayerNorm(msg_dim) for nt in node_types})
         self.dyn_norm = nn.ModuleDict({nt: nn.LayerNorm(msg_dim) for nt in node_types})
 
-    def forward(self, data, h_t, x_dyn_t):
+    def _run_mp_round(self, round_idx, data, h_t):
+        """Run one round of heterogeneous message passing."""
         x_static = {nt: data[nt].x_static for nt in self.node_types}
-        edge_static = {et: data[et].edge_attr_static for et in self.edge_types}
+        mp_modules = self.mp_modules_per_round[round_idx]
+        hetero_conv = self.hetero_convs[round_idx]
 
-        for (src_type, rel, dst_type) in self.edge_types:
-            key = f"{src_type}_{rel}_{dst_type}"
-            mp = self.mp_modules[key]
+        # Reconstruct edge_type tuples from module keys
+        edge_type_keys = list(mp_modules.keys())
+
+        for key in edge_type_keys:
+            parts = key.split('_', 2)
+            src_type, rel, dst_type = parts[0], parts[1], parts[2]
+            et = (src_type, rel, dst_type)
+            mp = mp_modules[key]
             if isinstance(mp, GATv2CrossTypeMP):
                 mp._set_context(h_src=h_t[src_type], h_dst=h_t[dst_type])
             else:
+                edge_attr = data[et].edge_attr_static
                 mp._set_context(
                     h_src=h_t[src_type], h_dst=h_t[dst_type],
-                    edge_attr_static=edge_static[(src_type, rel, dst_type)],
+                    edge_attr_static=edge_attr,
                     x_static_src=x_static[src_type], x_static_dst=x_static[dst_type])
 
-        edge_index_dict = {et: data[et].edge_index for et in self.edge_types}
+        # Build edge_index_dict using tuples (HeteroConv expects tuple keys)
+        edge_index_dict = {}
+        for key in edge_type_keys:
+            parts = key.split('_', 2)
+            et = (parts[0], parts[1], parts[2])
+            edge_index_dict[et] = data[et].edge_index
+
         x_dict = {nt: h_t[nt] for nt in self.node_types}
-        messages = self.hetero_conv(x_dict, edge_index_dict)
+        messages = hetero_conv(x_dict, edge_index_dict)
 
         for nt in self.node_types:
             if nt not in messages:
@@ -181,13 +235,35 @@ class HeteroTransportCell(nn.Module):
             if messages[nt].size(0) != expected:
                 raise RuntimeError(
                     f"Message shape mismatch for '{nt}': expected {expected} got {messages[nt].size(0)}")
+        return messages
+
+    def forward(self, data, h_t, x_dyn_t):
+        # ------------------------------------------------------------------
+        # Multi-hop: run num_mp_rounds rounds of message passing.
+        # Rounds 0..num_mp_rounds-2 refine h_t with residual updates.
+        # The final round's messages go into the GRU update.
+        # ------------------------------------------------------------------
+        h_cur = h_t  # working hidden state for intermediate rounds
+
+        for r in range(self.num_mp_rounds - 1):
+            messages = self._run_mp_round(r, data, h_cur)
+            # Residual update: h_cur = LayerNorm(h_cur + proj(msg))
+            h_new = {}
+            for nt in self.node_types:
+                msg_normed = self.inter_msg_norm[r][nt](messages[nt])
+                delta = self.inter_proj[r][nt](msg_normed)  # [N, h_dim]
+                h_new[nt] = self.inter_h_norm[r][nt](h_cur[nt] + delta)
+            h_cur = h_new
+
+        # Final MP round → messages for GRU update
+        messages = self._run_mp_round(self.num_mp_rounds - 1, data, h_cur)
 
         h_next = {}
         for nt in self.node_types:
             dyn_emb = self.dyn_norm[nt](self.dyn_proj[nt](x_dyn_t[nt]))
             msg_emb = self.msg_norm[nt](messages[nt])
             upd_in = torch.cat([dyn_emb, msg_emb], dim=-1)
-            h_raw = self.update[nt](upd_in, h_t[nt])
+            h_raw = self.update[nt](upd_in, h_cur[nt])
             h_next[nt] = self.h_norm[nt](h_raw)
         return h_next
 
@@ -282,19 +358,21 @@ class HeteroEncoderDecoderModel(nn.Module):
                  T_max=512,
                  dec_d_model=64, dec_nhead=2, dec_num_layers=2,
                  dec_ffn_dim=128, dec_dropout=0.1,
-                 dec_node_chunk=512, dropout=0.0):
+                 dec_node_chunk=512, dropout=0.0,
+                 num_mp_rounds=1):
         super().__init__()
         self.node_types = node_types
         self.h_dim = h_dim
         self.T_max = T_max
         self.dec_node_chunk = dec_node_chunk
 
-        # Encoder GRU cell
+        # Encoder GRU cell (with multi-hop message passing)
         self.cell = HeteroTransportCell(
             node_types=node_types, edge_types=edge_types,
             node_static_dims=node_static_dims, node_dyn_input_dims=node_dyn_input_dims,
             edge_static_dims=edge_static_dims,
-            h_dim=h_dim, msg_dim=msg_dim, hidden_dim=hidden_dim, dropout=dropout)
+            h_dim=h_dim, msg_dim=msg_dim, hidden_dim=hidden_dim, dropout=dropout,
+            num_mp_rounds=num_mp_rounds)
 
         # Transformer decoders — one per predicted node type
         _no_head = {"global", "ctx1d", "ctx2d"}

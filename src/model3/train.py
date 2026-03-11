@@ -58,6 +58,7 @@ def save_checkpoint(model, epoch, loss, save_dir, optimizer=None, scheduler=None
             'h_dim':          model.h_dim,
             'msg_dim':        model.cell.msg_dim,
             'hidden_dim':     model.cell._hidden_dim,
+            'num_mp_rounds':  model.cell.num_mp_rounds,
             'T_max':          CONFIG['T_max'],
             'dec_d_model':    CONFIG['dec_d_model'],
             'dec_nhead':      CONFIG['dec_nhead'],
@@ -261,6 +262,7 @@ def train(resume_from=None, use_mixed_precision=False):
         'dec_ffn_dim':      CONFIG['dec_ffn_dim'],
         'dec_dropout':      CONFIG['dec_dropout'],
         'dec_node_chunk':   CONFIG['dec_node_chunk'],
+        'num_mp_rounds':    CONFIG.get('num_mp_rounds', 1),
     })
     model = HeteroEncoderDecoderModel(**graph_config).to(device)
 
