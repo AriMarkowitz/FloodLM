@@ -254,11 +254,7 @@ def initialize_data():
         edges1dfeats_tmp, normalizer_edge1d = future_1d.result()
         edges2dfeats_tmp, normalizer_edge2d = future_2d.result()
     
-    edges1dfeats = normalizer_edge1d.transform_static(edges1dfeats, EDGE_ID_COL)
-    edges2dfeats = normalizer_edge2d.transform_static(edges2dfeats, EDGE_ID_COL)
-    
-    edge1_cols = [c for c in edges1dfeats.columns if c != EDGE_ID_COL]
-    edge2_cols = [c for c in edges2dfeats.columns if c != EDGE_ID_COL]
+    # NOTE: edge transform deferred until after unified normalization override below.
     
     # Get event directories
     event_dirs = sorted(
@@ -305,10 +301,88 @@ def initialize_data():
     print("[INFO] Preprocessing static 1D nodes...")
     static_1d = preprocess_1d_nodes(static_1d, static_2d, edges1d2d)
     print("[INFO] Fitting static feature normalization...")
+    # Save raw (pre-normalization) spatial & elevation columns for cross-type edge features.
+    # These must be computed in a common physical space, not from independently-normalized values.
+    _raw_cols_1d = {c: static_1d[c].values.copy() for c in ['position_x', 'position_y', 'invert_elevation']
+                    if c in static_1d.columns}
+    _raw_cols_1d['node_idx'] = static_1d[NODE_ID_COL].values.copy()
+    _raw_cols_2d = {c: static_2d[c].values.copy() for c in ['position_x', 'position_y', 'elevation']
+                    if c in static_2d.columns}
+    _raw_cols_2d['node_idx'] = static_2d[NODE_ID_COL].values.copy()
     normalizer_1d.fit_static(static_1d.copy(), NODE_ID_COL, skew_threshold=2.0)
     normalizer_2d.fit_static(static_2d.copy(), NODE_ID_COL, skew_threshold=2.0)
+
+    # ---- Unify normalization for shared spatial & elevation features ----
+    # Position columns must map to the same [0,1] scale across 1D and 2D nodes
+    # so the model sees consistent spatial relationships.
+    # Elevation columns likewise: invert_elevation, surface_elevation (1D) and
+    # elevation, min_elevation (2D) share the same vertical datum.
+    _spatial_groups = [
+        # (columns in normalizer_1d, columns in normalizer_2d) that share a physical axis
+        (['position_x'], ['position_x']),
+        (['position_y'], ['position_y']),
+        # All elevation columns share the same vertical datum
+        (['invert_elevation', 'surface_elevation'],
+         ['elevation', 'min_elevation']),
+    ]
+    for cols_1d, cols_2d in _spatial_groups:
+        # Collect all params that exist in either normalizer
+        all_params = []
+        for c in cols_1d:
+            if c in normalizer_1d.static_params:
+                all_params.append(normalizer_1d.static_params[c])
+        for c in cols_2d:
+            if c in normalizer_2d.static_params:
+                all_params.append(normalizer_2d.static_params[c])
+        if len(all_params) < 2:
+            continue
+        # Use consistent log transform decision: use log only if ALL columns use log
+        use_log = all(p['log'] for p in all_params)
+        joint_min = min(p['min'] for p in all_params)
+        joint_max = max(p['max'] for p in all_params)
+        for c in cols_1d:
+            if c in normalizer_1d.static_params:
+                normalizer_1d.static_params[c] = {'min': joint_min, 'max': joint_max, 'log': use_log}
+        for c in cols_2d:
+            if c in normalizer_2d.static_params:
+                normalizer_2d.static_params[c] = {'min': joint_min, 'max': joint_max, 'log': use_log}
+    print("[INFO] Unified normalization for shared spatial/elevation features across 1D/2D nodes")
+
+    # Unify edge normalizers for shared features (relative_position, slope)
+    _edge_spatial_groups = [
+        (['relative_position_x'], ['relative_position_x']),
+        (['relative_position_y'], ['relative_position_y']),
+        (['slope'], ['slope']),
+    ]
+    for cols_e1, cols_e2 in _edge_spatial_groups:
+        all_params = []
+        for c in cols_e1:
+            if c in normalizer_edge1d.static_params:
+                all_params.append(normalizer_edge1d.static_params[c])
+        for c in cols_e2:
+            if c in normalizer_edge2d.static_params:
+                all_params.append(normalizer_edge2d.static_params[c])
+        if len(all_params) < 2:
+            continue
+        use_log = all(p['log'] for p in all_params)
+        joint_min = min(p['min'] for p in all_params)
+        joint_max = max(p['max'] for p in all_params)
+        for c in cols_e1:
+            if c in normalizer_edge1d.static_params:
+                normalizer_edge1d.static_params[c] = {'min': joint_min, 'max': joint_max, 'log': use_log}
+        for c in cols_e2:
+            if c in normalizer_edge2d.static_params:
+                normalizer_edge2d.static_params[c] = {'min': joint_min, 'max': joint_max, 'log': use_log}
+    print("[INFO] Unified normalization for shared spatial/slope features across 1D/2D edges")
+
     static_1d = normalizer_1d.transform_static(static_1d, NODE_ID_COL)
     static_2d = normalizer_2d.transform_static(static_2d, NODE_ID_COL)
+
+    # Transform edges with unified params (transform was deferred from above).
+    edges1dfeats = normalizer_edge1d.transform_static(edges1dfeats, EDGE_ID_COL)
+    edges2dfeats = normalizer_edge2d.transform_static(edges2dfeats, EDGE_ID_COL)
+    edge1_cols = [c for c in edges1dfeats.columns if c != EDGE_ID_COL]
+    edge2_cols = [c for c in edges2dfeats.columns if c != EDGE_ID_COL]
     
     # Stream through events for dynamic normalization (Pass 1) - PARALLELIZED
     print(f"[INFO] Streaming through {len(train_events)} TRAINING events for dynamic normalization (parallel)...")
@@ -465,6 +539,8 @@ def initialize_data():
         'static_1d_cols': static_1d_cols,
         'static_2d_cols': static_2d_cols,
         'NODE_ID_COL': NODE_ID_COL,
+        'raw_spatial_1d': _raw_cols_1d,  # pre-normalization position/elevation for cross-edge features
+        'raw_spatial_2d': _raw_cols_2d,
     }
     
     _initialized = True

@@ -214,6 +214,8 @@ def create_static_hetero_graph(
     static_1d_cols, static_2d_cols,
     edge1_cols, edge2_cols,
     node_id_col: str = "node_idx",
+    raw_spatial_1d=None,
+    raw_spatial_2d=None,
 ):
     """
     Create a single static heterogeneous graph (no temporal unrolling).
@@ -354,14 +356,28 @@ def create_static_hetero_graph(
 
     if use_rich_cross_feats:
         import numpy as np
-        idx_1d = static_1d_norm["node_idx"].values
-        idx_2d = static_2d_norm["node_idx"].values
-        x1d = static_1d_norm["position_x"].values
-        y1d = static_1d_norm["position_y"].values
-        inv_elev_1d = static_1d_norm["invert_elevation"].values
-        x2d = static_2d_norm["position_x"].values
-        y2d = static_2d_norm["position_y"].values
-        elev_2d = static_2d_norm["elevation"].values
+        # Use raw (pre-normalization) spatial data when available so that distances
+        # and elevation differences are computed in a consistent physical coordinate
+        # space, not from independently min-max-normalized values.
+        if raw_spatial_1d is not None and raw_spatial_2d is not None:
+            idx_1d = raw_spatial_1d["node_idx"]
+            idx_2d = raw_spatial_2d["node_idx"]
+            x1d = raw_spatial_1d["position_x"]
+            y1d = raw_spatial_1d["position_y"]
+            inv_elev_1d = raw_spatial_1d["invert_elevation"]
+            x2d = raw_spatial_2d["position_x"]
+            y2d = raw_spatial_2d["position_y"]
+            elev_2d = raw_spatial_2d["elevation"]
+        else:
+            # Fallback: use normalized values (legacy / inference without raw data)
+            idx_1d = static_1d_norm["node_idx"].values
+            idx_2d = static_2d_norm["node_idx"].values
+            x1d = static_1d_norm["position_x"].values
+            y1d = static_1d_norm["position_y"].values
+            inv_elev_1d = static_1d_norm["invert_elevation"].values
+            x2d = static_2d_norm["position_x"].values
+            y2d = static_2d_norm["position_y"].values
+            elev_2d = static_2d_norm["elevation"].values
 
         map_1d = {int(v): i for i, v in enumerate(idx_1d)}
         map_2d = {int(v): i for i, v in enumerate(idx_2d)}
@@ -1031,10 +1047,13 @@ class ShuffledFloodDataset(IterableDataset):
         batch_size=1,
         shuffle=True,
         node_id_col: str = "node_idx",
+        raw_spatial_1d=None,
+        raw_spatial_2d=None,
     ):
         super().__init__()
         self.history_len = history_len
         self.forecast_len = forecast_len
+        self._active_future = forecast_len  # overridden by set_min_future()
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.node_id_col = node_id_col
@@ -1046,6 +1065,8 @@ class ShuffledFloodDataset(IterableDataset):
             static_1d_cols, static_2d_cols,
             edge1_cols, edge2_cols,
             node_id_col=node_id_col,
+            raw_spatial_1d=raw_spatial_1d,
+            raw_spatial_2d=raw_spatial_2d,
         )
         self.n_nodes_1d = len(static_1d_norm)
         self.n_nodes_2d = len(static_2d_norm)
@@ -1060,6 +1081,7 @@ class ShuffledFloodDataset(IterableDataset):
         #   wl_2d:   [T, N_2d]
         #   rain_2d: [T, N_2d, RAIN_N_CHANNELS]  (augmented)
         self._events = []          # list of (wl_1d, wl_2d, rain_2d_aug)
+        self._event_lengths = []   # list of T per event
         self._window_index = []    # list of (event_idx, t_start) across all events
 
         print(f"[ShuffledFloodDataset] Pre-loading {len(event_file_list)} events into memory...")
@@ -1097,26 +1119,41 @@ class ShuffledFloodDataset(IterableDataset):
             rain_aug = compute_rainfall_features(rain_raw, rain_sum_maxes=norm_stats.get('rain_sum_maxes'))
 
             self._events.append((wl_1d, wl_2d, rain_aug))
+            self._event_lengths.append(T)
 
-            win_len = history_len + forecast_len
-            for t_start in range(T - win_len + 1):
+            # Index windows with at least forecast_len future steps (conservative default).
+            # _window_index is rebuilt via set_min_future() at each curriculum stage,
+            # which may include more windows when max_h < forecast_len.
+            max_t = T - history_len - forecast_len + 1
+            for t_start in range(max(0, max_t)):
                 self._window_index.append((ev_idx, t_start))
 
         print(f"[ShuffledFloodDataset] Loaded {len(self._events)} events, "
               f"{len(self._window_index)} total windows.")
 
+    def set_min_future(self, min_future: int):
+        """Rebuild window index to only include windows with >= min_future steps available.
+        Call this at each curriculum stage change to drop windows too short for current horizon.
+        Also sets the active future slice length so _get_window returns uniform tensors.
+        """
+        self._active_future = min_future
+        self._window_index = []
+        for ev_idx, T in enumerate(self._event_lengths):
+            for t_start in range(T - self.history_len - min_future + 1):
+                self._window_index.append((ev_idx, t_start))
+
     def _get_window(self, ev_idx: int, t_start: int) -> dict:
         wl_1d, wl_2d, rain_aug = self._events[ev_idx]
         h = self.history_len
-        f = self.forecast_len
+        f = self._active_future  # current curriculum horizon, not max forecast_len
         t_hist_end = t_start + h  # exclusive
 
         y_hist_1d      = wl_1d[t_start:t_hist_end, :].unsqueeze(-1)           # [H, N_1d, 1]
         y_hist_2d      = wl_2d[t_start:t_hist_end, :].unsqueeze(-1)           # [H, N_2d, 1]
         rain_hist_2d   = rain_aug[t_start:t_hist_end, :, :]                   # [H, N_2d, R]
-        y_future_1d    = wl_1d[t_hist_end:t_hist_end + f, :].unsqueeze(-1)    # [T, N_1d, 1]
-        y_future_2d    = wl_2d[t_hist_end:t_hist_end + f, :].unsqueeze(-1)    # [T, N_2d, 1]
-        rain_future_2d = rain_aug[t_hist_end:t_hist_end + f, :, :]            # [T, N_2d, R]
+        y_future_1d    = wl_1d[t_hist_end:t_hist_end + f, :].unsqueeze(-1)    # [F, N_1d, 1]
+        y_future_2d    = wl_2d[t_hist_end:t_hist_end + f, :].unsqueeze(-1)    # [F, N_2d, 1]
+        rain_future_2d = rain_aug[t_hist_end:t_hist_end + f, :, :]            # [F, N_2d, R]
 
         return {
             'y_hist_1d':      y_hist_1d,
@@ -1487,6 +1524,8 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
         batch_size=batch_size,
         shuffle=shuffle,
         node_id_col=node_id_col,
+        raw_spatial_1d=data.get('raw_spatial_1d'),
+        raw_spatial_2d=data.get('raw_spatial_2d'),
     )
 
     # Collate function: dataset already yields pre-formed batches, so the
@@ -1498,7 +1537,7 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
         static_graph = item['static_graph']
         if isinstance(static_graph, NonBatchableGraph):
             static_graph = static_graph.graph
-        return {
+        result = {
             'static_graph':   static_graph,
             'y_hist_1d':      item['y_hist_1d'],
             'y_hist_2d':      item['y_hist_2d'],
@@ -1507,6 +1546,9 @@ def get_recurrent_dataloader(history_len=10, forecast_len=1, batch_size=8, shuff
             'y_future_2d':    item['y_future_2d'],
             'rain_future_2d': item['rain_future_2d'],
         }
+        if 'avail_steps' in item:
+            result['avail_steps'] = item['avail_steps']
+        return result
 
     # Use torch DataLoader (not PyG) to avoid automatic batching of HeteroData.
     # batch_size=1 because RecurrentFloodDataset already yields pre-formed batches.

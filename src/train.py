@@ -807,6 +807,11 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     # Pre-build batched static graphs once — reused every forward pass to eliminate
     # per-batch CPU overhead from Batch.from_data_list.
     print(f"\n[INFO] Pre-building batched static graphs (B={CONFIG['batch_size']})...")
+    # Ensure window index uses forecast_len before the first batch is drawn,
+    # so all samples in the first batch have uniform shape.
+    train_dataloader.dataset.set_min_future(CONFIG['forecast_len'])
+    if val_dataloader is not None and hasattr(val_dataloader.dataset, 'set_min_future'):
+        val_dataloader.dataset.set_min_future(CONFIG['forecast_len'])
     _static_graph_cpu = next(iter(train_dataloader))['static_graph']
     train_batched_graph = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device)
     val_batched_graph   = model._make_batched_graph(_static_graph_cpu, CONFIG['batch_size']).to(device) if not skip_validation else None
@@ -986,7 +991,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             noise_K = _noise_extra_steps
         elif custom_curriculum is not None:
             # custom_curriculum: list of (horizon, n_epochs) built relative to start_epoch
-            # _cc_boundaries[i] = last absolute epoch of stage i
+            # _cc_boundaries[i] = first epoch of the NEXT stage (exclusive upper bound)
             _cc_boundaries = []
             _cc_horizons = []
             _ep = start_epoch
@@ -994,7 +999,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 _ep += n
                 _cc_boundaries.append(_ep)
                 _cc_horizons.append(h)
-            _stage_idx = next((i for i, b in enumerate(_cc_boundaries) if epoch <= b), len(_cc_boundaries) - 1)
+            _stage_idx = next((i for i, b in enumerate(_cc_boundaries) if epoch < b), len(_cc_boundaries) - 1)
             max_h = _cc_horizons[_stage_idx]
             noise_K = 0
         elif SELECTED_MODEL == 'Model_2':
@@ -1011,6 +1016,20 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
         # Epoch boundary marker — visible as a vertical annotation in wandb
         wandb.log({'epoch': epoch, 'curriculum/max_h': max_h,
                    'curriculum/noise_extra_steps': noise_K}, step=global_step)
+
+        # Update window index to only include windows with >= max_h future steps.
+        # This ensures short events contribute at low horizons but drop out at higher ones.
+        _eff_min_future = max(1, noise_K + 1 if _use_noise_curriculum else max_h)
+        if not hasattr(train_dataloader.dataset, '_last_min_future') or \
+                train_dataloader.dataset._last_min_future != _eff_min_future:
+            train_dataloader.dataset.set_min_future(_eff_min_future)
+            train_dataloader.dataset._last_min_future = _eff_min_future
+            print(f"[INFO] Window index updated: min_future={_eff_min_future}, "
+                  f"windows={len(train_dataloader.dataset._window_index)}")
+            # Also update val dataloader so val windows match the current horizon
+            if val_dataloader is not None and hasattr(val_dataloader.dataset, 'set_min_future'):
+                val_dataloader.dataset.set_min_future(_eff_min_future)
+                val_dataloader.dataset._last_min_future = _eff_min_future
 
         if _use_noise_curriculum and noise_K <= _noise_max_extra:
             _phase = "init" if _noise_init_epochs_done < _noise_smart_init_epochs else "smart-detect"
@@ -1032,12 +1051,10 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             y_future_2d = batch['y_future_2d'].to(device, non_blocking=True)    # [B, T, N_2d, 1]
             rain_future_2d = batch['rain_future_2d'].to(device, non_blocking=True)  # [B, T, N_2d, R]
 
-            avail = y_future_1d.shape[1]
-
             optimizer.zero_grad()
             with torch.amp.autocast('cuda', enabled=use_mixed_precision):
                 # Noise-injection curriculum: K extra perturbed warm-start steps, rollout=1
-                if _use_noise_curriculum and noise_K > 0 and _noise_mu_1d is not None and avail > noise_K:
+                if _use_noise_curriculum and noise_K > 0 and _noise_mu_1d is not None:
                     # Slice extra steps from y_future: steps 0..K-1 are the perturbed warm-start
                     # Target: step K (y_future[:, K:K+1])
                     y_extra_1d  = y_future_1d[:, :noise_K]        # [B, K, N_1d, 1]
@@ -1074,7 +1091,7 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                     loss_2d = criterion(predictions['twoD'], y_future_2d[:, noise_K:noise_K+1])
                 else:
                     # Standard horizon-expanding curriculum (or noise K=0 / no stats yet)
-                    rollout_steps = min(max_h, avail)
+                    rollout_steps = max_h
                     predictions = model.forward_unroll(
                         data=static_graph,
                         y_hist_1d=y_hist_1d,

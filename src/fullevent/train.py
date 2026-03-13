@@ -614,6 +614,8 @@ def train(resume_from=None, use_mixed_precision=None, pretrain_from=None, config
         data['static_1d_cols'], data['static_2d_cols'],
         data['edge1_cols'], data['edge2_cols'],
         node_id_col=data['NODE_ID_COL'],
+        raw_spatial_1d=data.get('raw_spatial_1d'),
+        raw_spatial_2d=data.get('raw_spatial_2d'),
     )
     static_graph = static_graph_cpu.to(device)
     rain_1d_index = (

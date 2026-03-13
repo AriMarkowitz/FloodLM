@@ -208,6 +208,8 @@ def build_static_graph_from_cache(data):
         edge1_cols=data['edge1_cols'],
         edge2_cols=data['edge2_cols'],
         node_id_col=data['NODE_ID_COL'],
+        raw_spatial_1d=data.get('raw_spatial_1d'),
+        raw_spatial_2d=data.get('raw_spatial_2d'),
     )
 
 

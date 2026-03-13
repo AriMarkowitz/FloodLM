@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=18:00:00
 #SBATCH --output=/users/admarkowitz/FloodLM/logs/slurm_%j.out
 #SBATCH --error=/users/admarkowitz/FloodLM/logs/slurm_%j.err
 
@@ -22,6 +22,11 @@
 #   sbatch slurm/submit_custom_curriculum.sh checkpoints/Model_2_20260312_152017/Model_2_best.pt "8:2,16:4,32:4,64:4" 1e-3 no-mirror
 
 CKPT="${1}"
+if [ "$CKPT" = "scratch" ]; then
+    RESUME_FLAG=""
+else
+    RESUME_FLAG="--resume ${CKPT}"
+fi
 CURRICULUM="${2}"
 LR="${3:-1e-3}"
 NO_MIRROR="${4:-}"
@@ -68,7 +73,7 @@ fi
 echo ""
 
 CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.py \
-    --resume ${CKPT} \
+    ${RESUME_FLAG} \
     --mixed-precision \
     --learning-rate ${LR} \
     --curriculum \"${CURRICULUM}\" \
