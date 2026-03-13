@@ -198,6 +198,33 @@ def initialize_data():
     _e1d_path = f"{TRAIN_PATH}/1d_edges_static_expanded.csv"
     static_1d = pd.read_csv(_n1d_path if os.path.exists(_n1d_path) else f"{TRAIN_PATH}/1d_nodes_static.csv")
     static_2d = pd.read_csv(f"{TRAIN_PATH}/2d_nodes_static.csv")
+
+    # Merge NLCD raster features into static_2d if available
+    _raster_feats_path = f"{TRAIN_PATH}/2d_nodes_raster_features.csv"
+    if os.path.exists(_raster_feats_path):
+        print(f"[INFO] Loading NLCD raster features from {_raster_feats_path}")
+        _raster_df = pd.read_csv(_raster_feats_path)
+
+        # One-hot encode land cover against fixed NLCD vocabulary (16 classes)
+        _NLCD_CLASSES = [11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95]
+        for _cls in _NLCD_CLASSES:
+            _raster_df[f'lc_{_cls}'] = (_raster_df['nlcd_land_cover'] == _cls).astype(np.float32)
+
+        # Keep only node_idx + one-hot columns + continuous features (tcc_2023 only, not mean)
+        _lc_cols = [f'lc_{c}' for c in _NLCD_CLASSES]
+        _keep_cols = ['node_idx'] + _lc_cols + ['nlcd_fct_imp', 'nlcd_tcc_2023']
+        _raster_df = _raster_df[_keep_cols]
+
+        # Fill any NaNs (nodes outside raster extent) with 0
+        _raster_df = _raster_df.fillna(0.0)
+
+        static_2d = static_2d.merge(_raster_df, on='node_idx', how='left')
+        static_2d[_lc_cols + ['nlcd_fct_imp', 'nlcd_tcc_2023']] = (
+            static_2d[_lc_cols + ['nlcd_fct_imp', 'nlcd_tcc_2023']].fillna(0.0)
+        )
+        print(f"[INFO] Added {len(_lc_cols)} land-cover one-hot cols + nlcd_fct_imp + nlcd_tcc_2023 to static_2d")
+    else:
+        print(f"[INFO] No NLCD raster features found at {_raster_feats_path} — skipping")
     edges1dfeats = pd.read_csv(_e1d_path if os.path.exists(_e1d_path) else f"{TRAIN_PATH}/1d_edges_static.csv")
     edges2dfeats = pd.read_csv(f"{TRAIN_PATH}/2d_edges_static.csv")
     edges1d = pd.read_csv(f"{TRAIN_PATH}/1d_edge_index.csv")

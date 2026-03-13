@@ -48,15 +48,14 @@ CONFIG = {
     # Noise-injection warm-start curriculum (Model_2 only)
     # Stage k trains with:  10 clean warm-start steps + k perturbed steps → predict step 11+k
     # Smart-detect advance: after each epoch, scan per-step AR NRMSE on train.
-    # K advances to the largest contiguous prefix where nrmse_ar[k] / nrmse_ar[k-1] <= noise_smart_beta.
-    # This asks: "does each extra AR step degrade the model by more than beta-fold?"
-    # Rather than comparing to a clean baseline (which AR always blows past), it checks
-    # whether the *incremental* cost of one more autoregressive step is acceptable.
-    # noise_smart_beta: max allowed per-step AR degradation ratio (e.g. 1.15 = 15% worse per step)
+    # K advances to the largest contiguous prefix where nrmse_ar[k] <= nrmse_ar[0] * noise_smart_beta.
+    # Compares every step against the h=1 AR baseline — e.g. if h=1 NRMSE=0.035,
+    # beta=1.057 means we only include steps where AR NRMSE stays below ~0.037.
+    # noise_smart_beta: max AR drift relative to h=1 baseline (tight = slow advance, loose = fast)
     # noise_smart_init_epochs: epochs of pure h=1 training before smart detection activates
     # noise_smart_probe_batches: train batches used for the per-step NRMSE scan (keep small)
     # noise_max_extra_steps:  maximum extra perturbed warm-start steps (K_max)
-    'noise_smart_beta': 1.15,
+    'noise_smart_beta': 1.057,
     'noise_smart_alpha': 1.3,   # kept for TF logging reference only
     'noise_smart_init_epochs': 2,
     'noise_smart_probe_batches': 8,
@@ -300,36 +299,46 @@ def evaluate_full_event_rollout(model, val_event_file_list, data, norm_stats, st
     return (nrmse_1d + nrmse_2d) / 2, nrmse_1d, nrmse_2d, per_event_results
 
 
-def _measure_rollout_nrmse_per_step(model, train_dataloader, max_steps, device,
+def _measure_rollout_nrmse_per_step(model, train_dataloader, device,
+                                     beta,
                                      batched_static_graph=None, use_mixed_precision=False,
-                                     rain_1d_index=None, max_batches=8):
+                                     rain_1d_index=None, max_batches=8,
+                                     max_steps=None):
     """
-    Cheap per-step NRMSE scan for smart curriculum advance.
+    Per-step NRMSE scan for smart curriculum advance with early stopping.
 
-    Runs TWO parallel rollouts on up to max_batches train batches:
-      - true-fed:       each step gets ground-truth previous state (no drift)
-      - autoregressive: model feeds its own predictions (realistic drift)
+    Rolls out one step at a time across all batches. After each step k, computes
+    AR NRMSE and checks: nrmse_ar[k] <= prev_ar[k-1] * beta. Stops as soon as
+    the check fails — no wasted compute past the threshold.
 
-    The AR curve is used for threshold decisions; true-fed is logged for comparison.
+    Runs two parallel rollouts:
+      - true-fed (TF): ground-truth fed at each step — logged for reference
+      - autoregressive (AR): model feeds own predictions — used for advancement
 
     Returns:
-        nrmse_tf:  list of floats (true-fed), length <= max_steps
-        nrmse_ar:  list of floats (autoregressive), length <= max_steps
+        nrmse_tf:  list of floats (true-fed), one per step measured
+        nrmse_ar:  list of floats (autoregressive), one per step measured
+        new_K:     int, largest contiguous K that passed the threshold
     """
-    model.eval()
-    sq_tf = [0.0] * max_steps   # true-fed
-    sq_ar = [0.0] * max_steps   # autoregressive
-    counts = [0]  * max_steps
+    if max_steps is None:
+        max_steps = 54  # fallback; caller should always pass _noise_max_extra
 
+    model.eval()
+
+    # Per-step accumulators — grow dynamically as we roll out
+    sq_tf_per_step: list[float] = []
+    sq_ar_per_step: list[float] = []
+    counts_per_step: list[int]  = []
+
+    # Hidden states and batch data stored per-batch for step-by-step iteration
+    batch_data = []
     with torch.no_grad():
+        # --- Load and warm-start all batches ---
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:
                 continue
             if batch_idx >= max_batches:
                 break
-
-            avail = batch['y_future_1d'].shape[1]
-            steps = min(max_steps, avail)
 
             static_graph   = batch['static_graph'].to(device)
             y_hist_1d      = batch['y_hist_1d'].to(device)
@@ -353,61 +362,92 @@ def _measure_rollout_nrmse_per_step(model, train_dataloader, max_steps, device,
             def _make_x(y, r, d, _r=_r1d):
                 return make_x_dyn(y['oneD'], y['twoD'], r, d, rain_1d_index=_r)
 
-            def _warm_start():
-                h = model.init_hidden(static_graph, B, device=device)
-                for k in range(H):
-                    y1d_k = y_hist_1d[:, k].reshape(B * N_1d, 1)
-                    y2d_k = y_hist_2d[:, k].reshape(B * N_2d, 1)
-                    r_k   = rain_hist_2d[:, k].reshape(B * N_2d, -1)
-                    y_t   = {'oneD': y1d_k, 'twoD': y2d_k}
-                    x_dyn = _make_x(y_t, r_k, bsg)
-                    for _ctx in ('global', 'ctx1d', 'ctx2d'):
-                        if _ctx in model.node_types:
-                            x_dyn[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
-                    h = model.cell(bsg, h, x_dyn)
-                return h
-
             with torch.amp.autocast('cuda', enabled=use_mixed_precision):
+                # Warm-start both TF and AR from clean history
+                def _warm_start():
+                    h = model.init_hidden(static_graph, B, device=device)
+                    for k in range(H):
+                        y1d_k = y_hist_1d[:, k].reshape(B * N_1d, 1)
+                        y2d_k = y_hist_2d[:, k].reshape(B * N_2d, 1)
+                        r_k   = rain_hist_2d[:, k].reshape(B * N_2d, -1)
+                        x_dyn = _make_x({'oneD': y1d_k, 'twoD': y2d_k}, r_k, bsg)
+                        for _ctx in ('global', 'ctx1d', 'ctx2d'):
+                            if _ctx in model.node_types:
+                                x_dyn[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_k.dtype)
+                        h = model.cell(bsg, h, x_dyn)
+                    return h
+
                 h_tf = _warm_start()
                 h_ar = _warm_start()
 
-                for k in range(steps):
-                    r_k = rain_future_2d[:, k].reshape(B * N_2d, -1)
+            batch_data.append({
+                'bsg': bsg, 'B': B, 'N_1d': N_1d, 'N_2d': N_2d,
+                'y_future_1d': y_future_1d, 'y_future_2d': y_future_2d,
+                'rain_future_2d': rain_future_2d,
+                'h_tf': h_tf, 'h_ar': h_ar,
+                '_make_x': _make_x, 'static_graph': static_graph,
+            })
 
-                    # --- true-fed step ---
-                    pred_tf = model.predict_water_levels(h_tf, B, {'oneD': N_1d, 'twoD': N_2d})
-                    mse_1d_tf = float(((pred_tf['oneD'] - y_future_1d[:, k]) ** 2).mean())
-                    mse_2d_tf = float(((pred_tf['twoD'] - y_future_2d[:, k]) ** 2).mean())
-                    sq_tf[k] += (mse_1d_tf + mse_2d_tf) / 2.0
+        # --- Roll out one step at a time, stop when threshold fails ---
+        new_K = 0
+        for step in range(max_steps):
+            sq_tf = 0.0
+            sq_ar = 0.0
+            n = 0
 
-                    y1d_true = y_future_1d[:, k].reshape(B * N_1d, 1)
-                    y2d_true = y_future_2d[:, k].reshape(B * N_2d, 1)
-                    x_tf = _make_x({'oneD': y1d_true, 'twoD': y2d_true}, r_k, bsg)
+            with torch.amp.autocast('cuda', enabled=use_mixed_precision):
+                for bd in batch_data:
+                    if step >= bd['y_future_1d'].shape[1]:
+                        continue
+                    B, N_1d, N_2d = bd['B'], bd['N_1d'], bd['N_2d']
+                    bsg = bd['bsg']
+                    r_k = bd['rain_future_2d'][:, step].reshape(B * N_2d, -1)
+                    make_x = bd['_make_x']
+
+                    # TF step
+                    pred_tf = model.predict_water_levels(bd['h_tf'], B, {'oneD': N_1d, 'twoD': N_2d})
+                    sq_tf += float(((pred_tf['oneD'] - bd['y_future_1d'][:, step]) ** 2).mean())
+                    sq_tf += float(((pred_tf['twoD'] - bd['y_future_2d'][:, step]) ** 2).mean())
+                    y1d_t = bd['y_future_1d'][:, step].reshape(B * N_1d, 1)
+                    y2d_t = bd['y_future_2d'][:, step].reshape(B * N_2d, 1)
+                    x_tf = make_x({'oneD': y1d_t, 'twoD': y2d_t}, r_k, bsg)
                     for _ctx in ('global', 'ctx1d', 'ctx2d'):
                         if _ctx in model.node_types:
-                            x_tf[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_true.dtype)
-                    h_tf = model.cell(bsg, h_tf, x_tf)
+                            x_tf[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_t.dtype)
+                    bd['h_tf'] = model.cell(bsg, bd['h_tf'], x_tf)
 
-                    # --- autoregressive step ---
-                    pred_ar = model.predict_water_levels(h_ar, B, {'oneD': N_1d, 'twoD': N_2d})
-                    mse_1d_ar = float(((pred_ar['oneD'] - y_future_1d[:, k]) ** 2).mean())
-                    mse_2d_ar = float(((pred_ar['twoD'] - y_future_2d[:, k]) ** 2).mean())
-                    sq_ar[k] += (mse_1d_ar + mse_2d_ar) / 2.0
-
+                    # AR step
+                    pred_ar = model.predict_water_levels(bd['h_ar'], B, {'oneD': N_1d, 'twoD': N_2d})
+                    sq_ar += float(((pred_ar['oneD'] - bd['y_future_1d'][:, step]) ** 2).mean())
+                    sq_ar += float(((pred_ar['twoD'] - bd['y_future_2d'][:, step]) ** 2).mean())
                     y1d_ar = pred_ar['oneD'].reshape(B * N_1d, 1).detach()
                     y2d_ar = pred_ar['twoD'].reshape(B * N_2d, 1).detach()
-                    x_ar = _make_x({'oneD': y1d_ar, 'twoD': y2d_ar}, r_k, bsg)
+                    x_ar = make_x({'oneD': y1d_ar, 'twoD': y2d_ar}, r_k, bsg)
                     for _ctx in ('global', 'ctx1d', 'ctx2d'):
                         if _ctx in model.node_types:
                             x_ar[_ctx] = torch.zeros(B, 1, device=device, dtype=y1d_ar.dtype)
-                    h_ar = model.cell(bsg, h_ar, x_ar)
+                    bd['h_ar'] = model.cell(bsg, bd['h_ar'], x_ar)
+                    n += 1
 
-                    counts[k] += 1
+            if n == 0:
+                break
 
-    nrmse_tf = [(sq_tf[k] / counts[k]) ** 0.5 if counts[k] > 0 else float('inf') for k in range(max_steps)]
-    nrmse_ar = [(sq_ar[k] / counts[k]) ** 0.5 if counts[k] > 0 else float('inf') for k in range(max_steps)]
+            nrmse_tf_k = (sq_tf / (2 * n)) ** 0.5
+            nrmse_ar_k = (sq_ar / (2 * n)) ** 0.5
+            sq_tf_per_step.append(nrmse_tf_k)
+            sq_ar_per_step.append(nrmse_ar_k)
+            counts_per_step.append(n)
+
+            # Advance K while nrmse_ar[k] <= nrmse_ar[0] * beta.
+            # Stop as soon as threshold fails — no wasted compute.
+            ar_baseline = sq_ar_per_step[0]
+            if nrmse_ar_k <= ar_baseline * beta and new_K == step:
+                new_K = step + 1
+            elif step > 0 and nrmse_ar_k > ar_baseline * beta:
+                break
+
     model.train()
-    return nrmse_tf, nrmse_ar
+    return sq_tf_per_step, sq_ar_per_step, new_K
 
 
 def collect_per_lag_noise_stats(model, val_dataloader, max_lag, device,
@@ -518,7 +558,7 @@ def collect_per_lag_noise_stats(model, val_dataloader, max_lag, device,
     return noise_mu_1d, noise_sigma_1d, noise_mu_2d, noise_sigma_2d
 
 
-def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None, mirror_latest=True, cold_start_passes=None):
+def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pretrain_from=None, train_split='train', extra_epochs=None, mirror_latest=True, cold_start_passes=None, custom_curriculum=None):
     """Main training loop.
     
     Args:
@@ -908,9 +948,9 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     # -----------------------------------------------------------------------
     # noise_extra_steps (K): number of perturbed steps appended beyond the 10-step clean warm-start
     # Smart-detect advance: each epoch, scan per-step train NRMSE up to noise_max_extra_steps.
-    # K advances to the largest contiguous prefix where nrmse_ar[k]/nrmse_ar[k-1] <= noise_smart_beta.
+    # K advances to the largest contiguous prefix where nrmse_ar[k] <= nrmse_ar[0] * noise_smart_beta.
     # noise_smart_init_epochs: pure h=1 warmup epochs before smart detection activates.
-    _use_noise_curriculum = (SELECTED_MODEL == 'Model_2')
+    _use_noise_curriculum = (SELECTED_MODEL == 'Model_2') and not args.no_noise_curriculum and (custom_curriculum is None)
     _noise_extra_steps = 0          # K — starts at 0 (no extra steps); advances via smart detect
     _noise_max_extra = CONFIG['noise_max_extra_steps']
     _noise_smart_beta = CONFIG['noise_smart_beta']
@@ -918,7 +958,6 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
     _noise_smart_init_epochs = CONFIG['noise_smart_init_epochs']
     _noise_smart_probe_batches = CONFIG['noise_smart_probe_batches']
     _noise_init_epochs_done = 0     # counts pure h=1 warmup epochs
-    _prev_ar_nrmse = None           # AR curve from previous epoch; used for one-step advance check
     # noise_stats: None until first smart-detect advance
     _noise_mu_1d    = None   # [K_cur, N_1d]
     _noise_sigma_1d = None   # [K_cur, N_1d]
@@ -945,6 +984,19 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
             # Noise curriculum is active — fixed 1-step rollout target, expanding warm-start
             max_h = 1  # predict only the next step (step 11+K)
             noise_K = _noise_extra_steps
+        elif custom_curriculum is not None:
+            # custom_curriculum: list of (horizon, n_epochs) built relative to start_epoch
+            # _cc_boundaries[i] = last absolute epoch of stage i
+            _cc_boundaries = []
+            _cc_horizons = []
+            _ep = start_epoch
+            for (h, n) in custom_curriculum:
+                _ep += n
+                _cc_boundaries.append(_ep)
+                _cc_horizons.append(h)
+            _stage_idx = next((i for i, b in enumerate(_cc_boundaries) if epoch <= b), len(_cc_boundaries) - 1)
+            max_h = _cc_horizons[_stage_idx]
+            noise_K = 0
         elif SELECTED_MODEL == 'Model_2':
             _m2_boundaries = [6, 10, 14, 18, 22, 26, 30, 34, 38, 46]  # last epoch of each stage; 46 total
             _m2_horizons   = [1,  2,  4,  6,  8, 16, 24, 32, 48, 64]
@@ -1197,14 +1249,6 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                             _fe_nrmses = [ev['combined_nrmse'] for ev in fe_per_event]
                             fe_log['full_event_val/combined_nrmse_std'] = float(np.std(_fe_nrmses))
                             fe_log['full_event_val/combined_nrmse_max'] = float(max(_fe_nrmses))
-                            # Top-5 worst events printed to console
-                            print(f"  Top-5 hardest val events:")
-                            for ev in fe_sorted[:5]:
-                                print(f"    {ev['event_name']:40s}  combined={ev['combined_nrmse']:.4f}  "
-                                      f"1d={ev['nrmse_1d']:.4f}  2d={ev['nrmse_2d']:.4f}  T={ev['T']}  "
-                                      f"t_jump={ev.get('t_worst_frac',-1):.2f}  "
-                                      f"rain_peak={ev.get('rain_peak',0):.3f}@{ev.get('t_rain_peak_frac',-1):.2f}  "
-                                      f"rain@jump={ev.get('rain_at_worst',0):.3f}")
                         wandb.log(fe_log, step=global_step)
                     except Exception as e:
                         print(f"[WARNING] Full-event rollout val failed: {e}")
@@ -1248,35 +1292,21 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                 _noise_init_epochs_done += 1
                 print(f"[INFO] Noise curriculum init phase: {_noise_init_epochs_done}/{_noise_smart_init_epochs} epochs done")
             else:
-                # Smart-detect phase: measure per-step NRMSE on train, find new K
+                # Smart-detect phase: roll out step-by-step, stop as soon as threshold fails
                 try:
-                    # Probe enough ahead to detect a jump, but don't scan all 54 steps early on.
-                    # Headroom: 2× current K + 10, capped at noise_max_extra.
-                    probe_steps = min(max(_noise_extra_steps * 2 + 10, 10), _noise_max_extra)
-                    print(f"[INFO] Smart-detect: probing {probe_steps} steps (K={_noise_extra_steps}) on {_noise_smart_probe_batches} train batches...")
-                    nrmse_tf, nrmse_ar = _measure_rollout_nrmse_per_step(
-                        model, train_dataloader, max_steps=probe_steps, device=device,
+                    print(f"[INFO] Smart-detect (K={_noise_extra_steps}) on {_noise_smart_probe_batches} train batches...")
+                    nrmse_tf, nrmse_ar, new_K = _measure_rollout_nrmse_per_step(
+                        model, train_dataloader, device=device,
+                        beta=_noise_smart_beta,
                         batched_static_graph=train_batched_graph,
                         use_mixed_precision=use_mixed_precision,
                         rain_1d_index=_rain_1d_index,
                         max_batches=_noise_smart_probe_batches,
+                        max_steps=_noise_max_extra,
                     )
-                    # Advance to the largest contiguous K where each new step k passes:
-                    #   nrmse_ar[k] <= prev_ar[k-1] * beta
-                    # "Step k this epoch is no worse (within beta) than step k-1 was last epoch."
-                    # Scans all steps >= current K, stops at first failure.
-                    # On the first smart-detect epoch (no prev), stay at current K.
-                    new_K = _noise_extra_steps
-                    if _prev_ar_nrmse is not None:
-                        for k in range(_noise_extra_steps, len(nrmse_ar)):
-                            prev_ref = _prev_ar_nrmse[k - 1] if k > 0 else _prev_ar_nrmse[0]
-                            if nrmse_ar[k] <= prev_ref * _noise_smart_beta:
-                                new_K = k + 1
-                            else:
-                                break
-                    new_K = min(new_K, _noise_max_extra)
+                    new_K = min(max(new_K, _noise_extra_steps), _noise_max_extra)
 
-                    tf_baseline = min(nrmse_tf[:min(5, len(nrmse_tf))])
+                    tf_baseline = min(nrmse_tf[:min(5, len(nrmse_tf))]) if nrmse_tf else float('nan')
                     wandb.log({
                         'noise_curriculum/smart_K': new_K,
                         'noise_curriculum/ar_step0_nrmse': nrmse_ar[0] if nrmse_ar else 0,
@@ -1284,12 +1314,9 @@ def train(resume_from=None, use_mixed_precision=False, skip_validation=False, pr
                         **{f'noise_curriculum/nrmse_ar_step_{k}': v for k, v in enumerate(nrmse_ar[:min(10, len(nrmse_ar))])},
                         **{f'noise_curriculum/nrmse_tf_step_{k}': v for k, v in enumerate(nrmse_tf[:min(10, len(nrmse_tf))])},
                     }, step=global_step)
-                    print(f"[INFO] Smart-detect: AR step-0={nrmse_ar[0]:.5f}  beta={_noise_smart_beta}")
-                    print(f"  AR  NRMSE: {[f'{v:.4f}' for v in nrmse_ar[:min(15, len(nrmse_ar))]]}")
-                    print(f"  prev AR:   {[f'{v:.4f}' for v in _prev_ar_nrmse[:min(15, len(_prev_ar_nrmse))]] if _prev_ar_nrmse else 'none'}")
-                    print(f"  TF  NRMSE: {[f'{v:.4f}' for v in nrmse_tf[:min(15, len(nrmse_tf))]]}")
+                    print(f"  AR  NRMSE: {[f'{v:.4f}' for v in nrmse_ar]}")
+                    print(f"  TF  NRMSE: {[f'{v:.4f}' for v in nrmse_tf]}")
                     print(f"  K: {_noise_extra_steps} → {new_K}")
-                    _prev_ar_nrmse = nrmse_ar
 
                     if new_K > _noise_extra_steps:
                         # Collect full per-node noise stats up to new_K
@@ -1444,6 +1471,12 @@ if __name__ == "__main__":
                         help='Fine-tune on cold-start windows only (first window per event). '
                              'Runs N shuffled passes over the pool instead of the standard epoch loop. '
                              'Intended for use with --resume and --max-h 64 at a low LR.')
+    parser.add_argument('--no-noise-curriculum', action='store_true',
+                        help='Disable noise-injection curriculum for Model_2 (train clean h=1 baseline).')
+    parser.add_argument('--curriculum', type=str, default=None,
+                        help='Custom curriculum as "h:epochs,h:epochs,..." relative to resume epoch. '
+                             'E.g. "8:2,16:4,32:4,64:4,128:4". Overrides built-in Model_2 schedule. '
+                             'Implies --no-noise-curriculum.')
     args = parser.parse_args()
     
     # Apply command-line overrides to CONFIG
@@ -1462,11 +1495,27 @@ if __name__ == "__main__":
         CONFIG['lr_final'] = args.learning_rate  # flat LR when explicitly overridden (e.g. finetune)
     if args.max_h is not None:
         CONFIG['forecast_len'] = args.max_h
-    
+
+    # Parse custom curriculum: "8:2,16:4,32:4,64:4,128:4" → [(8,2),(16,4),...]
+    custom_curriculum = None
+    if args.curriculum is not None:
+        custom_curriculum = []
+        for part in args.curriculum.split(','):
+            h_str, n_str = part.strip().split(':')
+            custom_curriculum.append((int(h_str), int(n_str)))
+        # Update forecast_len to max horizon in curriculum
+        CONFIG['forecast_len'] = max(h for h, _ in custom_curriculum)
+        # Update total epochs to sum of all stages (relative to resume)
+        total_stages_epochs = sum(n for _, n in custom_curriculum)
+        extra_epochs = total_stages_epochs
+        args.no_noise_curriculum = True
+        print(f"[INFO] Custom curriculum: {custom_curriculum} "
+              f"(total {total_stages_epochs} epochs, max_h={CONFIG['forecast_len']})")
+
     # Enable mixed precision if requested
     if args.mixed_precision:
         print("[INFO] Mixed precision training enabled")
         torch.set_float32_matmul_precision('medium')  # Speeds up matmuls on L40S/A100
         # Actual fp16 autocast + GradScaler is applied inside train()
     
-    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain, train_split=args.train_split, extra_epochs=extra_epochs, mirror_latest=not args.no_mirror_latest, cold_start_passes=args.cold_start_passes)
+    train(resume_from=args.resume, use_mixed_precision=args.mixed_precision, skip_validation=args.no_val, pretrain_from=args.pretrain, train_split=args.train_split, extra_epochs=extra_epochs, mirror_latest=not args.no_mirror_latest, cold_start_passes=args.cold_start_passes, custom_curriculum=custom_curriculum)
