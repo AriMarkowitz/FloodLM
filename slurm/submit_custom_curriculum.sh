@@ -30,9 +30,10 @@ fi
 CURRICULUM="${2}"
 LR="${3:-1e-3}"
 NO_MIRROR="${4:-}"
+ALL_DATA="${5:-}"  # pass "all-data" to train on train+val with no validation
 
 if [ -z "$CKPT" ] || [ -z "$CURRICULUM" ]; then
-    echo "Usage: sbatch submit_custom_curriculum.sh <checkpoint> <curriculum> [lr] [no-mirror]"
+    echo "Usage: sbatch submit_custom_curriculum.sh <checkpoint> <curriculum> [lr] [no-mirror] [all-data]"
     exit 1
 fi
 
@@ -65,6 +66,12 @@ PYTHON="python3"
 log_info()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO]  $1"; }
 log_error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2; }
 
+ALLDATA_FLAG=""
+if [ "$ALL_DATA" = "all-data" ]; then
+    ALLDATA_FLAG="--train-split all --no-val"
+    echo "NOTE: Training on train+val combined, no validation"
+fi
+
 MIRROR_FLAG=""
 if [ "$NO_MIRROR" = "no-mirror" ]; then
     MIRROR_FLAG="--no-mirror-latest"
@@ -77,7 +84,8 @@ CMD="cd \"${PROJECT_DIR}\" && SELECTED_MODEL=\"Model_2\" ${PYTHON} -u src/train.
     --mixed-precision \
     --learning-rate ${LR} \
     --curriculum \"${CURRICULUM}\" \
-    ${MIRROR_FLAG}"
+    ${MIRROR_FLAG} \
+    ${ALLDATA_FLAG}"
 
 log_info "Command: $CMD"
 log_info ""
